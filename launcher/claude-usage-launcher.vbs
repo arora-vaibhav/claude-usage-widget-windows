@@ -1,2 +1,4 @@
-Set oShell = CreateObject("WScript.Shell")
-oShell.Run """C:\Users\V\.local\bin\claude-usage.exe""", 0, False
+﻿Set oShell = CreateObject("WScript.Shell")
+Dim exePath
+exePath = oShell.ExpandEnvironmentStrings("%USERPROFILE%") & "\.local\bin\claude-usage.exe"
+oShell.Run """" & exePath & """", 0, False
