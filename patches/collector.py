@@ -430,8 +430,30 @@ def _load_subscription_type(claude_dir: str) -> str:
 _LAST_REFRESH_ATTEMPT: float = 0.0
 _REFRESH_COOLDOWN_SECS: float = 300.0
 
+def _find_claude_exe() -> str:
+    """Return the path to the claude CLI executable, or empty string if not found."""
+    import shutil
+    # Common locations on Windows
+    candidates = [
+        os.path.join(os.path.expanduser("~"), ".local", "bin", "claude.exe"),
+        os.path.join(os.path.expanduser("~"), ".local", "bin", "claude"),
+    ]
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    found = shutil.which("claude")
+    return found or ""
+
+
 def _refresh_access_token_if_needed(creds_path: str) -> None:
-    """If the OAuth access token is expired, refresh it using the stored refresh token."""
+    """If the OAuth access token is expiring soon, refresh it via the Claude CLI.
+
+    Running `claude auth status` causes the CLI to silently refresh the OAuth
+    token and write updated credentials back to disk.  This is more reliable
+    than calling the OAuth endpoint directly (which requires TLS fingerprinting
+    that Cloudflare accepts from Node.js but blocks from Python urllib).
+    """
+    global _LAST_REFRESH_ATTEMPT
     try:
         with open(creds_path, encoding="utf-8") as _f:
             _creds = json.load(_f)
@@ -440,35 +462,25 @@ def _refresh_access_token_if_needed(creds_path: str) -> None:
         _now_ms = int(time.time() * 1000)
         if _expires_ms > _now_ms + 5 * 60 * 1000:
             return  # still valid for 5+ minutes
-        # Rate-limit refresh attempts to avoid hammering the endpoint
-        global _LAST_REFRESH_ATTEMPT
+        # Rate-limit refresh attempts
         _now_s = time.time()
         if _now_s - _LAST_REFRESH_ATTEMPT < _REFRESH_COOLDOWN_SECS:
-            return  # within cooldown window; wait before retrying
+            return  # within cooldown; avoid hammering the CLI
         _LAST_REFRESH_ATTEMPT = _now_s
-        _rt = _oauth.get("refreshToken")
-        if not _rt:
+        # Invoke the Claude CLI to refresh the token.  It handles the OAuth
+        # token refresh internally (with proper TLS/headers that pass Cloudflare)
+        # and writes the updated credentials back to disk.
+        _claude = _find_claude_exe()
+        if not _claude:
             return
-        _body = json.dumps({"grant_type": "refresh_token", "refresh_token": _rt}).encode()
-        _req = Request(
-            "https://api.anthropic.com/oauth/token",
-            data=_body,
-            headers={"Content-Type": "application/json", "anthropic-beta": "oauth-2025-04-20"},
+        import subprocess
+        subprocess.run(
+            [_claude, "auth", "status"],
+            capture_output=True,
+            timeout=20,
+            creationflags=0x08000000,  # CREATE_NO_WINDOW on Windows
         )
-        with urlopen(_req, timeout=10) as _resp:
-            _new = json.loads(_resp.read(65536).decode("utf-8", errors="replace"))
-        if "access_token" in _new:
-            _oauth["accessToken"] = _new["access_token"]
-            if "expires_in" in _new:
-                _oauth["expiresAt"] = _now_ms + int(_new["expires_in"]) * 1000
-            if "refresh_token" in _new:
-                _oauth["refreshToken"] = _new["refresh_token"]
-            _creds["claudeAiOauth"] = _oauth
-            _tmp = creds_path + ".tmp"
-            with open(_tmp, "w", encoding="utf-8") as _f:
-                json.dump(_creds, _f)
-            os.replace(_tmp, creds_path)
-            _LAST_REFRESH_ATTEMPT = 0.0  # reset cooldown on success
+        _LAST_REFRESH_ATTEMPT = 0.0  # reset cooldown on success
     except Exception:
         pass  # fail silently; caller will surface the auth error as before
 
