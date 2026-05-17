@@ -4,7 +4,6 @@ A Windows-native desktop overlay that shows your [Claude Code](https://docs.anth
 
 This is a community Windows port of [bozdemir/claude-usage-widget](https://github.com/bozdemir/claude-usage-widget), which originally targeted Linux/macOS. All credit for the core product goes to the original author.
 
-![Widget screenshot](assets/screenshot-widget.png)
 
 ---
 
