@@ -2,8 +2,6 @@
 
 A Windows-native desktop overlay that shows your [Claude Code](https://docs.anthropic.com/en/docs/claude-code) usage in real time — session %, weekly %, reset timers, cost breakdown, and a weekly AI summary.
 
-This is a community Windows port of [bozdemir/claude-usage-widget](https://github.com/bozdemir/claude-usage-widget), which originally targeted Linux/macOS. All credit for the core product goes to the original author.
-
 
 ---
 
