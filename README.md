@@ -109,11 +109,6 @@ PRs welcome. If you find a Windows-specific bug, open an issue with your Python 
 
 ---
 
-## Credits
-
-- **Original widget**: [bozdemir/claude-usage-widget](https://github.com/bozdemir/claude-usage-widget) — all core logic, UI, and design
-- **Windows port**: [v-zagora](https://github.com/v-zagora)
-
 ## License
 
 This repo contains only the Windows-specific patches and setup tooling. The patched source files remain under the same license as the upstream project. See [upstream LICENSE](https://github.com/bozdemir/claude-usage-widget/blob/main/LICENSE) for details.
