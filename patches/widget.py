@@ -1017,6 +1017,10 @@ class ClaudeUsageApp(QObject):
         self.stats = UsageStats()
         self._alive = True
         self._refreshing = False
+        # Backoff / resilience state
+        self._consecutive_errors: int = 0
+        self._last_good_stats = None   # last UsageStats with no error
+        self._BACKOFF_SECS = [60, 120, 300]  # retry intervals on error
         self._last_daily_report_date: str = ""
         # Wall-clock of the last successful collect, used for the menu's
         # "Updated Xs ago" footer.  Never read by anything else.
