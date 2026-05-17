@@ -474,13 +474,15 @@ def _refresh_access_token_if_needed(creds_path: str) -> None:
         if not _claude:
             return
         import subprocess
-        subprocess.run(
+        _result = subprocess.run(
             [_claude, "auth", "status"],
             capture_output=True,
             timeout=20,
             creationflags=0x08000000,  # CREATE_NO_WINDOW on Windows
         )
-        _LAST_REFRESH_ATTEMPT = 0.0  # reset cooldown on success
+        # Reset cooldown regardless of exit code so the widget's own
+        # backoff timer controls the retry cadence, not this cooldown.
+        _LAST_REFRESH_ATTEMPT = 0.0
     except Exception:
         pass  # fail silently; caller will surface the auth error as before
 
