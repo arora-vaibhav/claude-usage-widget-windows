@@ -1479,9 +1479,34 @@ class ClaudeUsageApp(QObject):
         import time as _t
         self._last_refresh_ts = _t.time()
 
-        self.overlay.update_stats(stats)
-        self.popup.update_stats(stats)
-        self.skin_popup.update_stats(stats)
+        # ── Resilience: backoff on transient auth / network errors ──────
+        if stats.rate_limit_error:
+            self._consecutive_errors += 1
+            # Escalate retry interval: 60 s → 2 min → 5 min
+            backoff = self._BACKOFF_SECS[
+                min(self._consecutive_errors - 1, len(self._BACKOFF_SECS) - 1)
+            ]
+            self._timer.setInterval(backoff * 1000)
+            # Show last known-good stats for the first 2 failures so the
+            # UI does not flash an error on a momentary blip.  After the
+            # 3rd consecutive failure (~4+ minutes) surface the real error.
+            if self._consecutive_errors <= 2 and self._last_good_stats is not None:
+                display = self._last_good_stats
+            else:
+                display = stats
+        else:
+            # Success: reset backoff, restore normal refresh cadence
+            if self._consecutive_errors > 0:
+                self._consecutive_errors = 0
+                refresh_secs = int(self.config.get("refresh_seconds", 30))
+                self._timer.setInterval(refresh_secs * 1000)
+            self._last_good_stats = stats
+            display = stats
+        # ────────────────────────────────────────────────────────────────
+
+        self.overlay.update_stats(display)
+        self.popup.update_stats(display)
+        self.skin_popup.update_stats(display)
         self.notifier.check_stats(stats)
 
         # Webhook: anomaly
@@ -1591,10 +1616,29 @@ class ClaudeUsageApp(QObject):
             tag, available = check_latest_version(v)
             if available and tag:
                 self._latest_tag = tag
-                # Show a one-time system notification.
                 self.notifier._send(
                     f"Claude Usage {tag} available",
                     "Update with: pip install --upgrade claude-usage-widget",
+                )
+        except Exception:
+            pass
+        # Also check the Windows-port repo for patch updates
+        try:
+            import json as _json
+            from urllib.request import Request as _Req, urlopen as _uopen
+            _api = "https://api.github.com/repos/arora-vaibhav/claude-usage-widget-windows/releases/latest"
+            _req = _Req(_api, headers={"User-Agent": "claude-usage-widget-windows/1.0"})
+            with _uopen(_req, timeout=10) as _r:
+                _rel = _json.loads(_r.read(32768).decode("utf-8", errors="replace"))
+            _win_tag = _rel.get("tag_name", "")
+            _installed = getattr(self, "_win_patch_version", None)
+            if _win_tag and _win_tag != _installed:
+                # Persist seen tag so we only notify once per version
+                self._win_patch_version = _win_tag
+                _body = _rel.get("body", "").split("\n")[0][:80]  # first line of notes
+                self.notifier._send(
+                    f"Windows patch {_win_tag} available",
+                    _body or "Run setup.ps1 again to apply the latest patch.",
                 )
         except Exception:
             pass
