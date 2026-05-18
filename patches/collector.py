@@ -475,9 +475,9 @@ def _refresh_access_token_if_needed(creds_path: str) -> None:
             return
         import subprocess
         _result = subprocess.run(
-            [_claude, "config", "list"],
+            [_claude, "--version"],
             capture_output=True,
-            timeout=20,
+            timeout=8,
             creationflags=0x08000000,  # CREATE_NO_WINDOW on Windows
         )
         # Reset cooldown regardless of exit code so the widget's own
