@@ -475,7 +475,7 @@ def _refresh_access_token_if_needed(creds_path: str) -> None:
             return
         import subprocess
         _result = subprocess.run(
-            [_claude, "auth", "status"],
+            [_claude, "config", "list"],
             capture_output=True,
             timeout=20,
             creationflags=0x08000000,  # CREATE_NO_WINDOW on Windows
