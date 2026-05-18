@@ -1466,8 +1466,17 @@ class ClaudeUsageApp(QObject):
         def _worker() -> None:
             try:
                 stats = collect_all(self.config)
-            except Exception:
-                stats = UsageStats(rate_limit_error="Collection failed")
+            except Exception as _exc:
+                # Log to file for debugging; show a safe error in the UI
+                try:
+                    import traceback as _tb
+                    _log = open(r"C:\Users\V\AppData\Local\Temp\cu-collect.log", "a", encoding="utf-8")
+                    _log.write("Collection exception:\n" + _tb.format_exc() + "\n---\n")
+                    _log.close()
+                except Exception:
+                    pass
+                _msg = f"{type(_exc).__name__}: {_exc}"[:120]
+                stats = UsageStats(rate_limit_error=f"Collection error: {_msg}")
             # Emit cross-thread signal; the slot runs on the GUI thread.
             if self._alive:
                 self.stats_ready.emit(stats)
