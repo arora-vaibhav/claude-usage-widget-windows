@@ -5,6 +5,7 @@ from __future__ import annotations
 import glob
 import json
 import math
+import gc
 import os
 import time
 import sys
@@ -173,17 +174,38 @@ def _collect_tokens_single_pass(
     # we're aggregating, plus a one-day slack for clock skew / slow flushes.
     mtime_cutoff = datetime.now().timestamp() - 8 * 86400
 
+    # ── Memory guard: collect candidates, sort newest-first, cap at 150 MB ──
+    # Large project dirs (e.g. scheduled-task sessions) can contain hundreds
+    # of files within the 8-day window; reading them all triggers MemoryError.
+    _SCAN_BUDGET = 150 * 1024 * 1024  # 150 MB max per refresh cycle
+    _candidates: list = []
     for jsonl_path in glob.glob(os.path.join(projects_dir, "*", "*.jsonl")):
         parts = jsonl_path.split(os.sep)
-        # Subagent conversations share tokens with their parent; skip to avoid double-counting
         if "subagents" in parts:
             continue
         try:
-            if os.path.getmtime(jsonl_path) < mtime_cutoff:
+            mtime = os.path.getmtime(jsonl_path)
+            if mtime < mtime_cutoff:
                 continue
+            fsize = os.path.getsize(jsonl_path)
         except OSError:
             continue
-        _parse_tokens_file(jsonl_path, today_prefix, week_prefixes, result)
+        _candidates.append((mtime, fsize, jsonl_path))
+    # Newest files first -- ensures today's usage is always captured
+    _candidates.sort(reverse=True)
+    _bytes_read = 0
+    for _i, (_mtime, _fsize, jsonl_path) in enumerate(_candidates):
+        if _bytes_read > _SCAN_BUDGET:
+            break
+        try:
+            _parse_tokens_file(jsonl_path, today_prefix, week_prefixes, result)
+        except MemoryError:
+            gc.collect()
+            break
+        _bytes_read += _fsize
+        # Nudge GC every ~20 MB to release parsed-JSON objects
+        if _i > 0 and _i % 20 == 0:
+            gc.collect()
 
     return result
 
@@ -201,7 +223,8 @@ def _parse_tokens_file(
     """
     try:
         f = open(path, encoding="utf-8", errors="replace")
-    except OSError:
+    except (OSError, MemoryError):
+        gc.collect()
         return
 
     # Project name = name of the immediate parent directory under projects/
