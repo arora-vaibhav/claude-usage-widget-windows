@@ -469,14 +469,18 @@ def _find_claude_exe() -> str:
 
 
 def _refresh_access_token_if_needed(creds_path: str) -> None:
-    """If the OAuth access token is expiring soon, refresh it via the Claude CLI.
+    """Refresh the OAuth access token when it is about to expire.
 
-    Running `claude auth status` causes the CLI to silently refresh the OAuth
-    token and write updated credentials back to disk.  This is more reliable
-    than calling the OAuth endpoint directly (which requires TLS fingerprinting
-    that Cloudflare accepts from Node.js but blocks from Python urllib).
+    Uses curl.exe (ships with Windows 10/11) to POST to the OAuth token
+    endpoint.  curl TLS fingerprint is accepted by Cloudflare; Python urllib
+    and PowerShell Invoke-WebRequest return 429.
+
+    Refresh tokens rotate on every successful use -- both the new
+    access_token and new refresh_token are written back to the credentials file.
     """
     global _LAST_REFRESH_ATTEMPT
+    _CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+    _TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
     try:
         with open(creds_path, encoding="utf-8") as _f:
             _creds = json.load(_f)
@@ -485,29 +489,54 @@ def _refresh_access_token_if_needed(creds_path: str) -> None:
         _now_ms = int(time.time() * 1000)
         if _expires_ms > _now_ms + 5 * 60 * 1000:
             return  # still valid for 5+ minutes
-        # Rate-limit refresh attempts
         _now_s = time.time()
         if _now_s - _LAST_REFRESH_ATTEMPT < _REFRESH_COOLDOWN_SECS:
-            return  # within cooldown; avoid hammering the CLI
+            return  # within cooldown
         _LAST_REFRESH_ATTEMPT = _now_s
-        # Invoke the Claude CLI to refresh the token.  It handles the OAuth
-        # token refresh internally (with proper TLS/headers that pass Cloudflare)
-        # and writes the updated credentials back to disk.
-        _claude = _find_claude_exe()
-        if not _claude:
+        _refresh_tok = _oauth.get("refreshToken", "")
+        if not _refresh_tok:
             return
-        import subprocess
-        _result = subprocess.run(
-            [_claude, "--version"],
-            capture_output=True,
-            timeout=8,
+        # Use curl.exe -- TLS fingerprint accepted by Cloudflare (unlike urllib/PowerShell)
+        import subprocess as _sp
+        _curl = r"C:\Windows\System32\curl.exe"
+        if not os.path.isfile(_curl):
+            _curl = "curl"
+        _res = _sp.run(
+            [
+                _curl, "-s",
+                "-X", "POST", _TOKEN_URL,
+                "-H", "Content-Type: application/x-www-form-urlencoded",
+                "-H", "User-Agent: claude-code/1.0",
+                "-d",
+                (
+                    "grant_type=refresh_token"
+                    f"&refresh_token={_refresh_tok}"
+                    f"&client_id={_CLIENT_ID}"
+                ),
+            ],
+            capture_output=True, text=True, timeout=15,
             creationflags=0x08000000,  # CREATE_NO_WINDOW on Windows
         )
-        # Reset cooldown regardless of exit code so the widget's own
-        # backoff timer controls the retry cadence, not this cooldown.
-        _LAST_REFRESH_ATTEMPT = 0.0
+        if _res.returncode != 0:
+            return
+        _tok_data = json.loads(_res.stdout)
+        _new_access = _tok_data.get("access_token", "")
+        _new_refresh = _tok_data.get("refresh_token", "")
+        _exp_in = int(_tok_data.get("expires_in", 28800))
+        if not _new_access:
+            return
+        # Write updated credentials back -- refresh token rotates on use
+        _creds["claudeAiOauth"]["accessToken"] = _new_access
+        if _new_refresh:
+            _creds["claudeAiOauth"]["refreshToken"] = _new_refresh
+        _creds["claudeAiOauth"]["expiresAt"] = int((time.time() + _exp_in) * 1000)
+        _tmp = creds_path + ".tmp"
+        with open(_tmp, "w", encoding="utf-8") as _f:
+            json.dump(_creds, _f, indent=2)
+        os.replace(_tmp, creds_path)
+        _LAST_REFRESH_ATTEMPT = 0.0  # reset so next check sees valid token and skips
     except Exception:
-        pass  # fail silently; caller will surface the auth error as before
+        pass  # silent -- failure surfaced on next collect cycle
 
 def _load_credentials(claude_dir: str) -> str | None:
     """Load the OAuth access token from the credentials file or macOS Keychain.
