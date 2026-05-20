@@ -442,7 +442,7 @@ def _load_subscription_type(claude_dir: str) -> str:
     if not os.path.isfile(creds_path):
         return ""
     try:
-        with open(creds_path, encoding="utf-8") as f:
+        with open(creds_path, encoding="utf-8-sig") as f:  # utf-8-sig strips BOM if present
             creds = json.load(f)
         return str(creds.get("claudeAiOauth", {}).get("subscriptionType", ""))
     except (json.JSONDecodeError, OSError):
@@ -482,7 +482,7 @@ def _refresh_access_token_if_needed(creds_path: str) -> None:
     _CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
     _TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
     try:
-        with open(creds_path, encoding="utf-8") as _f:
+        with open(creds_path, encoding="utf-8-sig") as _f:  # utf-8-sig strips BOM
             _creds = json.load(_f)
         _oauth = _creds.get("claudeAiOauth", {})
         _expires_ms = int(_oauth.get("expiresAt") or 0)
@@ -553,7 +553,7 @@ def _load_credentials(claude_dir: str) -> str | None:
     _refresh_access_token_if_needed(creds_path)
     if os.path.isfile(creds_path):
         try:
-            with open(creds_path, encoding="utf-8") as f:
+            with open(creds_path, encoding="utf-8-sig") as f:  # utf-8-sig strips BOM if present
                 creds = json.load(f)
             return creds["claudeAiOauth"]["accessToken"]
         except (json.JSONDecodeError, KeyError, OSError):
