@@ -23,6 +23,9 @@ from claude_usage.live_stream import LiveActivity, detect_live_activity
 from claude_usage.subagents import count_active_subagents
 from claude_usage.ticker import TickerItem, scan_ticker_items
 from claude_usage.trends import daily_heatmap, hourly_histogram, monthly_summary
+from claude_usage.logging_setup import get_logger
+
+_log = get_logger()
 
 HISTORY_FILENAME = "usage-history.jsonl"
 HISTORY_KEEP_DAYS = 90  # keep 90 days for trend/anomaly analysis
@@ -518,12 +521,19 @@ def _refresh_access_token_if_needed(creds_path: str) -> None:
             creationflags=0x08000000,  # CREATE_NO_WINDOW on Windows
         )
         if _res.returncode != 0:
+            _log.warning("token refresh: curl exited %s: %s",
+                         _res.returncode, (_res.stderr or "").strip()[:200])
             return
         _tok_data = json.loads(_res.stdout)
         _new_access = _tok_data.get("access_token", "")
         _new_refresh = _tok_data.get("refresh_token", "")
         _exp_in = int(_tok_data.get("expires_in", 28800))
         if not _new_access:
+            _log.warning(
+                "token refresh rejected by endpoint: %s",
+                _tok_data.get("error_description") or _tok_data.get("error")
+                or "no access_token in response",
+            )
             return
         # Write updated credentials back -- refresh token rotates on use
         _creds["claudeAiOauth"]["accessToken"] = _new_access
@@ -535,8 +545,8 @@ def _refresh_access_token_if_needed(creds_path: str) -> None:
             json.dump(_creds, _f, indent=2)
         os.replace(_tmp, creds_path)
         _LAST_REFRESH_ATTEMPT = 0.0  # reset so next check sees valid token and skips
-    except Exception:
-        pass  # silent -- failure surfaced on next collect cycle
+    except Exception as _exc:
+        _log.warning("token refresh failed: %s", _exc)
 
 def _load_credentials(claude_dir: str) -> str | None:
     """Load the OAuth access token from the credentials file or macOS Keychain.
@@ -803,6 +813,7 @@ def collect_all(config: dict[str, Any]) -> UsageStats:
 
     if "error" in rate_limits:
         stats.rate_limit_error = rate_limits["error"]
+        _log.warning("rate-limit fetch failed: %s", rate_limits["error"])
         # API call failed (transient network glitch, OAuth hiccup, etc.).
         # Without this, both utilization fields stay at the dataclass
         # default 0.0 and the widget paints "0% / 0%" until the next

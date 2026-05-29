@@ -17,6 +17,7 @@ from typing import Sequence
 from claude_usage import __version__
 from claude_usage.collector import UsageStats, collect_all
 from claude_usage.config import load_config, user_config_path
+from claude_usage.logging_setup import get_logger, setup_logging
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -157,6 +158,8 @@ def _launch_gui() -> None:
     app.setQuitOnLastWindowClosed(False)
 
     config = load_config(_default_config_path())
+    setup_logging(config["claude_dir"])
+    get_logger().info("claude-usage %s starting", __version__)
     _controller = ClaudeUsageApp(config)  # keep a reference
     _ = _controller  # suppress unused-var warnings; QApplication holds ownership
     sys.exit(app.exec())
