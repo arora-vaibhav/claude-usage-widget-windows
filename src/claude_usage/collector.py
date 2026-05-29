@@ -648,6 +648,11 @@ def fetch_rate_limits(claude_dir: str) -> dict[str, Any]:
     primary = _fetch_oauth_usage(token)
     if "error" not in primary:
         return primary
+    # A rate-limit (429) is transient -- surface it directly instead of hitting
+    # the urllib /v1/messages fallback, which Cloudflare rate-limits even harder
+    # and which would mislabel the 429 as "Credentials expired".
+    if "Rate limited" in primary.get("error", ""):
+        return primary
 
     # Fallback: tiny /v1/messages call to harvest rate-limit headers. These
     # cover API-key-level limits (not plan limits) but are better than
@@ -693,22 +698,46 @@ def _fetch_oauth_usage(token: str) -> dict[str, Any]:
     The response uses 0-100 percentages and ISO-8601 ``resets_at`` strings;
     we normalise both to the internal 0-1 fraction + unix-seconds epoch.
     """
-    req = Request(
-        "https://api.anthropic.com/api/oauth/usage",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "anthropic-beta": "oauth-2025-04-20",
-            "User-Agent": "claude-usage-widget",
-        },
-    )
+    # Use curl.exe like the token refresh does. Cloudflare rate-limits (429s)
+    # Python urllib's TLS fingerprint ~4 times out of 5, but accepts curl's --
+    # hitting this endpoint via urllib was the real cause of the frequent
+    # "stale" flapping (the 429 was being mis-reported as "Credentials expired").
+    import subprocess as _sp
+
+    _curl = r"C:\Windows\System32\curl.exe"
+    if not os.path.isfile(_curl):
+        _curl = "curl"
+    _run_kwargs: dict[str, Any] = {}
+    if sys.platform == "win32":
+        _run_kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
     try:
-        with urlopen(req, timeout=10) as resp:
-            payload = json.loads(resp.read(65536).decode("utf-8", errors="replace"))
-    except HTTPError as e:
-        if e.code == 401:
-            return {"error": "Credentials expired -- re-authenticate with 'claude'"}
-        return {"error": f"OAuth usage error {e.code}"}
-    except (URLError, OSError, TimeoutError, json.JSONDecodeError):
+        _res = _sp.run(
+            [
+                _curl, "-s", "-w", "\n%{http_code}",
+                "https://api.anthropic.com/api/oauth/usage",
+                "-H", f"Authorization: Bearer {token}",
+                "-H", "anthropic-beta: oauth-2025-04-20",
+                "-H", "User-Agent: claude-code/1.0",
+            ],
+            capture_output=True, text=True, timeout=15, **_run_kwargs,
+        )
+    except (OSError, _sp.SubprocessError):
+        return {"error": "OAuth usage request failed"}
+    if _res.returncode != 0:
+        return {"error": "OAuth usage request failed"}
+    _out = _res.stdout or ""
+    _nl = _out.rfind("\n")
+    _status = _out[_nl + 1:].strip() if _nl >= 0 else ""
+    _body = _out[:_nl] if _nl >= 0 else _out
+    if _status == "401":
+        return {"error": "Credentials expired -- re-authenticate with 'claude'"}
+    if _status == "429":
+        return {"error": "Rate limited -- try again shortly"}
+    if _status != "200":
+        return {"error": f"OAuth usage error {_status or '?'}"}
+    try:
+        payload = json.loads(_body)
+    except json.JSONDecodeError:
         return {"error": "OAuth usage request failed"}
 
     if not isinstance(payload, dict):
