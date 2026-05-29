@@ -21,8 +21,9 @@ Config = dict[str, Any]
 # Built-in defaults used when a key is absent from the user's config.json.
 DEFAULT_CONFIG: Config = {
     # Directory where Claude Code writes its usage logs.  The tilde is
-    # expanded at import time so the path is always absolute.
-    "claude_dir": os.path.expanduser("~/.claude"),
+    # expanded at import time so the path is always absolute, and normpath'd
+    # so Windows doesn't end up with a mixed-separator "C:\\Users\\x/.claude".
+    "claude_dir": os.path.normpath(os.path.expanduser("~/.claude")),
 
     # Rolling-window message limits.  These mirror the Claude Code plan
     # thresholds and are used only for the progress-bar display; the plugin
@@ -97,6 +98,10 @@ def load_config(path: str) -> Config:
 
     # Merge: user values overwrite defaults, unknown keys are added.
     cfg.update(user_cfg)
+    # Normalise claude_dir: expand ~ and collapse mixed separators (e.g. a
+    # user file containing "C:\\Users\\x/.claude") so downstream os.path.join
+    # calls produce clean, single-separator paths.
+    cfg["claude_dir"] = os.path.normpath(os.path.expanduser(str(cfg["claude_dir"])))
     return cfg
 
 
