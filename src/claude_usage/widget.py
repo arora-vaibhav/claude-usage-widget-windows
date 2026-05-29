@@ -1040,6 +1040,10 @@ class ClaudeUsageApp(QObject):
         self._context_menu = QMenu()
         self._build_context_menu()
 
+        # System-tray icon — a persistent, always-findable entry point to the
+        # dashboard (the floating OSD is easy to lose behind other windows).
+        self._setup_tray()
+
         # Webhook dispatcher + notifier
         from claude_usage.webhooks import WebhookDispatcher
         self._webhooks = WebhookDispatcher(config.get("webhooks", {}))
@@ -1576,21 +1580,76 @@ class ClaudeUsageApp(QObject):
         self._context_menu.popup(global_pos)
 
     def _open_dashboard(self) -> None:
-        """Open (or re-focus) the full-size usage-history Dashboard window."""
-        existing = getattr(self, "_dashboard", None)
-        if existing is not None:
-            try:
-                existing.show()
-                existing.raise_()
-                existing.activateWindow()
-                return
-            except RuntimeError:
-                pass  # previous window was destroyed; fall through to recreate
+        """Open (or re-focus) the usage-history Dashboard window, brought to front."""
+        from PySide6.QtCore import Qt
         from claude_usage.dashboard import DashboardWindow
-        self._dashboard = DashboardWindow(self.config)
-        self._dashboard.show()
-        self._dashboard.raise_()
-        self._dashboard.activateWindow()
+
+        w = getattr(self, "_dashboard", None)
+        try:
+            if w is None:
+                raise RuntimeError("create")
+            _ = w.isVisible()  # touches the C++ object; raises if it was destroyed
+        except RuntimeError:
+            w = DashboardWindow(self.config)
+            self._dashboard = w
+        # Un-minimise, show, and force to the front (it otherwise opens behind
+        # maximised windows and looks "missing").
+        w.setWindowState((w.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
+        w.show()
+        w.raise_()
+        w.activateWindow()
+
+    def _setup_tray(self) -> None:
+        """Add a system-tray icon: a persistent entry point to the dashboard.
+
+        The floating OSD is easily lost behind maximised windows; the tray icon
+        is always reachable. Single- or double-clicking it opens the dashboard;
+        right-click gives the full menu. Non-fatal where no system tray exists.
+        """
+        import os
+
+        from PySide6.QtGui import QIcon
+        from PySide6.QtWidgets import QMenu, QSystemTrayIcon
+
+        self._tray = None
+        try:
+            if not QSystemTrayIcon.isSystemTrayAvailable():
+                return
+        except Exception:
+            return
+
+        icon_path = os.path.join(os.path.dirname(__file__), "icons", "claude-tray.svg")
+        icon = QIcon(icon_path)
+
+        tray = QSystemTrayIcon(icon, self)
+        tray.setToolTip("Claude Usage")
+
+        menu = QMenu()
+        for label, slot in (
+            ("📊  Open Dashboard", self._open_dashboard),
+            ("◉  Details…", self._show_popup),
+            ("↻  Refresh", self._refresh_async),
+        ):
+            act = QAction(label, menu)
+            act.triggered.connect(slot)
+            menu.addAction(act)
+        menu.addSeparator()
+        act_quit = QAction("⏻  Quit", menu)
+        act_quit.triggered.connect(self._on_quit)
+        menu.addAction(act_quit)
+
+        tray.setContextMenu(menu)
+        tray.activated.connect(self._on_tray_activated)
+        tray.show()
+        self._tray = tray
+        self._tray_menu = menu  # keep a reference so Qt doesn't GC the menu
+
+    def _on_tray_activated(self, reason) -> None:
+        """Left-click (Trigger) or double-click the tray icon → open dashboard."""
+        from PySide6.QtWidgets import QSystemTrayIcon
+
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            self._open_dashboard()
 
     def _show_popup(self) -> None:
         # Pick the popup implementation that matches the active theme:
