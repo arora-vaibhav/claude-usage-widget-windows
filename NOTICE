@@ -1,0 +1,12 @@
+claude-usage-widget-windows
+===========================
+
+This project is a Windows-focused fork of "claude-usage-widget" by Burak,
+licensed under the MIT License (see LICENSE).
+
+  Upstream: https://github.com/bozdemir/claude-usage-widget
+
+Fork maintained by Vaibhav Arora (https://github.com/arora-vaibhav). Changes
+include Windows compatibility (OAuth token refresh, memory-safe scans, BOM
+handling, backoff/retry, exception logging), a full-source build, a usage
+history store + dashboard, and UI modernization.

@@ -1,5 +1,9 @@
-# Claude Usage Widget for Windows - Setup Script
+# Claude Usage Widget for Windows - Setup Script (full-source fork)
 # Run with: powershell -ExecutionPolicy Bypass -File setup.ps1
+#
+# Installs the widget directly from THIS repository's source (src/claude_usage)
+# via `uv tool install`. No PyPI download, no patch-copying step -- the source
+# in this repo IS the app, so there is nothing to drift out of sync.
 
 param(
     [switch]$Uninstall
@@ -8,12 +12,9 @@ param(
 $ErrorActionPreference = "Stop"
 
 # ── Paths ──────────────────────────────────────────────────────────────────
-$uvToolsRoot  = "$env:APPDATA\uv\tools\claude-usage-widget"
-$sitePackages = "$uvToolsRoot\Lib\site-packages\claude_usage"
-$claudeExe    = "$env:USERPROFILE\.local\bin\claude-usage.exe"
+$repoDir      = $PSScriptRoot
 $launcherDst  = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\claude-usage-launcher.vbs"
 $shortcutDst  = "$env:USERPROFILE\Desktop\Claude Usage.lnk"
-$repoDir      = $PSScriptRoot
 
 function Write-Step($msg) { Write-Host "`n>> $msg" -ForegroundColor Cyan }
 function Write-OK($msg)   { Write-Host "   OK: $msg" -ForegroundColor Green }
@@ -48,31 +49,10 @@ if (-not (Test-Path "$env:USERPROFILE\.local\bin\claude.exe")) {
     Write-Host "   Then run 'claude' once to authenticate before starting the widget." -ForegroundColor Yellow
 }
 
-# ── Install base package ───────────────────────────────────────────────────
-Write-Step "Installing claude-usage-widget..."
-uv tool install claude-usage-widget --force
-Write-OK "Installed"
-
-# Verify site-packages location
-if (-not (Test-Path $sitePackages)) {
-    Write-Host "ERROR: Could not find site-packages at: $sitePackages" -ForegroundColor Red
-    Write-Host "Run 'uv tool install claude-usage-widget' manually and check the output path." -ForegroundColor Red
-    exit 1
-}
-
-# ── Apply Windows patches ──────────────────────────────────────────────────
-Write-Step "Applying Windows compatibility patches..."
-$patchSrc = Join-Path $repoDir "patches"
-foreach ($file in @("collector.py", "overlay.py", "widget.py")) {
-    $src = Join-Path $patchSrc $file
-    $dst = Join-Path $sitePackages $file
-    if (Test-Path $src) {
-        Copy-Item $src $dst -Force
-        Write-OK "Patched $file"
-    } else {
-        Write-Warn "Patch file not found: $src"
-    }
-}
+# ── Install from local source ──────────────────────────────────────────────
+Write-Step "Installing claude-usage-widget from local source..."
+uv tool install $repoDir --force
+Write-OK "Installed from $repoDir"
 
 # ── Install console-less launcher ─────────────────────────────────────────
 Write-Step "Installing launcher (no console window)..."
