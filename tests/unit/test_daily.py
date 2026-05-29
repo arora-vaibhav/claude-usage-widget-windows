@@ -1,4 +1,7 @@
-from claude_usage.daily import DAILY_FILENAME, load_daily, upsert_day
+import datetime as _dt
+import json
+
+from claude_usage.daily import DAILY_FILENAME, backfill, load_daily, upsert_day
 
 
 def _row(date, output=0, cost=0.0):
@@ -62,3 +65,77 @@ def test_malformed_line_skipped(tmp_path):
         '{"date":"2026-05-27","schema":1}\nnot json\n{"date":"2026-05-28","schema":1}\n'
     )
     assert [r["date"] for r in load_daily(str(path))] == ["2026-05-27", "2026-05-28"]
+
+
+# ---- backfill ----------------------------------------------------------
+
+def _write(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def _ms(iso_utc):
+    return int(_dt.datetime.fromisoformat(iso_utc).replace(tzinfo=_dt.timezone.utc).timestamp() * 1000)
+
+
+def _seed_transcripts_and_history(cd):
+    tx = cd / "projects" / "proj-a" / "s1.jsonl"
+    _write(tx, "\n".join([
+        json.dumps({"type": "assistant", "timestamp": "2026-05-20T10:00:00.000Z",
+                    "message": {"model": "claude-opus-4-8",
+                                "usage": {"input_tokens": 100, "output_tokens": 50,
+                                          "cache_read_input_tokens": 10,
+                                          "cache_creation_input_tokens": 5}}}),
+        json.dumps({"type": "assistant", "timestamp": "2026-05-20T11:00:00.000Z",
+                    "message": {"model": "claude-opus-4-8",
+                                "usage": {"input_tokens": 200, "output_tokens": 80}}}),
+        json.dumps({"type": "assistant", "timestamp": "2026-05-21T09:00:00.000Z",
+                    "message": {"model": "claude-sonnet-4-6",
+                                "usage": {"input_tokens": 300, "output_tokens": 120}}}),
+        json.dumps({"type": "user", "timestamp": "2026-05-20T10:00:00.000Z"}),  # ignored
+    ]) + "\n")
+    _write(cd / "history.jsonl", "\n".join([
+        json.dumps({"timestamp": _ms("2026-05-20T10:00:00"), "sessionId": "A"}),
+        json.dumps({"timestamp": _ms("2026-05-20T12:00:00"), "sessionId": "A"}),
+        json.dumps({"timestamp": _ms("2026-05-21T09:00:00"), "sessionId": "B"}),
+    ]) + "\n")
+
+
+def test_backfill_buckets_by_day(tmp_path):
+    _seed_transcripts_and_history(tmp_path)
+    n = backfill(str(tmp_path))
+    rows = {r["date"]: r for r in load_daily(str(tmp_path / DAILY_FILENAME))}
+    assert n == 2
+    assert set(rows) == {"2026-05-20", "2026-05-21"}
+
+    d20 = rows["2026-05-20"]
+    assert d20["tokens"]["output"] == 130          # 50 + 80
+    assert d20["tokens"]["input"] == 300           # 100 + 200
+    assert d20["by_model"]["claude-opus-4-8"]["output"] == 130
+    assert d20["by_project"]["proj-a"] == 130
+    assert d20["messages"] == 2
+    assert d20["sessions"] == 1                     # session "A" deduped
+    assert d20["cost"] > 0                          # opus output costed (not zero)
+    assert d20["backfilled"] is True
+
+    d21 = rows["2026-05-21"]
+    assert d21["tokens"]["output"] == 120
+    assert d21["sessions"] == 1                     # session "B"
+
+
+def test_backfill_is_idempotent(tmp_path):
+    _seed_transcripts_and_history(tmp_path)
+    assert backfill(str(tmp_path)) == 2
+    assert backfill(str(tmp_path)) == 0             # re-run writes nothing new
+
+
+def test_backfill_preserves_existing_rows(tmp_path):
+    _seed_transcripts_and_history(tmp_path)
+    daily_path = str(tmp_path / DAILY_FILENAME)
+    # Simulate a live-collector row already present for 2026-05-20.
+    upsert_day(daily_path, {"date": "2026-05-20", "messages": 999, "schema": 1, "live": True})
+    written = backfill(str(tmp_path))
+    rows = {r["date"]: r for r in load_daily(daily_path)}
+    assert written == 1                              # only 2026-05-21 added
+    assert rows["2026-05-20"]["messages"] == 999     # existing row untouched
+    assert rows["2026-05-20"].get("live") is True
