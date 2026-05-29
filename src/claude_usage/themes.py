@@ -1,0 +1,270 @@
+"""Theme presets for the Claude Usage Widget.
+
+Each theme is a flat dict of hex color strings with an identical set of keys.
+The canonical key set is :data:`THEME_KEYS`.
+
+Public API:
+    THEMES      -- mapping of theme name (str) -> color dict
+    THEME_KEYS  -- frozenset of the canonical keys every theme must provide
+    get_theme() -- look up a theme by name, falling back to "default"
+
+Keys and their intended roles:
+    bg             -- window / panel background
+    bar_blue       -- progress-bar fill (primary accent)
+    bar_track      -- progress-bar empty track
+    text_primary   -- headings and primary labels
+    text_secondary -- subtitles and supporting info
+    text_dim       -- timestamps and low-priority text
+    text_link      -- links / active-session paths
+    separator      -- horizontal rules and dividers
+    warn           -- warning notices (e.g. approaching limits)
+    crit           -- critical notices (e.g. over budget)
+    error          -- error text (e.g. API / collection failures)
+    live_indicator -- "● LIVE" dot + text on the OSD while a session is running
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, Mapping
+
+
+# Bar rendering styles. "rounded" is the classic Qt pill progress bar; "ascii"
+# swaps in monospace block glyphs (`█░`) for terminal themes; "block" draws
+# sharp-cornered rectangles for brutalist themes.
+BAR_STYLE_ROUNDED = "rounded"
+BAR_STYLE_ASCII = "ascii"
+BAR_STYLE_BLOCK = "block"
+
+
+@dataclass(frozen=True)
+class ThemeStyle:
+    """Per-theme paint parameters consulted by overlay + popup renderers.
+
+    These are intentionally narrow — a theme that wants radically different
+    layout should still slot into the bars/gauge paint paths. Anything more
+    ambitious belongs in a view_mode, not a style override.
+    """
+
+    # Panel corner radius. 0 = sharp corners (brutalist, receipt).
+    corner_radius: int = 12
+    # Outline width around the OSD / popup chrome. >=2 draws a visible
+    # border on top of the background fill (brutalist).
+    border_width: int = 0
+    # Bar fill style. See BAR_STYLE_* constants.
+    bar_style: str = BAR_STYLE_ROUNDED
+    # Optional ASCII decoration prefixed to the CLAUDE title on the OSD
+    # (e.g. "┌─ " for the terminal theme).
+    title_prefix: str = ""
+    # Case transform applied to top-level labels ("Session", "Weekly",
+    # section headers). "upper" gives dashboard/brutalist their datasheet
+    # look without the renderer hardcoding it.
+    label_case: str = "normal"  # normal | upper | lower
+    # Decorative flourish bucket. Currently only "receipt" is handled —
+    # it paints a paper-grain bg stripe pattern plus a 1D barcode along
+    # the OSD bottom edge, matching the thermal-printer skin.
+    decoration: str = ""  # "" | "receipt"
+    # Separator rendering — "solid" (default), "dashed" (receipt), or
+    # "heavy" (brutalist Swiss-grid vibe).
+    separator_style: str = "solid"  # solid | dashed | heavy
+
+
+_DEFAULT_STYLE = ThemeStyle()
+
+# Canonical set of keys every theme must provide.
+THEME_KEYS: frozenset[str] = frozenset({
+    "bg",
+    "bar_blue",
+    "bar_track",
+    "text_primary",
+    "text_secondary",
+    "text_dim",
+    "text_link",
+    "separator",
+    "warn",
+    "crit",
+    "error",
+    "live_indicator",
+})
+
+
+# --- Theme presets ---------------------------------------------------------
+
+# 1. Default — extracted from claude_usage/widget.py.
+_DEFAULT: Dict[str, str] = {
+    "bg":             "#1a1a2e",
+    "bar_blue":       "#5B9BD5",
+    "bar_track":      "#333340",
+    "text_primary":   "#e0e0e8",
+    "text_secondary": "#8a8a9a",
+    "text_dim":       "#555568",
+    "text_link":      "#6BA4D9",
+    "separator":      "#2a2a38",
+    "warn":           "#f59e0b",  # amber — matches tray icon warn gradient
+    "crit":           "#dc2626",  # strong red
+    "error":          "#ef4444",  # vivid red — matches existing .error-text CSS
+    "live_indicator": "#4ade80",  # emerald — reads as "running" against dark bg
+}
+
+# 2. Catppuccin Mocha — https://catppuccin.com/palette/
+#    base/blue/surface0/text/subtext0/overlay0/sapphire/surface1/peach/red/maroon
+_CATPPUCCIN_MOCHA: Dict[str, str] = {
+    "bg":             "#1e1e2e",  # base
+    "bar_blue":       "#89b4fa",  # blue
+    "bar_track":      "#313244",  # surface0
+    "text_primary":   "#cdd6f4",  # text
+    "text_secondary": "#a6adc8",  # subtext0
+    "text_dim":       "#6c7086",  # overlay0
+    "text_link":      "#74c7ec",  # sapphire
+    "separator":      "#45475a",  # surface1
+    "warn":           "#fab387",  # peach
+    "crit":           "#f38ba8",  # red
+    "error":          "#eba0ac",  # maroon
+    "live_indicator": "#a6e3a1",  # green
+}
+
+# 3. Dracula — https://draculatheme.com/contribute
+#    background/purple/current line/foreground/comment/selection/cyan/orange/red/pink
+_DRACULA: Dict[str, str] = {
+    "bg":             "#282a36",  # background
+    "bar_blue":       "#bd93f9",  # purple (primary accent in Dracula)
+    "bar_track":      "#44475a",  # current line
+    "text_primary":   "#f8f8f2",  # foreground
+    "text_secondary": "#bfbfbf",  # lighter foreground-ish
+    "text_dim":       "#6272a4",  # comment
+    "text_link":      "#8be9fd",  # cyan
+    "separator":      "#44475a",  # selection / current line
+    "warn":           "#ffb86c",  # orange
+    "crit":           "#ff5555",  # red
+    "error":          "#ff79c6",  # pink — reserved for hard errors
+    "live_indicator": "#50fa7b",  # green
+}
+
+# 4. Nord — https://www.nordtheme.com/docs/colors-and-palettes
+#    nord0/nord8/nord1/nord6/nord4/nord3/nord9/nord2/nord13/nord11/nord12
+_NORD: Dict[str, str] = {
+    "bg":             "#2e3440",  # nord0
+    "bar_blue":       "#88c0d0",  # nord8 (frost)
+    "bar_track":      "#3b4252",  # nord1
+    "text_primary":   "#eceff4",  # nord6
+    "text_secondary": "#d8dee9",  # nord4
+    "text_dim":       "#4c566a",  # nord3
+    "text_link":      "#81a1c1",  # nord9
+    "separator":      "#434c5e",  # nord2
+    "warn":           "#ebcb8b",  # nord13 (aurora yellow)
+    "crit":           "#bf616a",  # nord11 (aurora red)
+    "error":          "#d08770",  # nord12 (aurora orange)
+    "live_indicator": "#a3be8c",  # nord14 (aurora green)
+}
+
+# 5. Gruvbox Dark — https://github.com/morhetz/gruvbox
+#    bg0/blue bright/bg1/fg1/fg3/gray/aqua/bg2/yellow/red/orange (bright variants)
+_GRUVBOX_DARK: Dict[str, str] = {
+    "bg":             "#282828",  # bg0
+    "bar_blue":       "#83a598",  # bright blue
+    "bar_track":      "#3c3836",  # bg1
+    "text_primary":   "#ebdbb2",  # fg1
+    "text_secondary": "#bdae93",  # fg3
+    "text_dim":       "#928374",  # gray
+    "text_link":      "#8ec07c",  # bright aqua
+    "separator":      "#504945",  # bg2
+    "warn":           "#fabd2f",  # bright yellow
+    "crit":           "#fb4934",  # bright red
+    "error":          "#fe8019",  # bright orange
+    "live_indicator": "#b8bb26",  # bright green
+}
+
+# --- Skin themes -----------------------------------------------------------
+# Themes 6-11 come from the Claude Design handoff bundle under
+# ``claude_usage/skins/``. Each skin module exports its own THEME dict plus
+# the exact paint_osd function the overlay will dispatch to. We copy those
+# dicts over so load_config can still see the theme by name; the richer
+# per-key palette (accent, paper, border_bright, etc.) is read by the skin
+# painter directly from its own module.
+def _filter_theme(src: Dict[str, str]) -> Dict[str, str]:
+    """Narrow a skin THEME to the canonical key set registered here.
+
+    Skin modules add extra keys (accent, panel, rule, ...) that the
+    overlay / popup paint paths don't know about; :data:`THEME_KEYS`
+    tests assert equality on the set we register, so we strip extras
+    when sourcing palettes from the skin modules.
+    """
+    return {k: src[k] for k in THEME_KEYS if k in src}
+
+
+def _load_skin_themes() -> Dict[str, Dict[str, str]]:
+    """Import-once, build a name→palette map from the skins package."""
+    from claude_usage.skins import SKIN_MODULES
+    return {name: _filter_theme(mod.THEME) for name, mod in SKIN_MODULES.items()}
+
+
+THEMES: Dict[str, Dict[str, str]] = {
+    "default":          _DEFAULT,
+    "catppuccin-mocha": _CATPPUCCIN_MOCHA,
+    "dracula":          _DRACULA,
+    "nord":             _NORD,
+    "gruvbox-dark":     _GRUVBOX_DARK,
+    **_load_skin_themes(),
+}
+
+
+# Per-theme style overrides — only themes that want a non-default paint
+# shape appear here. Anything missing falls back to _DEFAULT_STYLE.
+THEME_STYLES: Dict[str, ThemeStyle] = {
+    "terminal": ThemeStyle(
+        corner_radius=4,
+        bar_style=BAR_STYLE_ASCII,
+        title_prefix="┌─ ",
+        label_case="lower",
+    ),
+    "dashboard": ThemeStyle(
+        corner_radius=6,
+        label_case="upper",
+    ),
+    "receipt": ThemeStyle(
+        corner_radius=0,
+        border_width=1,
+        bar_style=BAR_STYLE_BLOCK,
+        label_case="upper",  # SESSION / WEEKLY per the thermal-print design
+        decoration="receipt",
+        separator_style="dashed",
+    ),
+    "strip": ThemeStyle(
+        corner_radius=4,
+    ),
+    "brutalist": ThemeStyle(
+        corner_radius=0,
+        border_width=2,
+        bar_style=BAR_STYLE_BLOCK,
+        label_case="upper",
+        separator_style="heavy",
+    ),
+}
+
+
+def get_theme(name: str) -> Dict[str, str]:
+    """Return the color dict for *name*, falling back to ``"default"``.
+
+    The returned dict is a fresh copy, so callers may mutate it freely
+    without affecting the shared :data:`THEMES` registry.
+    """
+    theme: Mapping[str, str] = THEMES.get(name, THEMES["default"])
+    return dict(theme)
+
+
+def get_style(name: str) -> ThemeStyle:
+    """Return the :class:`ThemeStyle` for *name*, or the default style."""
+    return THEME_STYLES.get(name, _DEFAULT_STYLE)
+
+
+__all__ = [
+    "THEMES",
+    "THEME_KEYS",
+    "THEME_STYLES",
+    "ThemeStyle",
+    "BAR_STYLE_ROUNDED",
+    "BAR_STYLE_ASCII",
+    "BAR_STYLE_BLOCK",
+    "get_theme",
+    "get_style",
+]
