@@ -16,7 +16,7 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from claude_usage import daily  # noqa: E402
 from claude_usage.dashboard import DashboardWindow  # noqa: E402
-from claude_usage.dashboard.charts import BarChart  # noqa: E402
+from claude_usage.dashboard.charts import AreaChart, BarChart  # noqa: E402
 
 _app = QApplication.instance() or QApplication([])
 
@@ -53,10 +53,40 @@ def test_dashboard_builds_and_renders(tmp_path):
     win.resize(900, 1000)
     img = win.grab().toImage()
     assert not img.isNull()
-    assert img.width() == 900
+    assert img.width() >= 900  # window may clamp up to its min width (header/buttons)
 
 
 def test_dashboard_empty_store_renders(tmp_path):
     win = DashboardWindow({"theme": "default", "claude_dir": str(tmp_path)})
     win.resize(700, 500)
     assert not win.grab().toImage().isNull()
+
+
+def test_area_chart_renders_nonempty():
+    c = AreaChart("Trend", [("a", 1.0), ("b", 3.0), ("c", 2.0)])
+    c.resize(320, 180)
+    img = c.grab().toImage()
+    assert img.width() == 320 and not img.isNull()
+
+
+def test_area_chart_single_point_does_not_crash():
+    c = AreaChart("One", [("a", 5.0)])
+    c.resize(300, 170)
+    assert not c.grab().toImage().isNull()
+
+
+def test_dashboard_range_switch(tmp_path):
+    rows = [
+        {"date": f"2026-05-{d:02d}", "messages": d, "sessions": 1,
+         "tokens": {"input": 0, "output": d * 100, "cache_read": 0, "cache_creation": 0},
+         "cost": float(d), "by_model": {"claude-opus-4-8": {"input": 0, "output": d * 100}},
+         "by_project": {"C--Projects-Demo": d * 100}, "schema": 1}
+        for d in range(1, 21)
+    ]
+    p = tmp_path / daily.DAILY_FILENAME
+    p.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    win = DashboardWindow({"theme": "default", "claude_dir": str(tmp_path)})
+    win.resize(960, 1000)
+    for rng in (7, 90, None):
+        win._render(rng)
+        assert not win.grab().toImage().isNull()
