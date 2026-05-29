@@ -1141,6 +1141,10 @@ class ClaudeUsageApp(QObject):
         act_details.triggered.connect(self._show_popup)
         m.addAction(act_details)
 
+        act_dashboard = QAction("▭  Dashboard…", m)
+        act_dashboard.triggered.connect(self._open_dashboard)
+        m.addAction(act_dashboard)
+
         self._act_refresh = QAction("↻  Refresh", m)
         self._act_refresh.triggered.connect(self._refresh_async)
         m.addAction(self._act_refresh)
@@ -1570,6 +1574,23 @@ class ClaudeUsageApp(QObject):
 
     def _on_overlay_right_click(self, global_pos: QPoint) -> None:
         self._context_menu.popup(global_pos)
+
+    def _open_dashboard(self) -> None:
+        """Open (or re-focus) the full-size usage-history Dashboard window."""
+        existing = getattr(self, "_dashboard", None)
+        if existing is not None:
+            try:
+                existing.show()
+                existing.raise_()
+                existing.activateWindow()
+                return
+            except RuntimeError:
+                pass  # previous window was destroyed; fall through to recreate
+        from claude_usage.dashboard import DashboardWindow
+        self._dashboard = DashboardWindow(self.config)
+        self._dashboard.show()
+        self._dashboard.raise_()
+        self._dashboard.activateWindow()
 
     def _show_popup(self) -> None:
         # Pick the popup implementation that matches the active theme:
