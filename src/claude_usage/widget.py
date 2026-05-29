@@ -1497,10 +1497,22 @@ class ClaudeUsageApp(QObject):
                 min(self._consecutive_errors - 1, len(self._BACKOFF_SECS) - 1)
             ]
             self._timer.setInterval(backoff * 1000)
-            # Show last known-good stats for the first 2 failures so the
-            # UI does not flash an error on a momentary blip.  After the
-            # 3rd consecutive failure (~4+ minutes) surface the real error.
-            if self._consecutive_errors <= 2 and self._last_good_stats is not None:
+            # Persistent auth failures (expired / invalid credentials) won't
+            # fix themselves on retry, so surface them immediately. Only
+            # transient (network) errors get the "show last known-good for the
+            # first 2 failures" grace that avoids flashing on a momentary blip.
+            _err = (stats.rate_limit_error or "").lower()
+            _auth_failure = (
+                "credential" in _err
+                or "re-authenticate" in _err
+                or "log in" in _err
+                or "expired" in _err
+            )
+            if (
+                not _auth_failure
+                and self._consecutive_errors <= 2
+                and self._last_good_stats is not None
+            ):
                 display = self._last_good_stats
             else:
                 display = stats
