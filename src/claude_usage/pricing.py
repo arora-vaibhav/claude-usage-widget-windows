@@ -19,6 +19,13 @@ from typing import Dict, Mapping
 # Prices are USD per 1,000,000 tokens.
 # Source: https://www.anthropic.com/pricing (April 2026)
 MODEL_PRICING: Dict[str, Dict[str, float]] = {
+    # Opus 4.8 (current): same $5 input / $25 output tier as 4.7 / 4.6.
+    "claude-opus-4-8": {
+        "input": 5.0,
+        "output": 25.0,
+        "cache_read": 0.50,
+        "cache_creation": 6.25,
+    },
     # Opus 4.7 (April 2026): $5 input, $25 output — consistent across
     # Anthropic API, Bedrock, Vertex AI, and Foundry.
     "claude-opus-4-7": {
@@ -66,8 +73,16 @@ MODEL_PRICING: Dict[str, Dict[str, float]] = {
     },
 }
 
-# Fallback model used whenever a caller passes an unknown model identifier.
+# Fallback model used when an identifier can't even be matched to a family.
 _FALLBACK_MODEL = "claude-sonnet-4-6"
+
+# Representative known model per family, used to price unenumerated IDs (e.g. a
+# future point release) at the correct tier instead of the Sonnet fallback.
+_TIER_EXEMPLAR: Dict[str, str] = {
+    "opus": "claude-opus-4-7",
+    "sonnet": "claude-sonnet-4-6",
+    "haiku": "claude-haiku-4-5-20251001",
+}
 
 # Conversion factor: prices are per one million tokens.
 _PER_MILLION = 1_000_000.0
@@ -77,17 +92,34 @@ _WARNED_MODELS: set[str] = set()
 
 
 def _resolve_pricing(model: str) -> Dict[str, float]:
-    """Return the pricing table for ``model``, warning once per unknown model."""
+    """Return the pricing table for ``model``.
+
+    Exact matches win. For an unenumerated identifier we infer the tier from
+    the model family (opus/sonnet/haiku) so a new point release is priced at
+    its real tier instead of silently dropping to Sonnet. Truly unrecognised
+    identifiers use the Sonnet fallback. Either way we warn once per model.
+    """
     pricing = MODEL_PRICING.get(model)
     if pricing is not None:
         return pricing
+
+    lowered = model.lower()
+    family = next((fam for fam in _TIER_EXEMPLAR if fam in lowered), "")
+
     if model not in _WARNED_MODELS:
         _WARNED_MODELS.add(model)
-        warnings.warn(
-            f"Unknown model {model!r}; falling back to {_FALLBACK_MODEL} pricing.",
-            stacklevel=3,
-        )
-    return MODEL_PRICING[_FALLBACK_MODEL]
+        if family:
+            warnings.warn(
+                f"Unknown model {model!r}; inferred {family} tier pricing by family.",
+                stacklevel=3,
+            )
+        else:
+            warnings.warn(
+                f"Unknown model {model!r}; falling back to {_FALLBACK_MODEL} pricing.",
+                stacklevel=3,
+            )
+
+    return MODEL_PRICING[_TIER_EXEMPLAR[family] if family else _FALLBACK_MODEL]
 
 
 def calculate_cost(
