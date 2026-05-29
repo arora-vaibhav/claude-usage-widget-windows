@@ -158,6 +158,7 @@ def _collect_tokens_single_pass(
     """
     result: dict[str, Any] = {
         "today_output": 0,
+        "today_messages": 0,
         "week_output": 0,
         "today_by_model": {},
         # Full per-model breakdowns (input/output/cache_read/cache_creation)
@@ -277,6 +278,7 @@ def _parse_tokens_file(
 
             if is_today:
                 result["today_output"] += output_tokens
+                result["today_messages"] += 1
                 result["today_by_model"][model] = result["today_by_model"].get(model, 0) + output_tokens
 
                 today_bucket = result["today_by_model_detailed"].setdefault(
@@ -798,6 +800,10 @@ def collect_all(config: dict[str, Any]) -> UsageStats:
     top_projects = sorted(project_totals.items(), key=lambda kv: kv[1], reverse=True)[:10]
     stats.today_by_project = dict(top_projects)
 
+    # history.jsonl can stop updating (Claude Code rotates it); transcripts are
+    # the robust turn source, so take whichever message count is higher.
+    stats.today_messages = max(stats.today_messages, int(tokens.get("today_messages", 0)))
+
     # Cost estimates via pricing module. A single call covers today + week so
     # the pricing table is walked twice rather than per-model per-request.
     today_cost_summary = pricing.calculate_stats_cost(stats.today_by_model_detailed)
@@ -918,5 +924,46 @@ def collect_all(config: dict[str, Any]) -> UsageStats:
     stats.weekly_forecast = forecast.forecast_time_to_limit(
         stats.weekly_utilization, weekly_rate, stats.weekly_reset,
     )
+
+    # ── Daily rollup (Phase 2 history) ─────────────────────────────────────
+    # Keep today's usage-daily.jsonl row current and, once, reconstruct past
+    # days from local transcripts. Wrapped so a rollup error never breaks a
+    # refresh (the live stats above are already complete).
+    try:
+        from claude_usage import daily
+
+        daily_path = os.path.join(claude_dir, daily.DAILY_FILENAME)
+        marker = os.path.join(claude_dir, ".usage-daily-backfilled")
+        if not os.path.exists(marker):
+            try:
+                count = daily.backfill(claude_dir, daily_path)
+                with open(marker, "w", encoding="utf-8") as _m:
+                    _m.write(str(count))
+                _log.info("daily backfill complete: %d day(s)", count)
+            except Exception as _exc:
+                _log.warning("daily backfill failed: %s", _exc)
+
+        _today_tokens = {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}
+        for _b in (stats.today_by_model_detailed or {}).values():
+            for _k in _today_tokens:
+                _today_tokens[_k] += int(_b.get(_k, 0) or 0)
+        daily.upsert_day(daily_path, {
+            "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "messages": int(stats.today_messages),
+            "sessions": int(stats.today_sessions),
+            "tokens": _today_tokens,
+            "cost": round(float(stats.today_cost), 4),
+            "cache_savings": round(float(today_cost_summary.get("cache_savings", 0.0)), 4),
+            "by_model": {
+                _m: {"input": int(_b.get("input", 0) or 0), "output": int(_b.get("output", 0) or 0)}
+                for _m, _b in (stats.today_by_model_detailed or {}).items()
+            },
+            "by_project": dict(stats.today_by_project or {}),
+            "peak_session_util": round(float(stats.session_utilization), 4),
+            "peak_weekly_util": round(float(stats.weekly_utilization), 4),
+            "schema": daily.SCHEMA_VERSION,
+        })
+    except Exception as _exc:
+        _log.warning("daily rollup upsert failed: %s", _exc)
 
     return stats
