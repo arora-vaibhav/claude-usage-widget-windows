@@ -175,6 +175,10 @@ class UsageOverlay(QWidget):
         self._weekly_reset: int = 0
         self._live_tpm: float = 0.0      # tokens/min over the last few minutes
         self._is_live: bool = False       # show the "● LIVE" dot
+        # True when the rate-limit API is unreachable (e.g. expired creds): the
+        # session/weekly %s are then last-known, not live, so paintEvent draws
+        # a "STALE" badge instead of letting them masquerade as current.
+        self._stale: bool = False
         self._active_subagents: int = 0  # count of running Task-tool subagents
         # Ticker tape: newest-first. The paint loop walks them oldest→newest
         # so the newest item rides in from the right edge like a news ticker.
@@ -225,6 +229,9 @@ class UsageOverlay(QWidget):
         self._last_stats = stats
         self._session_pct = max(0.0, min(1.0, float(stats.session_utilization)))
         self._weekly_pct = max(0.0, min(1.0, float(stats.weekly_utilization)))
+        # Stale when the rate-limit API failed: the %s above are last-known,
+        # not live -> paint the STALE badge so they don't look current.
+        self._stale = bool(getattr(stats, "rate_limit_error", ""))
         self._session_reset = int(stats.session_reset)
         self._weekly_reset = int(stats.weekly_reset)
         live = getattr(stats, "live_activity", None)
@@ -437,34 +444,64 @@ class UsageOverlay(QWidget):
 
         if self._minimized:
             self._paint_minimized(p, w, h)
-            return
+        else:
+            painted_by_skin = False
+            # Skin dispatch: when a handoff skin is active, hand the whole OSD
+            # over to its dedicated `paint_osd(p, rect, data, scale)` renderer.
+            # The skin owns the entire panel — background, chrome, bars, ticker.
+            if self._skin is not None and self._last_stats is not None:
+                from PySide6.QtCore import QRectF
+                p.setRenderHint(QPainter.Antialiasing, True)
+                p.setRenderHint(QPainter.TextAntialiasing, True)
+                data = _skin_data_from_stats(
+                    self._last_stats, ticker_offset=self._ticker_offset,
+                )
+                try:
+                    self._skin.paint_osd(p, QRectF(0, 0, w, h), data, self._scale)
+                    painted_by_skin = True
+                except Exception:
+                    # A broken skin module must never leave the OSD black; fall
+                    # through to the default paint path. Traceback to stderr.
+                    import traceback
+                    traceback.print_exc()
+            if not painted_by_skin:
+                if self._view_mode == VIEW_MODE_GAUGE:
+                    self._paint_gauge(p, w, h)
+                else:
+                    self._paint_full(p, w, h)
 
-        # Skin dispatch: when a handoff skin is active, hand the whole OSD
-        # over to its dedicated `paint_osd(p, rect, data, scale)` renderer.
-        # The skin owns the entire panel — background, chrome, bars, ticker
-        # — so the default bars / gauge code paths are skipped.
-        if self._skin is not None and self._last_stats is not None:
-            from PySide6.QtCore import QRectF
-            p.setRenderHint(QPainter.Antialiasing, True)
-            p.setRenderHint(QPainter.TextAntialiasing, True)
-            data = _skin_data_from_stats(
-                self._last_stats, ticker_offset=self._ticker_offset,
-            )
-            try:
-                self._skin.paint_osd(p, QRectF(0, 0, w, h), data, self._scale)
-                return
-            except Exception:
-                # Swallow skin-paint errors and fall through to default paint
-                # so a broken skin module never leaves the OSD black. The
-                # traceback goes to stderr via Qt's default path.
-                import traceback
-                traceback.print_exc()
+        # Stale-data badge — drawn last so it sits above every mode/skin when
+        # the rate-limit API is unreachable (the %s shown are last-known only).
+        if self._stale and not self._minimized:
+            self._paint_stale_badge(p, w, h)
 
-        if self._view_mode == VIEW_MODE_GAUGE:
-            self._paint_gauge(p, w, h)
-            return
+    def _paint_stale_badge(self, p: QPainter, w: int, h: int) -> None:
+        """Amber 'STALE' pill (top-right), shown when the API is unreachable.
 
-        self._paint_full(p, w, h)
+        Signals that the session/weekly %s are last-known values rather than
+        live data (e.g. the OAuth token expired and needs re-auth), so they
+        don't masquerade as current.
+        """
+        from PySide6.QtCore import QRectF
+        from PySide6.QtGui import QFont
+
+        s = self._scale
+        label = "STALE"
+        font = QFont()
+        font.setPointSizeF(max(7.0, 8.0 * s))
+        font.setBold(True)
+        p.setFont(font)
+        fm = p.fontMetrics()
+        pad_x, pad_y = 5.0 * s, 2.0 * s
+        bw = fm.horizontalAdvance(label) + 2 * pad_x
+        bh = fm.height() + 2 * pad_y
+        x = w - bw - 4.0 * s
+        y = 3.0 * s
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(240, 170, 40, 235))  # amber
+        p.drawRoundedRect(QRectF(x, y, bw, bh), bh / 2.0, bh / 2.0)
+        p.setPen(QColor(28, 22, 8))
+        p.drawText(QRectF(x, y, bw, bh), Qt.AlignCenter, label)
 
     def _paint_minimized(self, p: QPainter, w: int, h: int) -> None:
         """Thin capsule showing session utilisation."""
