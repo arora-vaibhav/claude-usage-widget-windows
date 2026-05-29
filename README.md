@@ -2,6 +2,7 @@
 
 A Windows-native desktop overlay that shows your [Claude Code](https://docs.anthropic.com/en/docs/claude-code) usage in real time — session %, weekly %, reset timers, cost breakdown, and a weekly AI summary.
 
+This is a **full-source, Windows-focused fork** of [`claude-usage-widget`](https://github.com/bozdemir/claude-usage-widget) by Burak (MIT). The complete application source lives in [`src/claude_usage/`](src/claude_usage) and is installed directly from this repo — there is no separate PyPI download or patch-overlay step.
 
 ---
 
@@ -9,14 +10,15 @@ A Windows-native desktop overlay that shows your [Claude Code](https://docs.anth
 
 | Area | Change |
 |---|---|
-| **Encoding** | All file reads use `encoding="utf-8"` to avoid `UnicodeDecodeError` on Windows (cp1252 default) |
-| **OAuth auto-refresh** | Expired tokens are refreshed automatically using the stored `refreshToken` — no manual re-auth |
-| **Rate limiting** | Token refresh has a 5-minute cooldown so a broken endpoint isn't hammered |
+| **Packaging** | Full source vendored in `src/`; installs from this repo via `uv tool install .` (no PyPI + patch overlay) |
+| **Encoding** | File reads use `encoding="utf-8"` / `utf-8-sig` to avoid `UnicodeDecodeError` and BOM issues on Windows (cp1252 default) |
+| **OAuth auto-refresh** | Expired tokens refresh automatically from the stored `refreshToken` — no manual re-auth |
+| **Rate limiting** | Token refresh has a cooldown so a broken endpoint isn't hammered |
+| **Memory-safe scans** | Conversation/cache/ticker scans use byte budgets + `MemoryError` guards for large `~/.claude/projects` trees |
 | **No terminal required** | A VBScript launcher runs the widget without a console window |
 | **Desktop shortcut** | Setup creates a one-click `.lnk` on your Desktop |
 | **Position memory** | Drag the widget anywhere; position is saved and restored on next launch |
 | **Details panel** | Wider (680 px), auto-fits height to content, positions next to the OSD widget |
-| **Active sessions** | Removed from the panel (not functional on Windows) |
 
 ---
 
@@ -25,7 +27,7 @@ A Windows-native desktop overlay that shows your [Claude Code](https://docs.anth
 | Requirement | Notes |
 |---|---|
 | Windows 10 / 11 | 64-bit |
-| Python 3.11+ | Via [uv](https://docs.astral.sh/uv/) — installer handles this |
+| Python 3.10+ | Via [uv](https://docs.astral.sh/uv/) — installer handles this |
 | [uv](https://docs.astral.sh/uv/) | Installed automatically if missing |
 | Claude CLI | For initial authentication — [install guide](https://docs.anthropic.com/en/docs/claude-code) |
 | Claude subscription | Pro / Max / Team / Enterprise or API key |
@@ -36,10 +38,10 @@ A Windows-native desktop overlay that shows your [Claude Code](https://docs.anth
 
 ```powershell
 # 1. Clone this repo
-git clone https://github.com/v-zagora/claude-usage-widget-windows.git
+git clone https://github.com/arora-vaibhav/claude-usage-widget-windows.git
 cd claude-usage-widget-windows
 
-# 2. Run the setup script (one time only)
+# 2. Run the setup script (installs from source, one time)
 powershell -ExecutionPolicy Bypass -File setup.ps1
 
 # 3. Authenticate Claude CLI (if not done already)
@@ -48,7 +50,7 @@ claude   # follow the browser auth flow
 # 4. Double-click "Claude Usage" on your Desktop
 ```
 
-That's it. The widget appears as a small translucent overlay — drag it wherever you want.
+The widget appears as a small translucent overlay — drag it wherever you want.
 
 ---
 
@@ -69,47 +71,46 @@ That's it. The widget appears as a small translucent overlay — drag it whereve
 powershell -ExecutionPolicy Bypass -File setup.ps1 -Uninstall
 ```
 
-This removes the launcher, desktop shortcut, and the `claude-usage-widget` uv tool.
+Removes the launcher, desktop shortcut, and the `claude-usage-widget` uv tool.
 
 ---
 
 ## How it works
 
-- `setup.ps1` installs the upstream `claude-usage-widget` via `uv tool install`, then overlays the three patched Python files from `patches/`.
+- `setup.ps1` installs the widget straight from this repo's source with `uv tool install .` — the code in `src/claude_usage/` *is* the app, so nothing can drift out of sync.
 - The VBScript launcher in `launcher/` calls the installed `claude-usage.exe` with `WindowStyle=0`, keeping the GUI visible while hiding the console.
 - Token refresh runs inside the widget process using the `refreshToken` already stored in `~/.claude/.credentials.json` — no credentials are transmitted to this repo or any third party.
+- Usage data comes only from local `~/.claude/` files and the Anthropic rate-limit API.
 
 ---
 
-## Patches overview
+## Development
 
-### `patches/collector.py`
-- All `open()` calls use `encoding="utf-8", errors="replace"` to handle Windows cp1252 defaults
-- `_refresh_access_token_if_needed()`: auto-refreshes the OAuth token before API calls; 5-minute cooldown; atomic file write via `tmp + os.replace()`
+```powershell
+# Editable install for development
+uv tool install -e .
 
-### `patches/overlay.py`
-- Added `positionSaved = Signal(int, int)` Qt signal
-- `mouseReleaseEvent`: emits position signal after a drag ends so the main app can persist it
+# Run the test suite (headless, pure-logic tests)
+uv run --extra dev pytest
+# or, against the source tree without installing:
+#   $env:PYTHONPATH="src"; uv run --no-project --with pytest python -m pytest tests
+```
 
-### `patches/widget.py`
-- `_save_osd_position()`: writes `osd_x` / `osd_y` to user config on drag
-- Restores saved position on startup
-- `_fit_height()`: measures inner layout height directly (bypasses `QScrollArea`) and resizes the popup to fit content, capped at 88% of screen
-- Details panel: 680 px wide, smart positioning relative to OSD, section headers don't word-wrap
-- Active sessions section disabled (not functional on Windows)
+- **Layout:** `src/claude_usage/` (package), `tests/unit/` (tests), `launcher/`, `setup.ps1`.
+- **Build:** setuptools (`pyproject.toml`), single runtime dependency `PySide6-Essentials`.
+- **Design & roadmap:** see [`docs/superpowers/specs/`](docs/superpowers/specs) for the modernization plan (stabilization, a usage-history store + dashboard, and UI work).
 
 ---
 
 ## Contributing
 
-PRs welcome. If you find a Windows-specific bug, open an issue with your Python version, uv version, and the error output from the console (run `claude-usage.exe` directly in a terminal to see logs).
+PRs welcome. For a Windows-specific bug, open an issue with your Python version, uv version, and console output — run `claude-usage` directly in a terminal to see logs.
 
 ---
 
 ## License
 
-This repo contains only the Windows-specific patches and setup tooling. The patched source files remain under the same license as the upstream project. See [upstream LICENSE](https://github.com/bozdemir/claude-usage-widget/blob/main/LICENSE) for details.
-
+MIT. This fork vendors the full upstream source under the same MIT License — see [`LICENSE`](LICENSE) (© 2026 Burak) and [`NOTICE`](NOTICE) for attribution and a summary of fork changes.
 
 ---
 
