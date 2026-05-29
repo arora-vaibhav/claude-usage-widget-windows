@@ -6,7 +6,8 @@
 # in this repo IS the app, so there is nothing to drift out of sync.
 
 param(
-    [switch]$Uninstall
+    [switch]$Uninstall,
+    [switch]$Autostart   # also launch the widget automatically at login
 )
 
 $ErrorActionPreference = "Stop"
@@ -15,6 +16,8 @@ $ErrorActionPreference = "Stop"
 $repoDir      = $PSScriptRoot
 $launcherDst  = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\claude-usage-launcher.vbs"
 $shortcutDst  = "$env:USERPROFILE\Desktop\Claude Usage.lnk"
+$startupDir   = [Environment]::GetFolderPath('Startup')
+$autostartDst = Join-Path $startupDir "Claude Usage.lnk"
 
 function Write-Step($msg) { Write-Host "`n>> $msg" -ForegroundColor Cyan }
 function Write-OK($msg)   { Write-Host "   OK: $msg" -ForegroundColor Green }
@@ -25,6 +28,7 @@ if ($Uninstall) {
     Write-Step "Uninstalling..."
     if (Test-Path $launcherDst) { Remove-Item $launcherDst; Write-OK "Removed launcher VBS" }
     if (Test-Path $shortcutDst) { Remove-Item $shortcutDst; Write-OK "Removed desktop shortcut" }
+    if (Test-Path $autostartDst) { Remove-Item $autostartDst; Write-OK "Removed autostart entry" }
     uv tool uninstall claude-usage-widget 2>$null
     Write-OK "Uninstalled claude-usage-widget"
     Write-Host "`nDone." -ForegroundColor Green
@@ -71,6 +75,20 @@ $lnk.Description = "Claude Usage Widget"
 $lnk.Save()
 Write-OK "Desktop shortcut created: Claude Usage.lnk"
 
+# ── Optional: launch automatically at login ────────────────────────────────
+if ($Autostart) {
+    Write-Step "Enabling autostart at login..."
+    $auto = $shell.CreateShortcut($autostartDst)
+    $auto.TargetPath  = "wscript.exe"
+    $auto.Arguments   = "`"$launcherDst`""
+    $auto.WindowStyle = 7
+    $auto.Description = "Claude Usage Widget (autostart)"
+    $auto.Save()
+    Write-OK "Autostart enabled (Startup folder). Disable with: setup.ps1 -Uninstall"
+} else {
+    Write-Host "   (Tip: re-run with -Autostart to launch the widget at login.)" -ForegroundColor DarkGray
+}
+
 # ── Done ───────────────────────────────────────────────────────────────────
 Write-Host @"
 
@@ -81,6 +99,7 @@ Write-Host @"
   - Right-click the widget to access settings or quit.
   - Drag the widget to reposition; position is remembered.
   - Click the widget to open the details panel.
+  - Launch at login: re-run  setup.ps1 -Autostart
 
   First run: make sure you have authenticated Claude CLI
   at least once ('claude' in a terminal) so credentials
