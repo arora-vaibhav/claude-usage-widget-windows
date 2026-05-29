@@ -160,8 +160,26 @@ def _launch_gui() -> None:
     config = load_config(_default_config_path())
     setup_logging(config["claude_dir"])
     get_logger().info("claude-usage %s starting", __version__)
+
+    # Single-instance guard. Multiple concurrent copies each refresh the shared
+    # OAuth token; because refresh tokens rotate on use, the losers invalidate
+    # the winner's token -> "invalid_grant" -> recording silently dies. A
+    # PID-aware lock file (QLockFile clears stale locks left by a crash) keeps
+    # exactly one instance alive; the lock releases automatically on exit.
+    from PySide6.QtCore import QLockFile
+
+    lock_path = os.path.join(config["claude_dir"], ".claude-usage.lock")
+    _lock = QLockFile(lock_path)
+    if not _lock.tryLock(100):
+        get_logger().warning(
+            "another claude-usage instance is already running (lock: %s); exiting",
+            lock_path,
+        )
+        print("claude-usage is already running.", file=sys.stderr)
+        return
+
     _controller = ClaudeUsageApp(config)  # keep a reference
-    _ = _controller  # suppress unused-var warnings; QApplication holds ownership
+    _ = (_controller, _lock)  # keep both alive for the whole process lifetime
     sys.exit(app.exec())
 
 
