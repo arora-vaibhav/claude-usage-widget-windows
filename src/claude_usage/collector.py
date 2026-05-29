@@ -550,6 +550,33 @@ def _refresh_access_token_if_needed(creds_path: str) -> None:
     except Exception as _exc:
         _log.warning("token refresh failed: %s", _exc)
 
+
+LONG_LIVED_TOKEN_FILENAME = "claude-usage-token"
+
+
+def _load_long_lived_token(claude_dir: str) -> str | None:
+    """Return a user-provided long-lived token, if one is configured.
+
+    Set up once via ``claude setup-token`` and stored either in the
+    ``CLAUDE_USAGE_TOKEN`` environment variable or in
+    ``<claude_dir>/claude-usage-token``. Unlike the rotating OAuth access token
+    in ``.credentials.json`` (which Claude Code invalidates when it refreshes
+    in-memory during active use), a long-lived token does not rotate, so the
+    widget keeps working without re-logins.
+    """
+    env = (os.environ.get("CLAUDE_USAGE_TOKEN") or "").strip()
+    if env:
+        return env
+    path = os.path.join(claude_dir, LONG_LIVED_TOKEN_FILENAME)
+    try:
+        if os.path.isfile(path):
+            tok = open(path, encoding="utf-8-sig").read().strip()
+            return tok or None
+    except OSError:
+        pass
+    return None
+
+
 def _load_credentials(claude_dir: str) -> str | None:
     """Load the OAuth access token from the credentials file or macOS Keychain.
 
@@ -560,6 +587,12 @@ def _load_credentials(claude_dir: str) -> str | None:
 
     Returns the raw access-token string, or ``None`` if no valid token is found.
     """
+    # 0. Prefer a long-lived token (set up once via `claude setup-token`). It
+    #    doesn't rotate, so Claude Code's in-use refreshes can't invalidate it.
+    long_lived = _load_long_lived_token(claude_dir)
+    if long_lived:
+        return long_lived
+
     # 1. Try the credentials file (Linux + macOS)
     creds_path = os.path.join(claude_dir, ".credentials.json")
     _refresh_access_token_if_needed(creds_path)
