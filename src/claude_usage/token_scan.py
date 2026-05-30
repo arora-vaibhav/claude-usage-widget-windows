@@ -3,14 +3,15 @@
 A budget-capped *full* re-scan every refresh under-counts when the daily
 transcript volume exceeds the budget. This scanner instead tracks a byte offset
 per file and streams only the **new** lines appended since last time into
-per-UTC-day token buckets.
+per-LOCAL-day token buckets ("today" follows the user's local day, matching the
+rest of the app).
 
 To stay responsive on huge histories it:
-  * orders files **newest-first** and reads at most ``_PER_SCAN_BUDGET`` bytes
-    per ``scan()`` call, so today's usage is captured first and a single call
-    never blocks for minutes (the backlog catches up over a few refreshes);
-  * **persists** its offsets + day buckets to disk, so the one expensive full
-    pass happens once ever — restarts resume incrementally.
+  * orders files newest-first and reads at most ``_PER_SCAN_BUDGET`` bytes per
+    ``scan()`` call, so today's usage is captured first and a single call never
+    blocks for minutes (the backlog catches up over a few refreshes);
+  * persists offsets + day buckets to disk, so the one expensive full pass
+    happens once ever — restarts resume incrementally.
 
 ``collect_tokens()`` is a drop-in replacement for the collector's old
 ``_collect_tokens_single_pass`` and returns the same result-dict shape.
@@ -23,9 +24,9 @@ import json
 import os
 import tempfile
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
-_WINDOW_SECONDS = 8 * 86400          # today + 7-day week (+ slack)
+_WINDOW_SECONDS = 8 * 86400           # today + 7-day week (+ slack)
 _PER_SCAN_BUDGET = 250 * 1024 * 1024  # max bytes read per scan() call
 _STATE_FILENAME = ".usage-token-scan.json"
 _STATE_SCHEMA = 1
@@ -41,14 +42,27 @@ def _empty_day() -> dict:
     }
 
 
+def local_day(ts: str) -> str:
+    """A UTC ISO-8601 timestamp -> the user's LOCAL calendar date 'YYYY-MM-DD'.
+
+    "Today" follows the user's local day-rollover (matching the rest of the app
+    and what the user perceives as "today"); transcripts store UTC timestamps,
+    so we convert before bucketing. Falls back to the date prefix on bad input.
+    """
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone().strftime("%Y-%m-%d")
+    except (ValueError, TypeError):
+        return ts[:10]
+
+
 class IncrementalTokenScanner:
-    """Streams new transcript lines into per-UTC-day token buckets across refreshes."""
+    """Streams new transcript lines into per-local-day token buckets across refreshes."""
 
     def __init__(self, claude_dir: str) -> None:
         self._claude_dir = claude_dir
         self._state_path = os.path.join(claude_dir, _STATE_FILENAME)
         self._offsets: dict[str, int] = {}   # file path -> bytes consumed
-        self._days: dict[str, dict] = {}     # "YYYY-MM-DD" (UTC) -> bucket
+        self._days: dict[str, dict] = {}     # "YYYY-MM-DD" (local) -> bucket
         self._load_state()
 
     # -- persistence -------------------------------------------------------
@@ -68,7 +82,7 @@ class IncrementalTokenScanner:
             self._days = days
 
     def _save_state(self) -> None:
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=_KEEP_DAYS)).strftime("%Y-%m-%d")
+        cutoff = (datetime.now() - timedelta(days=_KEEP_DAYS)).strftime("%Y-%m-%d")
         days = {d: b for d, b in self._days.items() if d >= cutoff}
         offsets = {p: o for p, o in self._offsets.items() if os.path.exists(p)}
         payload = {"schema": _STATE_SCHEMA, "offsets": offsets, "days": days}
@@ -166,7 +180,7 @@ class IncrementalTokenScanner:
         cc = usage.get("cache_creation_input_tokens", 0) or 0
         model = msg.get("model", "unknown")
 
-        d = self._days.setdefault(ts[:10], _empty_day())
+        d = self._days.setdefault(local_day(ts), _empty_day())
         d["messages"] += 1
         t = d["tokens"]
         t["input"] += inp
@@ -202,7 +216,8 @@ def collect_tokens(
     """Drop-in for ``_collect_tokens_single_pass`` backed by the incremental scanner.
 
     Returns the same result dict: today/week output, per-model (+ detailed),
-    and today's per-project breakdown.
+    and today's per-project breakdown. ``today_prefix`` / ``week_prefixes`` are
+    local YYYY-MM-DD dates (matching the scanner's local-day buckets).
     """
     days = get_scanner(claude_dir).scan()
     result: dict = {

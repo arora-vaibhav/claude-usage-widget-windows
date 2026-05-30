@@ -850,7 +850,11 @@ def collect_all(config: dict[str, Any]) -> UsageStats:
     week_start = now - timedelta(days=6)
     week_dates = [(week_start + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
 
-    tokens = _collect_tokens_single_pass(claude_dir, today_str, week_dates)
+    # Incremental, persisted scanner (buckets by the user's LOCAL day to match
+    # today_str): counts today fully where the old budget-capped single pass
+    # under-counted huge days, and stays cheap per refresh. Same result shape.
+    from claude_usage import token_scan
+    tokens = token_scan.collect_tokens(claude_dir, today_str, week_dates)
     stats.today_tokens = tokens["today_output"]
     stats.week_tokens = tokens["week_output"]
     stats.today_model_tokens = tokens["today_by_model"]
@@ -1010,7 +1014,7 @@ def collect_all(config: dict[str, Any]) -> UsageStats:
             for _k in _today_tokens:
                 _today_tokens[_k] += int(_b.get(_k, 0) or 0)
         daily.upsert_day(daily_path, {
-            "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "date": datetime.now().strftime("%Y-%m-%d"),
             "messages": int(stats.today_messages),
             "sessions": int(stats.today_sessions),
             "tokens": _today_tokens,

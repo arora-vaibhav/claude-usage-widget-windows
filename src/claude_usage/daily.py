@@ -32,7 +32,9 @@ import glob
 import json
 import os
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime
+
+from claude_usage.token_scan import local_day
 
 DAILY_FILENAME = "usage-daily.jsonl"
 SCHEMA_VERSION = 1
@@ -154,7 +156,7 @@ def _bucket_transcripts_by_day(claude_dir: str) -> dict[str, dict]:
                     ts = entry.get("timestamp", "")
                     if not isinstance(ts, str) or len(ts) < 10:
                         continue
-                    day = ts[:10]  # ISO-8601 UTC -> YYYY-MM-DD
+                    day = local_day(ts)  # UTC timestamp -> user's local calendar day
                     msg = entry.get("message", {})
                     if not isinstance(msg, dict):
                         continue
@@ -210,7 +212,7 @@ def _bucket_history_by_day(claude_dir: str) -> dict[str, dict]:
             if not ts_ms:
                 continue
             try:
-                day = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+                day = datetime.fromtimestamp(ts_ms / 1000).strftime("%Y-%m-%d")
             except (OverflowError, OSError, ValueError):
                 continue
             d = out.setdefault(day, {"messages": 0, "sessions": set()})
@@ -232,7 +234,7 @@ def _bucket_peak_util_by_day(claude_dir: str) -> dict[str, dict]:
         if not ts:
             continue
         try:
-            day = datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime("%Y-%m-%d")
+            day = datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d")
         except (OverflowError, OSError, ValueError):
             continue
         d = out.setdefault(day, {"session": 0.0, "weekly": 0.0})
