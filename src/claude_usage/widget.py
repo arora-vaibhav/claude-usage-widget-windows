@@ -1102,6 +1102,17 @@ class ClaudeUsageApp(QObject):
 
         # Show the overlay and kick off the first refresh.
         self.overlay.show()
+        
+        # Keep the OSD reliably above other windows. On Windows the
+        # WindowStaysOnTopHint z-order is lost over time when other topmost or
+        # fullscreen windows appear, so re-raise the overlay on a short timer.
+        # raise_() only (never activateWindow) so we never steal keyboard focus
+        # from whatever the user is actually working in.
+        self._ontop_timer = QTimer(self)
+        self._ontop_timer.timeout.connect(
+            lambda: self.overlay.raise_() if self.overlay.isVisible() else None
+        )
+        self._ontop_timer.start(2000)
         self._refresh_async()
 
         # Periodic refresh timer (runs on the GUI thread).
