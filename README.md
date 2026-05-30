@@ -1,8 +1,21 @@
 # Claude Usage Widget — Windows Edition
 
-A Windows-native desktop overlay that shows your [Claude Code](https://docs.anthropic.com/en/docs/claude-code) usage in real time — session %, weekly %, reset timers, cost breakdown, and a weekly AI summary.
+A Windows-native desktop overlay that shows your [Claude Code](https://docs.anthropic.com/en/docs/claude-code) usage in real time — session %, weekly %, reset timers, cost breakdown, a full usage-history dashboard, and a weekly AI summary.
 
 This is a **full-source, Windows-focused fork** of [`claude-usage-widget`](https://github.com/bozdemir/claude-usage-widget) by Burak (MIT). The complete application source lives in [`src/claude_usage/`](src/claude_usage) and is installed directly from this repo — there is no separate PyPI download or patch-overlay step.
+
+---
+
+## What's new in v1.1
+
+- **📊 Usage-history dashboard** — a full window (open from the tray icon or the OSD right-click → "Dashboard…") with custom-painted charts: a cost-per-day trend, output-tokens/day, messages/day, and per-model + per-project breakdowns, with a **7 / 30 / 90-day / All** range selector.
+- **🗂️ Persistent usage history** — a daily rollup store (`~/.claude/usage-daily.jsonl`) records tokens, cost, messages, per-model and per-project totals each refresh, and **backfills from your existing transcripts** so the dashboard has real depth on first run.
+- **🖥️ System-tray icon** — always-reachable entry point (open dashboard, details, refresh, quit) so the widget is never "lost" behind other windows.
+- **💲 Accurate today's cost** — an incremental, memory-safe transcript scanner counts the full day (the old budget-capped scan under-counted heavy days), bucketed by your **local** day so it lines up with what you actually used today.
+- **📌 Reliable always-on-top** — the OSD re-asserts its top-most position on a short timer (raise-only, never steals focus) so it no longer sinks behind other windows over time.
+- **🎨 At-a-glance limit colors** — session/weekly percentages tint green → amber → red with usage.
+- **🩺 Honest connection state** — a "STALE" badge when the live API can't be reached, plus a rotating log at `~/.claude/claude-usage.log`; single-instance lock; opt-in launch-at-login (`setup.ps1 -Autostart`).
+- **🔢 Correct model pricing** — adds `claude-opus-4-8` and infers tier for future model releases (Opus was previously priced as Sonnet).
 
 ---
 
@@ -60,7 +73,8 @@ The widget appears as a small translucent overlay — drag it wherever you want.
 |---|---|
 | **Click** the widget | Opens the details panel |
 | **Drag** the widget | Moves it; position is saved automatically |
-| **Right-click** | Context menu: settings, theme, quit |
+| **Right-click** | Context menu: **Dashboard…**, details, refresh, settings, theme, quit |
+| **Tray icon** | Click to open the dashboard; right-click for the full menu |
 | **Close** details panel | Just close the window; the OSD stays |
 
 ---
