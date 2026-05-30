@@ -1,0 +1,234 @@
+"""Incremental, memory-safe transcript token scanner.
+
+A budget-capped *full* re-scan every refresh under-counts when the daily
+transcript volume exceeds the budget. This scanner instead tracks a byte offset
+per file and streams only the **new** lines appended since last time into
+per-UTC-day token buckets.
+
+To stay responsive on huge histories it:
+  * orders files **newest-first** and reads at most ``_PER_SCAN_BUDGET`` bytes
+    per ``scan()`` call, so today's usage is captured first and a single call
+    never blocks for minutes (the backlog catches up over a few refreshes);
+  * **persists** its offsets + day buckets to disk, so the one expensive full
+    pass happens once ever — restarts resume incrementally.
+
+``collect_tokens()`` is a drop-in replacement for the collector's old
+``_collect_tokens_single_pass`` and returns the same result-dict shape.
+"""
+
+from __future__ import annotations
+
+import glob
+import json
+import os
+import tempfile
+import time
+from datetime import datetime, timedelta, timezone
+
+_WINDOW_SECONDS = 8 * 86400          # today + 7-day week (+ slack)
+_PER_SCAN_BUDGET = 250 * 1024 * 1024  # max bytes read per scan() call
+_STATE_FILENAME = ".usage-token-scan.json"
+_STATE_SCHEMA = 1
+_KEEP_DAYS = 14                       # prune persisted day buckets beyond this
+
+
+def _empty_day() -> dict:
+    return {
+        "messages": 0,
+        "tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0},
+        "by_model": {},
+        "by_project": {},
+    }
+
+
+class IncrementalTokenScanner:
+    """Streams new transcript lines into per-UTC-day token buckets across refreshes."""
+
+    def __init__(self, claude_dir: str) -> None:
+        self._claude_dir = claude_dir
+        self._state_path = os.path.join(claude_dir, _STATE_FILENAME)
+        self._offsets: dict[str, int] = {}   # file path -> bytes consumed
+        self._days: dict[str, dict] = {}     # "YYYY-MM-DD" (UTC) -> bucket
+        self._load_state()
+
+    # -- persistence -------------------------------------------------------
+    def _load_state(self) -> None:
+        try:
+            with open(self._state_path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(data, dict) or data.get("schema") != _STATE_SCHEMA:
+            return
+        offs = data.get("offsets")
+        days = data.get("days")
+        if isinstance(offs, dict):
+            self._offsets = {str(k): int(v) for k, v in offs.items()}
+        if isinstance(days, dict):
+            self._days = days
+
+    def _save_state(self) -> None:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=_KEEP_DAYS)).strftime("%Y-%m-%d")
+        days = {d: b for d, b in self._days.items() if d >= cutoff}
+        offsets = {p: o for p, o in self._offsets.items() if os.path.exists(p)}
+        payload = {"schema": _STATE_SCHEMA, "offsets": offsets, "days": days}
+        try:
+            dirname = os.path.dirname(self._state_path) or "."
+            fd, tmp = tempfile.mkstemp(dir=dirname, prefix=".uts-", suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+            os.replace(tmp, self._state_path)
+        except OSError:
+            pass
+
+    # -- scanning ----------------------------------------------------------
+    def scan(self) -> dict[str, dict]:
+        """Read newly-appended lines (newest files first, budget-bounded)."""
+        projects_dir = os.path.join(self._claude_dir, "projects")
+        if not os.path.isdir(projects_dir):
+            return self._days
+        projects_dir = os.path.realpath(projects_dir)
+        cutoff = time.time() - _WINDOW_SECONDS
+
+        candidates: list[tuple[float, str, int]] = []
+        for path in glob.glob(os.path.join(projects_dir, "*", "*.jsonl")):
+            if "subagents" in path.split(os.sep):
+                continue
+            try:
+                mtime = os.path.getmtime(path)
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            if mtime < cutoff and path not in self._offsets:
+                continue
+            off = self._offsets.get(path, 0)
+            if size < off:        # truncated / replaced -> re-read from start
+                off = 0
+                self._offsets[path] = 0
+            if size <= off:
+                continue          # nothing new appended
+            candidates.append((mtime, path, off))
+
+        if not candidates:
+            return self._days
+
+        candidates.sort(reverse=True)  # newest first -> today captured first
+        budget = _PER_SCAN_BUDGET
+        for _mtime, path, off in candidates:
+            if budget <= 0:
+                break
+            budget -= self._scan_file(path, off, budget)
+        self._save_state()
+        return self._days
+
+    def _scan_file(self, path: str, off: int, budget: int) -> int:
+        """Stream new lines from *path* (from *off*), up to ~*budget* bytes. Returns bytes read."""
+        project = os.path.basename(os.path.dirname(path))
+        consumed = off
+        read = 0
+        try:
+            with open(path, "rb") as f:
+                f.seek(off)
+                for raw in f:                 # streams one line at a time (memory-safe)
+                    if raw.endswith(b"\n"):
+                        self._consume(raw[:-1], project)
+                        consumed += len(raw)
+                        read += len(raw)
+                        if read >= budget:
+                            break             # hit the per-scan budget; resume next call
+                    else:
+                        break                 # partial trailing line -> re-read next time
+        except (OSError, MemoryError):
+            return read
+        self._offsets[path] = consumed
+        return read
+
+    def _consume(self, raw_line: bytes, project: str) -> None:
+        line = raw_line.strip()
+        if not line:
+            return
+        try:
+            entry = json.loads(line.decode("utf-8", "replace"))
+        except (json.JSONDecodeError, ValueError):
+            return
+        if entry.get("type") != "assistant":
+            return
+        ts = entry.get("timestamp", "")
+        if not isinstance(ts, str) or len(ts) < 10:
+            return
+        msg = entry.get("message", {})
+        if not isinstance(msg, dict):
+            return
+        usage = msg.get("usage", {}) or {}
+        inp = usage.get("input_tokens", 0) or 0
+        out = usage.get("output_tokens", 0) or 0
+        cr = usage.get("cache_read_input_tokens", 0) or 0
+        cc = usage.get("cache_creation_input_tokens", 0) or 0
+        model = msg.get("model", "unknown")
+
+        d = self._days.setdefault(ts[:10], _empty_day())
+        d["messages"] += 1
+        t = d["tokens"]
+        t["input"] += inp
+        t["output"] += out
+        t["cache_read"] += cr
+        t["cache_creation"] += cc
+        bm = d["by_model"].setdefault(
+            model, {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0})
+        bm["input"] += inp
+        bm["output"] += out
+        bm["cache_read"] += cr
+        bm["cache_creation"] += cc
+        d["by_project"][project] = d["by_project"].get(project, 0) + out
+
+
+_SCANNERS: dict[str, IncrementalTokenScanner] = {}
+
+
+def get_scanner(claude_dir: str) -> IncrementalTokenScanner:
+    """Return a process-lifetime scanner for *claude_dir* (created on first use)."""
+    s = _SCANNERS.get(claude_dir)
+    if s is None:
+        s = IncrementalTokenScanner(claude_dir)
+        _SCANNERS[claude_dir] = s
+    return s
+
+
+def collect_tokens(
+    claude_dir: str,
+    today_prefix: str,
+    week_prefixes: list[str],
+) -> dict:
+    """Drop-in for ``_collect_tokens_single_pass`` backed by the incremental scanner.
+
+    Returns the same result dict: today/week output, per-model (+ detailed),
+    and today's per-project breakdown.
+    """
+    days = get_scanner(claude_dir).scan()
+    result: dict = {
+        "today_output": 0,
+        "today_messages": 0,
+        "week_output": 0,
+        "today_by_model": {},
+        "today_by_model_detailed": {},
+        "week_by_model_detailed": {},
+        "today_by_project": {},
+    }
+    week_set = set(week_prefixes) | {today_prefix}
+    for date, d in days.items():
+        if date not in week_set:
+            continue
+        result["week_output"] += d["tokens"]["output"]
+        for model, b in d["by_model"].items():
+            wb = result["week_by_model_detailed"].setdefault(
+                model, {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0})
+            for k in ("input", "output", "cache_read", "cache_creation"):
+                wb[k] += b.get(k, 0)
+        if date == today_prefix:
+            result["today_output"] = d["tokens"]["output"]
+            result["today_messages"] = d["messages"]
+            result["today_by_project"] = dict(d["by_project"])
+            for model, b in d["by_model"].items():
+                result["today_by_model"][model] = b.get("output", 0)
+                result["today_by_model_detailed"][model] = dict(b)
+    return result
