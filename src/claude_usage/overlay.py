@@ -845,8 +845,11 @@ class UsageOverlay(QWidget):
             label_text = label.lower()
         p.drawText(QPointF(pad_x, baseline), label_text)
 
+        # Percentage tinted by usage level (green -> amber -> red), matching the
+        # bar fill, so "how close to the limit" reads instantly.
         pct_text = f"{int(pct * 100)}%"
         pct_width = p.fontMetrics().horizontalAdvance(pct_text)
+        p.setPen(_bar_color(pct, self._theme))
         p.drawText(QPointF(w - pad_x - pct_width, baseline), pct_text)
 
         # Reset-time (between label and percentage, small font)
