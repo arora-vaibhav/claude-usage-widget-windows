@@ -630,19 +630,83 @@ def _load_credentials(claude_dir: str) -> str | None:
     return None
 
 
+def _fetch_unified_headers_via_messages(token: str) -> dict[str, Any]:
+    """Read plan utilization from the ``anthropic-ratelimit-unified-*`` response
+    headers of a tiny ``/v1/messages`` call, using curl (Cloudflare rate-limits
+    urllib's TLS fingerprint).
+
+    These unified headers carry the SAME 5h/7d plan-level utilization as
+    ``/api/oauth/usage``. This path is required for long-lived ``setup-token``
+    credentials, which lack the ``user:profile`` scope the OAuth-usage endpoint
+    demands (it 403s) but still receive the unified headers here.
+    """
+    import subprocess as _sp
+
+    _curl = r"C:\Windows\System32\curl.exe"
+    if not os.path.isfile(_curl):
+        _curl = "curl"
+    _kw: dict[str, Any] = {}
+    if sys.platform == "win32":
+        _kw["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+    body = json.dumps({
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "h"}],
+    })
+    try:
+        res = _sp.run(
+            [
+                _curl, "-s", "-D", "-", "-o", os.devnull, "-w", "\n%{http_code}",
+                "https://api.anthropic.com/v1/messages",
+                "-H", f"Authorization: Bearer {token}",
+                "-H", "anthropic-version: 2023-06-01",
+                "-H", "anthropic-beta: oauth-2025-04-20",
+                "-H", "content-type: application/json",
+                "-d", body,
+            ],
+            capture_output=True, text=True, timeout=15, **_kw,
+        )
+    except (OSError, _sp.SubprocessError):
+        return {"error": "API request failed -- check network"}
+    if res.returncode != 0:
+        return {"error": "API request failed -- check network"}
+    out = res.stdout or ""
+    nl = out.rfind("\n")
+    status = out[nl + 1:].strip() if nl >= 0 else ""
+    head_text = out[:nl] if nl >= 0 else out
+    headers: dict[str, str] = {}
+    for line in head_text.splitlines():
+        if ":" in line:
+            k, _, v = line.partition(":")
+            headers[k.strip().lower()] = v.strip()
+    if any(k.startswith("anthropic-ratelimit-unified-") for k in headers):
+        return _parse_rate_limit_headers(headers)
+    if status == "401":
+        return {"error": "Credentials expired -- re-authenticate with 'claude'"}
+    if status == "429":
+        return {"error": "Rate limited -- try again shortly"}
+    return {"error": f"API error {status or '?'}"}
+
+
 def fetch_rate_limits(claude_dir: str) -> dict[str, Any]:
     """Fetch the user's plan utilization from Anthropic.
 
-    Calls Claude Code's own ``/api/oauth/usage`` endpoint, which returns the
-    five-hour and seven-day plan-level utilization the Claude UI shows. The
-    legacy path (issuing a tiny ``/v1/messages`` call to read response
-    headers) was per-API-key rate limits — a different thing — so it
-    chronically under-reported real usage. We keep that path as a fallback
-    for any future schema break in the OAuth endpoint.
+    Two credential shapes are supported:
+
+    * **Subscription OAuth** (``.credentials.json``) — has the ``user:profile``
+      scope, so we use Claude Code's ``/api/oauth/usage`` endpoint directly.
+    * **Long-lived token** (``claude setup-token``) — lacks ``user:profile`` and
+      403s on that endpoint, so we read the identical 5h/7d plan utilization
+      from the ``/v1/messages`` unified rate-limit headers instead.
     """
     token = _load_credentials(claude_dir)
     if not token:
         return {"error": "No credentials found -- run 'claude' to log in"}
+
+    # Long-lived tokens (sk-ant-oat...) can't use /api/oauth/usage (no
+    # user:profile scope) — read plan utilization from the unified headers.
+    if _load_long_lived_token(claude_dir):
+        return _fetch_unified_headers_via_messages(token)
 
     # Primary path — the OAuth usage endpoint Claude Code itself uses.
     primary = _fetch_oauth_usage(token)
