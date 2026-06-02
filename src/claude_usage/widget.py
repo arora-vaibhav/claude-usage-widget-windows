@@ -1113,6 +1113,18 @@ class ClaudeUsageApp(QObject):
             lambda: self.overlay.raise_() if self.overlay.isVisible() else None
         )
         self._ontop_timer.start(2000)
+
+        # Autonomous auth self-healing: when the plan-usage fetch fails with a
+        # credential error for several cycles in a row, the watchdog re-mints a
+        # long-lived token (`claude setup-token`) so the widget recovers without
+        # a manual re-login. Repairs run on a worker thread (setup-token can take
+        # a while) and are rate-limited internally.
+        from claude_usage.auth_watchdog import AuthWatchdog
+        self._auth_watchdog = AuthWatchdog(
+            self.config["claude_dir"], on_repair_attempt=self._on_auth_repair,
+        )
+        self._repair_inflight = False
+
         self._refresh_async()
 
         # Periodic refresh timer (runs on the GUI thread).
@@ -1508,6 +1520,12 @@ class ClaudeUsageApp(QObject):
         import time as _t
         self._last_refresh_ts = _t.time()
 
+        # Autonomous auth self-healing: hand the outcome to the watchdog, which
+        # counts consecutive *credential* failures (ignoring transient 429/net)
+        # and, past its threshold, re-mints a long-lived token on a worker
+        # thread. Guarded so only one repair runs at a time.
+        self._maybe_self_heal_auth(stats.rate_limit_error)
+
         # ── Resilience: backoff on transient auth / network errors ──────
         if stats.rate_limit_error:
             self._consecutive_errors += 1
@@ -1583,6 +1601,45 @@ class ClaudeUsageApp(QObject):
             })
 
     # -------------------------------------------------------------- slots
+
+    def _maybe_self_heal_auth(self, error: str | None) -> None:
+        """Feed a fetch outcome to the auth watchdog; run any repair off-thread.
+
+        The watchdog decides whether this counts as an auth failure and whether
+        a repair is due (threshold + cooldown). Because ``claude setup-token``
+        can take a while, the repair runs on a daemon thread so the UI never
+        freezes; ``_repair_inflight`` ensures only one runs at a time.
+        """
+        wd = getattr(self, "_auth_watchdog", None)
+        if wd is None or getattr(self, "_repair_inflight", False):
+            # Still let success reset the streak even while a repair is in flight.
+            if wd is not None and error is None:
+                wd.note_result(None)
+            return
+        import threading
+
+        def _run() -> None:
+            try:
+                wd.note_result(error)
+            finally:
+                self._repair_inflight = False
+
+        # Only spin a thread when there's a credential error to act on; success
+        # / transient errors are cheap and handled inline.
+        from claude_usage.auth_watchdog import is_auth_error
+        if is_auth_error(error):
+            self._repair_inflight = True
+            threading.Thread(target=_run, name="auth-watchdog", daemon=True).start()
+        else:
+            wd.note_result(error)  # resets streak on success; ignores 429/net
+
+    def _on_auth_repair(self, message: str) -> None:
+        """Watchdog notification hook — log + best-effort desktop notification."""
+        try:
+            from claude_usage.notifier import notify
+            notify("Claude Usage", message)
+        except Exception:
+            pass  # notifier is optional; the log already records the event
 
     def _on_overlay_click(self) -> None:
         self._show_popup()

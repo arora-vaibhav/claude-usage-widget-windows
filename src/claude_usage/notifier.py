@@ -79,16 +79,55 @@ def _send_macos(title: str, body: str) -> None:
         pass
 
 
+def _send_windows(title: str, body: str) -> None:
+    """Fire a desktop notification via a Windows tray balloon (PowerShell)."""
+    # Single-quoted PowerShell strings escape a quote by doubling it; collapse
+    # newlines so the one-line command stays intact and content can't break out.
+    def _escape(s: str) -> str:
+        return s.replace("'", "''").replace("\n", " ").replace("\r", " ")
+    t = _escape(title)
+    b = _escape(body)
+    script = (
+        "Add-Type -AssemblyName System.Windows.Forms;"
+        "Add-Type -AssemblyName System.Drawing;"
+        "$n=New-Object System.Windows.Forms.NotifyIcon;"
+        "$n.Icon=[System.Drawing.SystemIcons]::Information;"
+        "$n.Visible=$true;"
+        f"$n.ShowBalloonTip(6000,'{t}','{b}',"
+        "[System.Windows.Forms.ToolTipIcon]::Info);"
+        "Start-Sleep -Milliseconds 6500;$n.Dispose()"
+    )
+    try:
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-NonInteractive",
+             "-WindowStyle", "Hidden", "-Command", script],
+            creationflags=0x08000000,  # CREATE_NO_WINDOW
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except (OSError, ValueError):
+        pass
+
+
 def _default_sender() -> Callable[[str, str], None]:
     if sys.platform == "darwin":
         return _send_macos
     if sys.platform.startswith("linux"):
         return _send_linux
+    if sys.platform.startswith("win"):
+        return _send_windows
 
     def _noop(title: str, body: str) -> None:
         return
 
     return _noop
+
+
+def notify(title: str, body: str) -> None:
+    """Fire a one-off desktop notification on the current platform (best effort)."""
+    try:
+        _default_sender()(title, body)
+    except Exception:
+        pass
 
 
 class UsageNotifier:
