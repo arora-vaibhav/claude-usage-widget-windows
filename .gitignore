@@ -25,5 +25,14 @@ Desktop.ini
 
 # Secrets / credentials – never commit these
 .env
+.env.*
 *.credentials.json
 credentials.json
+# Claude auth tokens (the widget reads these from ~/.claude; never vendor them)
+claude-usage-token
+*-token
+.usage-token-scan.json
+# Anthropic OAuth/API token files
+*.pem
+*.key
+secrets.json
