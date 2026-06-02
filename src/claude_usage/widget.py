@@ -1641,6 +1641,22 @@ class ClaudeUsageApp(QObject):
         except Exception:
             pass  # notifier is optional; the log already records the event
 
+    def _reconnect_auth(self) -> None:
+        """Manual tray 'Reconnect': force a token repair, bypassing backoff/give-up."""
+        wd = getattr(self, "_auth_watchdog", None)
+        if wd is None or getattr(self, "_repair_inflight", False):
+            return
+        import threading
+
+        def _run() -> None:
+            try:
+                wd.force_repair()
+            finally:
+                self._repair_inflight = False
+
+        self._repair_inflight = True
+        threading.Thread(target=_run, name="auth-reconnect", daemon=True).start()
+
     def _on_overlay_click(self) -> None:
         self._show_popup()
 
@@ -1697,6 +1713,7 @@ class ClaudeUsageApp(QObject):
             ("📊  Open Dashboard", self._open_dashboard),
             ("◉  Details…", self._show_popup),
             ("↻  Refresh", self._refresh_async),
+            ("🔌  Reconnect (re-auth)", self._reconnect_auth),
         ):
             act = QAction(label, menu)
             act.triggered.connect(slot)
