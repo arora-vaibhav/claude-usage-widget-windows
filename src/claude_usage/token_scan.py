@@ -35,9 +35,6 @@ _STATE_FILENAME = ".usage-token-scan.json"
 # discards any pre-dedup persisted state so totals self-correct on upgrade.
 _STATE_SCHEMA = 2
 _KEEP_DAYS = 14                       # prune persisted day buckets beyond this
-# Cap the persisted set of counted message-ids so the state file can't grow
-# unbounded; ids age out with their day buckets in practice, this is a backstop.
-_MAX_SEEN_IDS = 200_000
 
 
 def _empty_day() -> dict:
@@ -70,10 +67,13 @@ class IncrementalTokenScanner:
         self._state_path = os.path.join(claude_dir, _STATE_FILENAME)
         self._offsets: dict[str, int] = {}   # file path -> bytes consumed
         self._days: dict[str, dict] = {}     # "YYYY-MM-DD" (local) -> bucket
-        # message.id values already counted — Claude Code repeats a turn's usage
-        # block across multiple JSONL lines, so we count each id once. Persisted
-        # so duplicates spanning scan/restart boundaries stay deduped.
-        self._seen_ids: set[str] = set()
+        # message.id values already counted, keyed by local day. Claude Code
+        # repeats a turn's usage block across multiple JSONL lines, so we count
+        # each id once. Persisted so duplicates spanning scan/restart boundaries
+        # stay deduped — and stored PER DAY so the seen-set prunes in lockstep
+        # with its day bucket (a flat set would keep ids forever, which under-
+        # counts if a >14-day-old file is ever rewritten and re-scanned).
+        self._seen_by_day: dict[str, set[str]] = {}
         self._load_state()
 
     # -- persistence -------------------------------------------------------
@@ -92,18 +92,21 @@ class IncrementalTokenScanner:
         if isinstance(days, dict):
             self._days = days
         seen = data.get("seen")
-        if isinstance(seen, list):
-            self._seen_ids = {str(s) for s in seen}
+        if isinstance(seen, dict):
+            self._seen_by_day = {
+                str(day): {str(i) for i in ids}
+                for day, ids in seen.items() if isinstance(ids, list)
+            }
 
     def _save_state(self) -> None:
         cutoff = (datetime.now() - timedelta(days=_KEEP_DAYS)).strftime("%Y-%m-%d")
         days = {d: b for d, b in self._days.items() if d >= cutoff}
         offsets = {p: o for p, o in self._offsets.items() if os.path.exists(p)}
-        # Keep only the most recent ids if we've blown past the cap (set has no
-        # order, so this is an arbitrary-but-bounded trim — a pure backstop).
-        seen = list(self._seen_ids)
-        if len(seen) > _MAX_SEEN_IDS:
-            seen = seen[-_MAX_SEEN_IDS:]
+        # Prune seen-ids on the SAME day cutoff as the buckets, so the two stay
+        # in lockstep: an id is remembered exactly as long as its day bucket is.
+        seen = {
+            day: list(ids) for day, ids in self._seen_by_day.items() if day >= cutoff
+        }
         payload = {"schema": _STATE_SCHEMA, "offsets": offsets, "days": days, "seen": seen}
         try:
             dirname = os.path.dirname(self._state_path) or "."
@@ -200,12 +203,17 @@ class IncrementalTokenScanner:
             return
         # Dedupe by message.id: Claude Code writes one JSONL line per content/
         # tool block within a turn, each repeating the SAME turn-level usage
-        # block. Counting every line inflated totals ~3-4x. Count each id once;
-        # drop entries with no id (we can't safely dedupe those replays).
+        # block. Counting every line inflated totals ~3-4x. Count each id once
+        # PER DAY (so the seen-set prunes with its day bucket); drop entries with
+        # no id (we can't safely dedupe those replays).
         msg_id = str(msg.get("id") or "")
-        if not msg_id or msg_id in self._seen_ids:
+        if not msg_id:
             return
-        self._seen_ids.add(msg_id)
+        day = local_day(ts)
+        seen = self._seen_by_day.setdefault(day, set())
+        if msg_id in seen:
+            return
+        seen.add(msg_id)
 
         usage = msg.get("usage", {}) or {}
         inp = usage.get("input_tokens", 0) or 0
@@ -213,7 +221,7 @@ class IncrementalTokenScanner:
         cr = usage.get("cache_read_input_tokens", 0) or 0
         cc = usage.get("cache_creation_input_tokens", 0) or 0
 
-        d = self._days.setdefault(local_day(ts), _empty_day())
+        d = self._days.setdefault(day, _empty_day())
         d["messages"] += 1
         t = d["tokens"]
         t["input"] += inp

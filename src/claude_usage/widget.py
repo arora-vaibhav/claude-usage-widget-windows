@@ -1593,7 +1593,13 @@ class ClaudeUsageApp(QObject):
         # ────────────────────────────────────────────────────────────────
 
         self.overlay.update_stats(display)
-        self.popup.update_stats(display)
+        # Guarded: the popup may be embedded in the unified window; if that
+        # window were ever destroyed, Qt would delete the child popup and this
+        # unconditional call would raise every refresh. Defensive by design.
+        try:
+            self.popup.update_stats(display)
+        except RuntimeError:
+            pass
         self.skin_popup.update_stats(display)
         # If the unified window is open, keep its Overview tab live too. (It
         # embeds self.popup, so the call above already refreshed the content;

@@ -120,7 +120,7 @@ class UnifiedWindow(QWidget):
         import csv
         import os
 
-        from PySide6.QtWidgets import QFileDialog
+        from PySide6.QtWidgets import QFileDialog, QMessageBox
 
         from claude_usage import daily
 
@@ -142,8 +142,13 @@ class UnifiedWindow(QWidget):
                         r.get("messages", 0), tok.get("input", 0), tok.get("output", 0),
                         tok.get("cache_read", 0), tok.get("cache_creation", 0),
                     ])
-        except OSError:
-            pass
+        except (OSError, csv.Error, UnicodeError) as exc:
+            # Never claim success on a failed write — Excel-locked file, full
+            # disk, permission denied are all common on Windows.
+            QMessageBox.warning(self, "Export failed", f"Could not write CSV:\n{exc}")
+            return
+        QMessageBox.information(self, "Export complete",
+                                f"Exported {len(rows)} days to:\n{path}")
 
     def _build_qss(self) -> str:
         t = self._theme

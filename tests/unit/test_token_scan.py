@@ -84,6 +84,27 @@ def test_duplicate_id_dedup_survives_rescan(tmp_path):
     assert days["2026-05-29"]["tokens"]["output"] == 100  # still once
 
 
+def test_seen_ids_persist_and_prune_per_day(tmp_path):
+    # The seen-set is keyed per local day and persisted; it must round-trip
+    # through state so a new scanner instance still dedupes a replayed id.
+    tx = tmp_path / "projects" / "proj-a" / "s1.jsonl"
+    _write(tx, [_entry("2026-05-29T10:00:00Z", 100, msg_id="msg_p")])
+    s1 = IncrementalTokenScanner(str(tmp_path))
+    s1.scan()
+    assert "2026-05-29" in s1._seen_by_day
+    assert "msg_p" in s1._seen_by_day["2026-05-29"]
+
+    # A fresh scanner loads persisted state; if the file is rewritten (offset
+    # reset) the replayed id is still deduped via the persisted per-day set.
+    _write(tx, [
+        _entry("2026-05-29T10:00:00Z", 100, msg_id="msg_p"),   # same id, replayed
+        _entry("2026-05-29T11:00:00Z", 40, msg_id="msg_q"),    # new id
+    ])
+    s2 = IncrementalTokenScanner(str(tmp_path))
+    days = s2.scan()
+    assert days["2026-05-29"]["tokens"]["output"] == 140  # 100 (once) + 40, not 240
+
+
 def test_synthetic_and_no_id_entries_skipped(tmp_path):
     tx = tmp_path / "projects" / "proj-a" / "s1.jsonl"
     _write(tx, [

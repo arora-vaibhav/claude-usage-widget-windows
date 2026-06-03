@@ -63,7 +63,8 @@ class _ChartBase(QWidget):
     def set_items(self, items: Sequence[tuple[str, float]]) -> None:
         self._items = list(items)
         self._hover_idx = -1
-        self.update()
+        self._hit_x = []  # stale until the next paint rebuilds it; avoids
+        self.update()      # indexing new items with old hit positions
 
     # -- hover -------------------------------------------------------------
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
