@@ -1108,11 +1108,21 @@ class ClaudeUsageApp(QObject):
         self.overlay.rightClicked.connect(self._on_overlay_right_click)
         self.stats_ready.connect(self._apply_stats)
 
-        # Restore saved OSD position (if user has dragged it before).
+        # Restore saved OSD position (if user has dragged it before) — but only
+        # if it still lands on a connected screen. Otherwise (a monitor was
+        # unplugged / resolution changed) it would restore off-screen and become
+        # unreachable; fall back to the default position instead.
         _osd_x = config.get("osd_x")
         _osd_y = config.get("osd_y")
         if _osd_x is not None and _osd_y is not None:
-            self.overlay.move(int(_osd_x), int(_osd_y))
+            if self._osd_pos_visible(int(_osd_x), int(_osd_y)):
+                self.overlay.move(int(_osd_x), int(_osd_y))
+            else:
+                from claude_usage.logging_setup import get_logger
+                get_logger().info(
+                    "saved OSD position (%s,%s) is off-screen; using default",
+                    _osd_x, _osd_y,
+                )
 
         # Persist position whenever the user drags the overlay.
         def _save_osd_position(x: int, y: int) -> None:
@@ -1706,6 +1716,26 @@ class ClaudeUsageApp(QObject):
 
     def _on_overlay_right_click(self, global_pos: QPoint) -> None:
         self._context_menu.popup(global_pos)
+
+    def _osd_pos_visible(self, x: int, y: int) -> bool:
+        """True if an OSD placed at (x, y) would land on a connected screen.
+
+        Guards against restoring the overlay onto a monitor that was unplugged
+        or whose resolution shrank, which would otherwise strand it off-screen.
+        Checks the would-be top-left rect against each screen's available area;
+        requires a small visible overlap so a 1px sliver doesn't count.
+        """
+        from PySide6.QtCore import QRect
+        from PySide6.QtGui import QGuiApplication
+
+        w = max(self.overlay.width(), 80)
+        h = max(self.overlay.height(), 24)
+        rect = QRect(x, y, w, h)
+        for screen in QGuiApplication.screens():
+            inter = screen.availableGeometry().intersected(rect)
+            if inter.width() >= 24 and inter.height() >= 12:
+                return True
+        return False
 
     def _get_unified_window(self):
         """Return the singleton unified (Overview + History tabs) window.
