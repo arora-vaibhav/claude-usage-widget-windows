@@ -805,7 +805,16 @@ class UsagePopup(QWidget):
         adjustSize() does not see through QScrollArea, so we query the
         inner layout directly and cap at 88% of the available screen.
         """
-        self._layout.activate()
+        # When embedded in the unified tabbed window the popup is a child
+        # widget, not a top-level window — self-resizing is both meaningless
+        # and unsafe. And this runs from a deferred singleShot timer, so the
+        # underlying C++ object may already be gone. Bail on either.
+        try:
+            if self.parent() is not None:
+                return
+            self._layout.activate()
+        except RuntimeError:
+            return
         content_h = self._layout.sizeHint().height() + 2 * POPUP_PAD
         # Frame height delta (title bar + border) -- may be 0 before first paint
         fg = self.frameGeometry()
@@ -1566,6 +1575,15 @@ class ClaudeUsageApp(QObject):
         self.overlay.update_stats(display)
         self.popup.update_stats(display)
         self.skin_popup.update_stats(display)
+        # If the unified window is open, keep its Overview tab live too. (It
+        # embeds self.popup, so the call above already refreshed the content;
+        # this also lets the window react to fresh stats if needed.)
+        _unified = getattr(self, "_unified", None)
+        if _unified is not None:
+            try:
+                _unified.update_stats(display)
+            except RuntimeError:
+                self._unified = None  # window was closed/destroyed
         self.notifier.check_stats(stats)
 
         # Webhook: anomaly
@@ -1663,25 +1681,48 @@ class ClaudeUsageApp(QObject):
     def _on_overlay_right_click(self, global_pos: QPoint) -> None:
         self._context_menu.popup(global_pos)
 
-    def _open_dashboard(self) -> None:
-        """Open (or re-focus) the usage-history Dashboard window, brought to front."""
-        from PySide6.QtCore import Qt
-        from claude_usage.dashboard import DashboardWindow
+    def _get_unified_window(self):
+        """Return the singleton unified (Overview + History tabs) window.
 
-        w = getattr(self, "_dashboard", None)
+        Embeds the live ``self.popup`` as the Overview tab and a
+        ``DashboardWindow`` as the History tab, so the existing
+        ``self.popup.update_stats(...)`` in ``_apply_stats`` keeps the Overview
+        tab live with zero extra wiring. Lazily created; recreated if the
+        underlying C++ object was destroyed.
+        """
+        from claude_usage.dashboard import DashboardWindow, UnifiedWindow
+
+        w = getattr(self, "_unified", None)
         try:
             if w is None:
                 raise RuntimeError("create")
-            _ = w.isVisible()  # touches the C++ object; raises if it was destroyed
+            _ = w.isVisible()  # raises if the C++ object was destroyed
         except RuntimeError:
-            w = DashboardWindow(self.config)
-            self._dashboard = w
-        # Un-minimise, show, and force to the front (it otherwise opens behind
-        # maximised windows and looks "missing").
+            dashboard = DashboardWindow(self.config)
+            w = UnifiedWindow(self.config, self.popup, dashboard)
+            self._unified = w
+            # Seed the Overview tab with the latest stats we already have.
+            if getattr(self, "stats", None) is not None:
+                try:
+                    w.update_stats(self.stats)
+                except Exception:
+                    pass
+        return w
+
+    def _present_unified(self, tab_index: int) -> None:
+        """Bring the unified window to the front on the given tab."""
+        from PySide6.QtCore import Qt
+
+        w = self._get_unified_window()
+        w.show_tab(tab_index)
         w.setWindowState((w.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
         w.show()
         w.raise_()
         w.activateWindow()
+
+    def _open_dashboard(self) -> None:
+        """Open the unified window on the History tab, brought to front."""
+        self._present_unified(1)
 
     def _setup_tray(self) -> None:
         """Add a system-tray icon: a persistent entry point to the dashboard.
@@ -1737,16 +1778,19 @@ class ClaudeUsageApp(QObject):
             self._open_dashboard()
 
     def _show_popup(self) -> None:
-        # Pick the popup implementation that matches the active theme:
-        # classic themes use the layout-based popup; the 6 handoff skins
-        # use SkinPopupWidget (pure paintEvent).
+        # Classic themes use the unified tabbed window (Overview + History),
+        # which embeds the layout-based popup as its Overview tab. The 6 handoff
+        # skins keep their bespoke pure-paintEvent SkinPopupWidget.
         from claude_usage.skins import SKIN_MODULES
         theme_name = str(self.config.get("theme", "default"))
-        target = self.skin_popup if theme_name in SKIN_MODULES else self.popup
-        # Hide the other so both windows aren't on-screen simultaneously.
-        other = self.popup if target is self.skin_popup else self.skin_popup
-        if other.isVisible():
-            other.hide()
+        if theme_name not in SKIN_MODULES:
+            self._present_unified(0)  # Overview tab
+            return
+
+        target = self.skin_popup
+        # Hide the classic popup if it somehow leaked onto screen.
+        if self.popup.isVisible():
+            self.popup.hide()
         # Position popup relative to the OSD overlay
         try:
             osd = self.overlay

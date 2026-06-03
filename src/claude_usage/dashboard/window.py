@@ -75,6 +75,15 @@ class DashboardWindow(QWidget):
         )
         self._build()
 
+    def reload(self) -> None:
+        """Re-read the daily store from disk and re-render the current range.
+
+        Cheap (one small JSONL read); call when the History view becomes
+        visible so newly-recorded days appear without reopening the window.
+        """
+        self._rows = daily.load_daily(self._daily_path)
+        self._render(self._range_days)
+
     # -- construction ------------------------------------------------------
     def _build(self) -> None:
         outer = QVBoxLayout(self)
