@@ -82,11 +82,14 @@ def hourly_histogram(
     samples: list[dict],
     now: float,
     key: str = "session",
+    utc: bool = False,
 ) -> list[float]:
     """Return a 24-bucket list: average utilization at each hour of day.
 
-    Only samples from the last 7 days are considered. Buckets with no
-    samples are 0.0.
+    Only samples from the last 7 days are considered. Buckets with no samples
+    are 0.0. The hour is the user's **local** hour-of-day (so the chart's
+    "by hour of day" label is truthful); pass ``utc=True`` for deterministic
+    UTC bucketing in tests.
     """
     cutoff = now - 7 * 86400
     sums = [0.0] * 24
@@ -95,9 +98,14 @@ def hourly_histogram(
         ts = float(s.get("ts", 0))
         if ts < cutoff:
             continue
-        # Use UTC hour directly from the timestamp to keep the bucketing
-        # timezone-independent (tests supply synthetic timestamps).
-        hour = int((ts // 3600) % 24)
+        if utc:
+            hour = int((ts // 3600) % 24)
+        else:
+            # Local hour-of-day — what the user means by "I'm active at 3pm".
+            try:
+                hour = datetime.fromtimestamp(ts).hour
+            except (OverflowError, OSError, ValueError):
+                hour = int((ts // 3600) % 24)
         sums[hour] += float(s.get(key, 0))
         counts[hour] += 1
     return [
