@@ -175,6 +175,11 @@ class UsageOverlay(QWidget):
         self._weekly_reset: int = 0
         self._live_tpm: float = 0.0      # tokens/min over the last few minutes
         self._is_live: bool = False       # show the "● LIVE" dot
+        # Rich fields surfaced via the hover tooltip (not drawn on the panel).
+        self._today_cost: float = 0.0
+        self._session_forecast: dict = {}
+        self._weekly_forecast: dict = {}
+        self._anomaly_msg: str = ""
         # True when the rate-limit API is unreachable (e.g. expired creds): the
         # session/weekly %s are then last-known, not live, so paintEvent draws
         # a "STALE" badge instead of letting them masquerade as current.
@@ -191,6 +196,9 @@ class UsageOverlay(QWidget):
         # persists to config.
         raw_mode = str(cfg.get("osd_view_mode", VIEW_MODE_BARS))
         self._view_mode: str = raw_mode if raw_mode in VIEW_MODES else VIEW_MODE_BARS
+
+        # Pointing-hand cursor signals the panel is clickable (opens the window).
+        self.setCursor(Qt.PointingHandCursor)
 
         # Drag tracking
         self._press_pos: QPoint | None = None        # mouse pos on press (global)
@@ -243,6 +251,14 @@ class UsageOverlay(QWidget):
             self._live_tpm = 0.0
         self._active_subagents = max(0, int(getattr(stats, "active_subagent_count", 0) or 0))
         self._ticker_items = list(getattr(stats, "ticker_items", []) or [])
+        # Rich data the OSD ingests but is too small to draw — surfaced on hover
+        # via the tooltip so it isn't wasted (today's cost, time-to-limit
+        # forecasts, anomaly note). Near-zero cost, high value.
+        self._today_cost = float(getattr(stats, "today_cost", 0.0) or 0.0)
+        self._session_forecast = dict(getattr(stats, "session_forecast", {}) or {})
+        self._weekly_forecast = dict(getattr(stats, "weekly_forecast", {}) or {})
+        self._anomaly_msg = str(getattr(getattr(stats, "anomaly", None), "message", "") or "")
+        self.setToolTip(self._build_tooltip())
         # Animate whenever we have items and a view that actually draws the
         # ticker — default bars mode, or a skin that opts in via its
         # module-level WANTS_TICKER flag.
@@ -262,6 +278,33 @@ class UsageOverlay(QWidget):
             self._ticker_timer.stop()
             self._ticker_offset = 0.0
         self.update()  # schedule a paintEvent
+
+    def _build_tooltip(self) -> str:
+        """Compose the hover tooltip from the rich fields the panel can't draw."""
+        from claude_usage.forecast import format_forecast
+
+        lines = [
+            f"Session: {int(self._session_pct * 100)}%   ·   "
+            f"Weekly: {int(self._weekly_pct * 100)}%",
+        ]
+        if self._today_cost > 0:
+            lines.append(f"Today: ${self._today_cost:,.2f} (API-equiv)")
+        if self._is_live and self._live_tpm > 0:
+            tpm = self._live_tpm
+            lines.append(f"Live: {tpm/1000:.1f}k tok/min" if tpm >= 1000
+                         else f"Live: {int(tpm)} tok/min")
+        s_fc = format_forecast(self._session_forecast)
+        if s_fc:
+            lines.append(f"Session {s_fc}")
+        w_fc = format_forecast(self._weekly_forecast)
+        if w_fc:
+            lines.append(f"Weekly {w_fc}")
+        if self._anomaly_msg:
+            lines.append(f"⚠ {self._anomaly_msg}")
+        if self._stale:
+            lines.append("STALE — usage %s are last-known (API unreachable)")
+        lines.append("Click to open · drag to move")
+        return "\n".join(lines)
 
     def set_view_mode(self, mode: str) -> None:
         """Switch between bar and gauge rendering; resizes the OSD to match."""
