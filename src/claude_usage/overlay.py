@@ -13,6 +13,7 @@ Interactions:
 
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from typing import Any
 
@@ -230,6 +231,27 @@ class UsageOverlay(QWidget):
         self._ticker_timer.setInterval(TICKER_FRAME_INTERVAL_MS)
         self._ticker_timer.timeout.connect(self._advance_ticker)
 
+        # Near-limit pulse: when utilization is high, the usage bar's fill
+        # gently pulses to draw the eye ("you're about to hit your cap"). Only
+        # runs when needed, so the OSD stays CPU-idle the rest of the time.
+        self._pulse_phase: float = 0.0
+        self._pulse_timer = QTimer(self)
+        self._pulse_timer.setInterval(80)  # ~12 fps, plenty for a slow pulse
+        self._pulse_timer.timeout.connect(self._advance_pulse)
+
+    PULSE_THRESHOLD = 0.90  # start pulsing once session OR weekly hits 90%
+
+    def _advance_pulse(self) -> None:
+        self._pulse_phase = (self._pulse_phase + 0.18) % (2 * math.pi)
+        self.update()
+
+    def _pulse_alpha(self, pct: float) -> float:
+        """Alpha multiplier for a bar fill at *pct* — 1.0 unless near-limit."""
+        if pct < self.PULSE_THRESHOLD:
+            return 1.0
+        # Sine between ~0.55 and 1.0 so the fill 'breathes' without vanishing.
+        return 0.775 + 0.225 * math.sin(self._pulse_phase)
+
     # ------------------------------------------------------------------ API
 
     def update_stats(self, stats: UsageStats) -> None:
@@ -259,6 +281,19 @@ class UsageOverlay(QWidget):
         self._weekly_forecast = dict(getattr(stats, "weekly_forecast", {}) or {})
         self._anomaly_msg = str(getattr(getattr(stats, "anomaly", None), "message", "") or "")
         self.setToolTip(self._build_tooltip())
+
+        # Near-limit pulse: run the animation timer only while at/over threshold
+        # (and not stale — a frozen %, don't alarm on stale data).
+        near_limit = (not self._stale) and (
+            self._session_pct >= self.PULSE_THRESHOLD
+            or self._weekly_pct >= self.PULSE_THRESHOLD
+        )
+        if near_limit and not self._minimized:
+            if not self._pulse_timer.isActive():
+                self._pulse_timer.start()
+        elif self._pulse_timer.isActive():
+            self._pulse_timer.stop()
+            self._pulse_phase = 0.0
         # Animate whenever we have items and a view that actually draws the
         # ticker — default bars mode, or a skin that opts in via its
         # module-level WANTS_TICKER flag.
@@ -984,6 +1019,13 @@ class UsageOverlay(QWidget):
         """Render one usage bar in the style dictated by the current theme."""
         style = self._style.bar_style
         s = self._scale
+        # Near-limit pulse: modulate the fill's alpha when pct is high (the timer
+        # only runs then, so this is a no-op multiplier the rest of the time).
+        _fill = _bar_color(pct, self._theme)
+        _a = self._pulse_alpha(pct)
+        if _a < 1.0:
+            _fill = QColor(_fill)
+            _fill.setAlphaF(_fill.alphaF() * _a)
         if style == BAR_STYLE_ASCII:
             # Monospace block glyphs — htop / btop vibe. We draw with the
             # mono font so each cell is a fixed cell width; filled vs empty
@@ -992,7 +1034,7 @@ class UsageOverlay(QWidget):
             filled = round(pct * cells)
             font = _mono_font(max(7, int(10 * s)))
             p.setFont(font)
-            fill = _bar_color(pct, self._theme)
+            fill = _fill
             track = _hex_to_qcolor(self._theme["bar_track"], 0.8)
             fm = p.fontMetrics()
             cell_w = fm.horizontalAdvance("█")
@@ -1010,7 +1052,7 @@ class UsageOverlay(QWidget):
             p.setBrush(_hex_to_qcolor(self._theme["bar_track"], 0.8))
             p.drawRect(QRectF(x, y, w, h))
             if pct > 0:
-                p.setBrush(_bar_color(pct, self._theme))
+                p.setBrush(_fill)
                 p.drawRect(QRectF(x, y, w * min(pct, 1.0), h))
             return
 
@@ -1020,5 +1062,5 @@ class UsageOverlay(QWidget):
         p.drawRoundedRect(QRectF(x, y, w, h), radius, radius)
         if pct > 0:
             fill_w = max(w * min(pct, 1.0), h)
-            p.setBrush(_bar_color(pct, self._theme))
+            p.setBrush(_fill)
             p.drawRoundedRect(QRectF(x, y, fill_w, h), radius, radius)
