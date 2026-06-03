@@ -932,9 +932,13 @@ def collect_all(config: dict[str, Any]) -> UsageStats:
     top_projects = sorted(project_totals.items(), key=lambda kv: kv[1], reverse=True)[:10]
     stats.today_by_project = dict(top_projects)
 
-    # history.jsonl can stop updating (Claude Code rotates it); transcripts are
-    # the robust turn source, so take whichever message count is higher.
-    stats.today_messages = max(stats.today_messages, int(tokens.get("today_messages", 0)))
+    # "Messages" = assistant turns (responses), counted from the deduped
+    # transcript scanner — the SAME unit as tokens/cost, so the metrics agree.
+    # parse_history counts user *prompt* lines from history.jsonl (a different
+    # unit) and can go stale when Claude Code rotates the file, so it's only a
+    # fallback when transcripts yielded nothing.
+    _turns = int(tokens.get("today_messages", 0))
+    stats.today_messages = _turns if _turns > 0 else int(stats.today_messages)
 
     # Cost estimates via pricing module. A single call covers today + week so
     # the pricing table is walked twice rather than per-model per-request.

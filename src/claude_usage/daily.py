@@ -321,12 +321,13 @@ def backfill(claude_dir: str, daily_path: str | None = None) -> int:
         cost = pricing.calculate_stats_cost(bm_detailed)
         hist = hist_by_day.get(day, {})
         util = util_by_day.get(day, {})
+        # "Messages" = assistant turns from the deduped transcript scan (same
+        # unit as tokens/cost). history.jsonl counts user *prompts* (a different
+        # unit) and can be stale, so it's only a fallback when transcripts gave 0.
+        _turns = int(tok.get("messages", 0))
         new_rows.append({
             "date": day,
-            # Prefer whichever source has more coverage: history.jsonl can stop
-            # updating, while transcripts (one assistant entry = one turn) keep
-            # going, so a day is never spuriously shown as zero-activity.
-            "messages": max(int(tok.get("messages", 0)), int(hist.get("messages", 0))),
+            "messages": _turns if _turns > 0 else int(hist.get("messages", 0)),
             "sessions": len(hist.get("sessions", set())),
             "tokens": tok.get("tokens", _empty_tokens()),
             "cost": round(float(cost.get("total", 0.0)), 4),
