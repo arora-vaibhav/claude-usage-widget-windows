@@ -709,6 +709,8 @@ class UsagePopup(QWidget):
         override below).
         """
         self._pending_stats = stats
+        import time as _t
+        self._last_update_ts = _t.time()
         if not self.isVisible():
             return
         self._rebuild_from(stats)
@@ -978,7 +980,25 @@ class UsagePopup(QWidget):
 
     def _render_footer(self, stats: UsageStats) -> None:
         self._add_separator()
-        self._add_dim_line("Last updated: just now", margin_bottom=0)
+        # Real "updated N ago" stamp from when this snapshot was applied —
+        # previously hardcoded "just now", which was always a lie on an open
+        # window whose 30s-refreshed content could be minutes old.
+        ts = getattr(self, "_last_update_ts", 0.0)
+        if ts <= 0:
+            updated = "Last updated: just now"
+        else:
+            import time as _t
+            secs = max(0, int(_t.time() - ts))
+            if secs < 5:
+                rel = "just now"
+            elif secs < 60:
+                rel = f"{secs}s ago"
+            elif secs < 3600:
+                rel = f"{secs // 60}m ago"
+            else:
+                rel = f"{secs // 3600}h {(secs % 3600) // 60}m ago"
+            updated = f"Last updated: {rel}"
+        self._add_dim_line(updated, margin_bottom=0)
         if stats.rate_limit_error:
             self._add_dim_line(f"API: {stats.rate_limit_error}", role="error", margin_bottom=0)
 
@@ -1699,7 +1719,8 @@ class ClaudeUsageApp(QObject):
             _ = w.isVisible()  # raises if the C++ object was destroyed
         except RuntimeError:
             dashboard = DashboardWindow(self.config)
-            w = UnifiedWindow(self.config, self.popup, dashboard)
+            w = UnifiedWindow(self.config, self.popup, dashboard,
+                              on_refresh=self._refresh_async)
             self._unified = w
             # Seed the Overview tab with the latest stats we already have.
             if getattr(self, "stats", None) is not None:

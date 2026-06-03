@@ -25,15 +25,17 @@ from claude_usage.themes import get_theme
 class UnifiedWindow(QWidget):
     """A single window with Overview (live) and History (charts) tabs."""
 
-    def __init__(self, config: dict[str, Any], popup: QWidget, dashboard: QWidget) -> None:
+    def __init__(self, config: dict[str, Any], popup: QWidget, dashboard: QWidget,
+                 on_refresh=None) -> None:
         super().__init__()
         self._config = config
         self._theme = get_theme(str(config.get("theme", "default")))
         self._popup = popup
         self._dashboard = dashboard
+        self._on_refresh = on_refresh  # callable() to trigger a live refresh
 
         self.setWindowTitle("Claude Usage")
-        self.resize(980, 800)
+        self.resize(980, 820)
         self.setMinimumSize(520, 460)
         # Utility window: stay on top, keep a native close button, hidden from
         # the taskbar (exit is via the OSD/tray menu).
@@ -49,6 +51,7 @@ class UnifiedWindow(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
+        root.addWidget(self._make_toolbar())
         root.addWidget(self._tabs)
 
         self.setStyleSheet(self._build_qss())
@@ -71,9 +74,87 @@ class UnifiedWindow(QWidget):
         inner.show()
         return page
 
+    def _make_toolbar(self) -> QWidget:
+        """A slim top strip: title + Refresh + Export, right-aligned."""
+        from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton
+
+        t = self._theme
+        bar = QWidget()
+        bar.setObjectName("uniToolbar")
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(14, 8, 12, 8)
+        lay.setSpacing(8)
+
+        title = QLabel("Claude Usage")
+        title.setObjectName("uniTitle")
+        lay.addWidget(title)
+        lay.addStretch(1)
+
+        refresh = QPushButton("↻  Refresh")
+        refresh.setCursor(Qt.PointingHandCursor)
+        refresh.setObjectName("uniBtn")
+        refresh.clicked.connect(self._do_refresh)
+        lay.addWidget(refresh)
+
+        export = QPushButton("⤓  Export CSV")
+        export.setCursor(Qt.PointingHandCursor)
+        export.setObjectName("uniBtn")
+        export.clicked.connect(self._do_export)
+        lay.addWidget(export)
+        return bar
+
+    def _do_refresh(self) -> None:
+        if callable(self._on_refresh):
+            try:
+                self._on_refresh()
+            except Exception:
+                pass
+        if hasattr(self._dashboard, "reload"):
+            try:
+                self._dashboard.reload()
+            except Exception:
+                pass
+
+    def _do_export(self) -> None:
+        """Export the daily-history store to a CSV the user picks."""
+        import csv
+        import os
+
+        from PySide6.QtWidgets import QFileDialog
+
+        from claude_usage import daily
+
+        claude_dir = self._config.get("claude_dir") or os.path.expanduser("~/.claude")
+        rows = daily.load_daily(os.path.join(claude_dir, daily.DAILY_FILENAME))
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export usage history", "claude-usage-history.csv", "CSV (*.csv)")
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                wtr = csv.writer(f)
+                wtr.writerow(["date", "cost_usd", "messages", "input", "output",
+                              "cache_read", "cache_creation"])
+                for r in rows:
+                    tok = r.get("tokens", {})
+                    wtr.writerow([
+                        r.get("date", ""), f"{r.get('cost', 0):.4f}",
+                        r.get("messages", 0), tok.get("input", 0), tok.get("output", 0),
+                        tok.get("cache_read", 0), tok.get("cache_creation", 0),
+                    ])
+        except OSError:
+            pass
+
     def _build_qss(self) -> str:
         t = self._theme
         return f"""
+            QWidget#uniToolbar {{ background: {t['bg']}; border-bottom: 1px solid {t['separator']}; }}
+            QLabel#uniTitle {{ color: {t['text_primary']}; font-size: 13px; font-weight: bold; }}
+            QPushButton#uniBtn {{
+                background: {t['bar_track']}; color: {t['text_secondary']};
+                border: 0; border-radius: 5px; padding: 5px 12px; font-size: 11px;
+            }}
+            QPushButton#uniBtn:hover {{ color: {t['text_primary']}; background: {t['separator']}; }}
             QTabWidget::pane {{ border: 0; background: {t['bg']}; }}
             QTabBar {{ background: {t['bg']}; }}
             QTabBar::tab {{
