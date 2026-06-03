@@ -1,17 +1,19 @@
-"""Daily usage-rollup store — one JSON row per UTC day.
+"""Daily usage-rollup store — one JSON row per LOCAL calendar day.
 
 The fine-grained utilization point-samples live in :mod:`history`; this module
 keeps a compact per-day rollup of tokens / cost / messages / per-model /
 per-project that the dashboard charts read. One row per day keeps the file
 tiny (~365 rows/year), so an upsert just rewrites the whole file atomically.
 
-Days are bucketed in **UTC** to match the conversation-transcript timestamps
-(ISO-8601 ``...Z``) that the token data comes from.
+Days are bucketed by the user's **LOCAL** calendar day (transcript timestamps
+are ISO-8601 UTC ``...Z`` and are converted to local before bucketing), so a
+day matches what the user perceives as "today" — consistent with token_scan and
+trends.
 
 Row schema (v1), all values illustrative::
 
     {
-      "date": "2026-05-29",            # ISO-8601 YYYY-MM-DD, UTC
+      "date": "2026-05-29",            # ISO-8601 YYYY-MM-DD, LOCAL day
       "messages": 142,
       "sessions": 7,
       "tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0},
@@ -154,7 +156,7 @@ def _empty_tokens() -> dict:
 
 
 def _bucket_transcripts_by_day(claude_dir: str) -> dict[str, dict]:
-    """Bucket per-message tokens/model/project by UTC day from transcripts.
+    """Bucket per-message tokens/model/project by LOCAL day from transcripts.
 
     Streams ``~/.claude/projects/*/*.jsonl`` line by line (low memory), newest
     files first, stopping at the byte/file budget. Returns
@@ -244,7 +246,7 @@ def _bucket_transcripts_by_day(claude_dir: str) -> dict[str, dict]:
 
 
 def _bucket_history_by_day(claude_dir: str) -> dict[str, dict]:
-    """Bucket message counts + unique sessions by UTC day from history.jsonl."""
+    """Bucket message counts + unique sessions by LOCAL day from history.jsonl."""
     out: dict[str, dict] = {}
     path = os.path.join(claude_dir, "history.jsonl")
     if not os.path.isfile(path):
@@ -274,7 +276,7 @@ def _bucket_history_by_day(claude_dir: str) -> dict[str, dict]:
 
 
 def _bucket_peak_util_by_day(claude_dir: str) -> dict[str, dict]:
-    """Per-UTC-day peak session/weekly utilization from the point-sample file."""
+    """Per-LOCAL-day peak session/weekly utilization from the point-sample file."""
     from claude_usage.history import load_samples
 
     out: dict[str, dict] = {}

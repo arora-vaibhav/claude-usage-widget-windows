@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import statistics
 from dataclasses import dataclass, field
+from datetime import datetime
 
 
 MIN_SAMPLES = 7  # Need at least a week of data before we flag anomalies
@@ -29,13 +30,20 @@ class AnomalyReport:
 
 
 def _daily_peaks(samples: list[dict], key: str = "session") -> list[float]:
-    """Reduce a sample stream into one max value per calendar day."""
-    by_day: dict[int, float] = {}
+    """Reduce a sample stream into one max value per LOCAL calendar day.
+
+    Local-day grouping matches the rest of the app (token_scan, daily, trends),
+    so the anomaly baseline is built over the same day boundaries the user sees.
+    """
+    by_day: dict[str, float] = {}
     for s in samples:
         ts = float(s.get("ts", 0))
         if ts <= 0:
             continue
-        day = int(ts // 86400)
+        try:
+            day = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+        except (OverflowError, OSError, ValueError):
+            continue
         val = float(s.get(key, 0))
         if val > by_day.get(day, 0.0):
             by_day[day] = val
