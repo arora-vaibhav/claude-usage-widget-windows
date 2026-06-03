@@ -136,6 +136,10 @@ def _bucket_transcripts_by_day(claude_dir: str) -> dict[str, dict]:
             continue
     candidates.sort(reverse=True)  # newest first
 
+    # Dedupe by message.id: Claude Code repeats a turn's usage block across
+    # multiple JSONL lines; counting each line inflated totals ~3-4x. One scan
+    # pass, so a local set suffices.
+    seen_ids: set[str] = set()
     read = 0
     for i, (_mtime, fsize, jp) in enumerate(candidates[:_BACKFILL_MAX_FILES]):
         if read > _BACKFILL_BYTE_BUDGET:
@@ -160,12 +164,18 @@ def _bucket_transcripts_by_day(claude_dir: str) -> dict[str, dict]:
                     msg = entry.get("message", {})
                     if not isinstance(msg, dict):
                         continue
+                    model = msg.get("model", "unknown")
+                    if model in ("<synthetic>", "unknown"):
+                        continue  # Claude Code bookkeeping — not a real user turn
+                    msg_id = str(msg.get("id") or "")
+                    if not msg_id or msg_id in seen_ids:
+                        continue  # repeated usage block for the same turn
+                    seen_ids.add(msg_id)
                     usage = msg.get("usage", {}) or {}
                     inp = usage.get("input_tokens", 0) or 0
                     out = usage.get("output_tokens", 0) or 0
                     cr = usage.get("cache_read_input_tokens", 0) or 0
                     cc = usage.get("cache_creation_input_tokens", 0) or 0
-                    model = msg.get("model", "unknown")
 
                     d = days.setdefault(
                         day,

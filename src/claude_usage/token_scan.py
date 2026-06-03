@@ -29,8 +29,15 @@ from datetime import datetime, timedelta
 _WINDOW_SECONDS = 8 * 86400           # today + 7-day week (+ slack)
 _PER_SCAN_BUDGET = 250 * 1024 * 1024  # max bytes read per scan() call
 _STATE_FILENAME = ".usage-token-scan.json"
-_STATE_SCHEMA = 1
+# Schema 2: dedupe assistant turns by message.id (Claude Code writes one JSONL
+# line per content/tool block, each repeating the SAME turn-level usage block,
+# which previously inflated all token/cost totals ~3-4x). Bumping the schema
+# discards any pre-dedup persisted state so totals self-correct on upgrade.
+_STATE_SCHEMA = 2
 _KEEP_DAYS = 14                       # prune persisted day buckets beyond this
+# Cap the persisted set of counted message-ids so the state file can't grow
+# unbounded; ids age out with their day buckets in practice, this is a backstop.
+_MAX_SEEN_IDS = 200_000
 
 
 def _empty_day() -> dict:
@@ -63,6 +70,10 @@ class IncrementalTokenScanner:
         self._state_path = os.path.join(claude_dir, _STATE_FILENAME)
         self._offsets: dict[str, int] = {}   # file path -> bytes consumed
         self._days: dict[str, dict] = {}     # "YYYY-MM-DD" (local) -> bucket
+        # message.id values already counted — Claude Code repeats a turn's usage
+        # block across multiple JSONL lines, so we count each id once. Persisted
+        # so duplicates spanning scan/restart boundaries stay deduped.
+        self._seen_ids: set[str] = set()
         self._load_state()
 
     # -- persistence -------------------------------------------------------
@@ -80,12 +91,20 @@ class IncrementalTokenScanner:
             self._offsets = {str(k): int(v) for k, v in offs.items()}
         if isinstance(days, dict):
             self._days = days
+        seen = data.get("seen")
+        if isinstance(seen, list):
+            self._seen_ids = {str(s) for s in seen}
 
     def _save_state(self) -> None:
         cutoff = (datetime.now() - timedelta(days=_KEEP_DAYS)).strftime("%Y-%m-%d")
         days = {d: b for d, b in self._days.items() if d >= cutoff}
         offsets = {p: o for p, o in self._offsets.items() if os.path.exists(p)}
-        payload = {"schema": _STATE_SCHEMA, "offsets": offsets, "days": days}
+        # Keep only the most recent ids if we've blown past the cap (set has no
+        # order, so this is an arbitrary-but-bounded trim — a pure backstop).
+        seen = list(self._seen_ids)
+        if len(seen) > _MAX_SEEN_IDS:
+            seen = seen[-_MAX_SEEN_IDS:]
+        payload = {"schema": _STATE_SCHEMA, "offsets": offsets, "days": days, "seen": seen}
         try:
             dirname = os.path.dirname(self._state_path) or "."
             fd, tmp = tempfile.mkstemp(dir=dirname, prefix=".uts-", suffix=".tmp")
@@ -173,12 +192,26 @@ class IncrementalTokenScanner:
         msg = entry.get("message", {})
         if not isinstance(msg, dict):
             return
+        model = msg.get("model", "unknown")
+        # Skip Claude Code's internal bookkeeping turns (compact summaries,
+        # sidechain context). Pricing already zero-rates them, but they also
+        # padded token-volume and message counts — exclude them outright.
+        if model in ("<synthetic>", "unknown"):
+            return
+        # Dedupe by message.id: Claude Code writes one JSONL line per content/
+        # tool block within a turn, each repeating the SAME turn-level usage
+        # block. Counting every line inflated totals ~3-4x. Count each id once;
+        # drop entries with no id (we can't safely dedupe those replays).
+        msg_id = str(msg.get("id") or "")
+        if not msg_id or msg_id in self._seen_ids:
+            return
+        self._seen_ids.add(msg_id)
+
         usage = msg.get("usage", {}) or {}
         inp = usage.get("input_tokens", 0) or 0
         out = usage.get("output_tokens", 0) or 0
         cr = usage.get("cache_read_input_tokens", 0) or 0
         cc = usage.get("cache_creation_input_tokens", 0) or 0
-        model = msg.get("model", "unknown")
 
         d = self._days.setdefault(local_day(ts), _empty_day())
         d["messages"] += 1

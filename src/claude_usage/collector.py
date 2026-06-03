@@ -905,11 +905,13 @@ def collect_all(config: dict[str, Any]) -> UsageStats:
     stats = parse_history(claude_history_path)
     stats.subscription_type = _load_subscription_type(claude_dir)
 
-    # Build date prefix strings used to filter conversation entries by timestamp.
-    # JSONL timestamps are ISO-8601 with a `Z` suffix (UTC), so we MUST build
-    # `today_str` / `week_dates` in UTC — otherwise users west of UTC double-
-    # count their evenings and miss part of their morning.
-    now = datetime.now(timezone.utc)
+    # Build date-key strings used to look up the scanner's day buckets. The
+    # scanner buckets transcript turns by the user's LOCAL calendar day
+    # (token_scan.local_day converts the UTC `Z` timestamps to local first), and
+    # "today" must mean the user's local today — so these keys MUST be built in
+    # LOCAL time too. Building them in UTC made "today" read 0/stale every
+    # evening once local time crossed past UTC midnight.
+    now = datetime.now().astimezone()
     today_str = now.strftime("%Y-%m-%d")
     week_start = now - timedelta(days=6)
     week_dates = [(week_start + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]

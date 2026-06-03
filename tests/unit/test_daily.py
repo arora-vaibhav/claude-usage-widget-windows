@@ -82,15 +82,15 @@ def _seed_transcripts_and_history(cd):
     tx = cd / "projects" / "proj-a" / "s1.jsonl"
     _write(tx, "\n".join([
         json.dumps({"type": "assistant", "timestamp": "2026-05-20T10:00:00.000Z",
-                    "message": {"model": "claude-opus-4-8",
+                    "message": {"id": "m1", "model": "claude-opus-4-8",
                                 "usage": {"input_tokens": 100, "output_tokens": 50,
                                           "cache_read_input_tokens": 10,
                                           "cache_creation_input_tokens": 5}}}),
         json.dumps({"type": "assistant", "timestamp": "2026-05-20T11:00:00.000Z",
-                    "message": {"model": "claude-opus-4-8",
+                    "message": {"id": "m2", "model": "claude-opus-4-8",
                                 "usage": {"input_tokens": 200, "output_tokens": 80}}}),
         json.dumps({"type": "assistant", "timestamp": "2026-05-21T09:00:00.000Z",
-                    "message": {"model": "claude-sonnet-4-6",
+                    "message": {"id": "m3", "model": "claude-sonnet-4-6",
                                 "usage": {"input_tokens": 300, "output_tokens": 120}}}),
         json.dumps({"type": "user", "timestamp": "2026-05-20T10:00:00.000Z"}),  # ignored
     ]) + "\n")
