@@ -78,6 +78,32 @@ def _ms(iso_utc):
     return int(_dt.datetime.fromisoformat(iso_utc).replace(tzinfo=_dt.timezone.utc).timestamp() * 1000)
 
 
+def test_upsert_merged_keeps_peak_util(tmp_path):
+    from claude_usage.daily import upsert_day_merged
+    path = str(tmp_path / DAILY_FILENAME)
+    upsert_day_merged(path, {**_row("2026-06-03"), "peak_session_util": 0.95})
+    # A later refresh at low utilization must NOT lower the recorded peak.
+    upsert_day_merged(path, {**_row("2026-06-03"), "peak_session_util": 0.05})
+    r = load_daily(path)[0]
+    assert r["peak_session_util"] == 0.95
+
+
+def test_upsert_merged_totals_never_regress(tmp_path):
+    from claude_usage.daily import upsert_day_merged
+    path = str(tmp_path / DAILY_FILENAME)
+    upsert_day_merged(path, _row("2026-06-03", output=900, cost=12.0))
+    # A transient smaller recompute (e.g. scanner state reset) must not shrink.
+    upsert_day_merged(path, _row("2026-06-03", output=100, cost=2.0))
+    r = load_daily(path)[0]
+    assert r["tokens"]["output"] == 900
+    assert r["cost"] == 12.0
+    # But a larger value (normal accumulation) does advance.
+    upsert_day_merged(path, _row("2026-06-03", output=1500, cost=20.0))
+    r = load_daily(path)[0]
+    assert r["tokens"]["output"] == 1500
+    assert r["cost"] == 20.0
+
+
 def _seed_transcripts_and_history(cd):
     tx = cd / "projects" / "proj-a" / "s1.jsonl"
     _write(tx, "\n".join([

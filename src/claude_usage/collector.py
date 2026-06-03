@@ -1079,7 +1079,7 @@ def collect_all(config: dict[str, Any]) -> UsageStats:
         for _b in (stats.today_by_model_detailed or {}).values():
             for _k in _today_tokens:
                 _today_tokens[_k] += int(_b.get(_k, 0) or 0)
-        daily.upsert_day(daily_path, {
+        daily.upsert_day_merged(daily_path, {
             "date": datetime.now().strftime("%Y-%m-%d"),
             "messages": int(stats.today_messages),
             "sessions": int(stats.today_sessions),

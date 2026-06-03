@@ -104,6 +104,46 @@ def upsert_day(path: str, row: dict) -> None:
     _atomic_write_rows(path, list(by_date.values()))
 
 
+def upsert_day_merged(path: str, row: dict) -> None:
+    """Upsert today's row, merging monotonic fields so totals never regress.
+
+    The live collector rewrites today's row every refresh. Two hazards that a
+    plain replace would cause, both fixed here by merging against the existing
+    row:
+
+    * ``peak_session_util`` / ``peak_weekly_util`` must be the day's PEAK, but
+      the collector passes the *current* utilization — a plain replace turns the
+      "peak" into a last-sample snapshot (95% at noon, 5% at 8pm -> stored 5%).
+      We keep ``max(existing, new)``.
+    * ``cost`` / ``tokens`` / ``messages`` are monotonic within a day, but a
+      transient scanner-state reset can compute a *smaller* today value mid-day;
+      a plain replace would shrink the day. We keep ``max(existing, new)`` so a
+      reset can't clobber a larger earlier value (it catches back up next scan).
+
+    Non-monotonic fields (by_model/by_project breakdowns, date) take the new
+    value, since they're recomputed wholesale each refresh.
+    """
+    date = str(row["date"])
+    by_date = {str(r.get("date", "")): r for r in load_daily(path)}
+    prev = by_date.get(date)
+    if prev is not None:
+        merged = dict(row)
+        # Peak utilization: true running max across the day.
+        for k in ("peak_session_util", "peak_weekly_util"):
+            merged[k] = max(float(prev.get(k, 0.0) or 0.0), float(row.get(k, 0.0) or 0.0))
+        # Monotonic totals: never let a transient recompute shrink the day.
+        merged["cost"] = max(float(prev.get("cost", 0.0) or 0.0), float(row.get("cost", 0.0) or 0.0))
+        merged["messages"] = max(int(prev.get("messages", 0) or 0), int(row.get("messages", 0) or 0))
+        prev_tok, new_tok = prev.get("tokens", {}) or {}, row.get("tokens", {}) or {}
+        merged["tokens"] = {
+            k: max(int(prev_tok.get(k, 0) or 0), int(new_tok.get(k, 0) or 0))
+            for k in ("input", "output", "cache_read", "cache_creation")
+        }
+        row = merged
+    by_date[date] = row
+    _atomic_write_rows(path, list(by_date.values()))
+
+
 # --------------------------------------------------------------------------
 # Backfill — reconstruct historical daily rows from existing local data so the
 # dashboard has real depth on first run, instead of starting empty.
