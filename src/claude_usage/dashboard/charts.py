@@ -176,6 +176,102 @@ class _ChartBase(QWidget):
         p.drawText(QRectF(bx, by, tw, th_box), Qt.AlignCenter, text)
 
 
+#: distinct segment colours for the stacked bar / legend, in priority order.
+_SEGMENT_KEYS = ("bar_blue", "warn", "live_indicator", "text_link", "crit", "text_secondary")
+
+
+class StackedBar(QWidget):
+    """A single horizontal 100%-stacked bar + legend over ``(label, value)``.
+
+    Reads share-at-a-glance: each item is a coloured segment proportional to its
+    value, with a wrapped legend (label + value) below. Used for "cost by model"
+    and similar composition views where a vertical bar-per-item is overkill.
+    """
+
+    def __init__(
+        self,
+        title: str,
+        items: Sequence[tuple[str, float]],
+        value_fmt: Callable[[float], str] | None = None,
+        theme: dict | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._title = title
+        self._items = [(str(k), max(0.0, float(v))) for k, v in items]
+        self._fmt = value_fmt or (lambda v: f"{v:,.0f}")
+        self._theme = theme or get_theme("default")
+        self.setMinimumHeight(96)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    def _seg_color(self, i: int):
+        th = self._theme
+        return _q(th.get(_SEGMENT_KEYS[i % len(_SEGMENT_KEYS)], th["bar_blue"]))
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.TextAntialiasing)
+        th = self._theme
+        w, h = self.width(), self.height()
+        pad = 14
+        p.fillRect(self.rect(), _q(th["bg"]))
+
+        tf = QFont()
+        tf.setPointSizeF(11.0)
+        tf.setBold(True)
+        p.setFont(tf)
+        p.setPen(_q(th["text_primary"]))
+        p.drawText(QRectF(pad, pad - 2, w - 2 * pad, 20),
+                   Qt.AlignLeft | Qt.AlignVCenter, self._title)
+
+        total = sum(v for _, v in self._items)
+        bar_y, bar_h = pad + 26, 18.0
+        bar_w = w - 2 * pad
+        if total <= 0:
+            p.setFont(QFont())
+            p.setPen(_q(th["text_dim"]))
+            p.drawText(QRectF(pad, bar_y, bar_w, bar_h), Qt.AlignVCenter | Qt.AlignLeft,
+                       "no data yet")
+            return
+
+        # The stacked bar.
+        x = float(pad)
+        for i, (_lbl, v) in enumerate(self._items):
+            seg = (v / total) * bar_w
+            if seg <= 0:
+                continue
+            p.setPen(Qt.NoPen)
+            p.setBrush(self._seg_color(i))
+            p.drawRect(QRectF(x, bar_y, seg, bar_h))
+            x += seg
+
+        # Legend: swatch + label + value, wrapped across rows.
+        lf = QFont()
+        lf.setPointSizeF(8.5)
+        p.setFont(lf)
+        fm = p.fontMetrics()
+        lx, ly = float(pad), bar_y + bar_h + 12
+        for i, (lbl, v) in enumerate(self._items):
+            text = f"{lbl}  {self._fmt(v)}  ({v / total * 100:.0f}%)"
+            tw = 16 + fm.horizontalAdvance(text) + 14
+            if lx + tw > w - pad and lx > pad:
+                lx = float(pad)
+                ly += fm.height() + 6
+            p.setPen(Qt.NoPen)
+            p.setBrush(self._seg_color(i))
+            p.drawRoundedRect(QRectF(lx, ly - 8, 10, 10), 2, 2)
+            p.setPen(_q(th["text_secondary"]))
+            p.drawText(QRectF(lx + 14, ly - 10, tw - 14, 14),
+                       Qt.AlignLeft | Qt.AlignVCenter, text)
+            lx += tw
+
+        # Grow to fit the legend rows.
+        needed = int(ly + fm.height() + pad)
+        if needed > self.minimumHeight():
+            self.setMinimumHeight(needed)
+
+
 class BarChart(_ChartBase):
     """A titled vertical bar chart over ``(label, value)`` pairs."""
 

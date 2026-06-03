@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from claude_usage import daily
-from claude_usage.dashboard.charts import AreaChart, BarChart
+from claude_usage.dashboard.charts import AreaChart, BarChart, StackedBar
 from claude_usage.themes import get_theme
 
 _RANGES: tuple[tuple[str, int | None], ...] = (("7d", 7), ("30d", 30), ("90d", 90), ("All", None))
@@ -189,6 +189,12 @@ class DashboardWindow(QWidget):
                     continue
                 models[m] = models.get(m, 0) + (b.get("output", 0) or 0)
         top_models = sorted(models.items(), key=lambda kv: kv[1], reverse=True)[:6]
+        # Composition at a glance: one stacked bar of model share.
+        if top_models:
+            self._body_layout.addWidget(StackedBar(
+                "Output share by model",
+                [(_short_model(m), v) for m, v in top_models],
+                value_fmt=_fmt_tokens, theme=th))
         self._body_layout.addWidget(BarChart(
             "Output tokens by model",
             [(_short_model(m), v) for m, v in top_models],

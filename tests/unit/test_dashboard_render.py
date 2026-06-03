@@ -16,9 +16,22 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from claude_usage import daily  # noqa: E402
 from claude_usage.dashboard import DashboardWindow  # noqa: E402
-from claude_usage.dashboard.charts import AreaChart, BarChart  # noqa: E402
+from claude_usage.dashboard.charts import AreaChart, BarChart, StackedBar  # noqa: E402
 
 _app = QApplication.instance() or QApplication([])
+
+
+def test_stacked_bar_renders_and_empty():
+    sb = StackedBar("Share", [("a", 70.0), ("b", 30.0)], value_fmt=lambda v: f"{v:.0f}")
+    sb.resize(400, 110)
+    assert not sb.grab().toImage().isNull()
+    # All-zero / empty must not divide by zero.
+    sb2 = StackedBar("Empty", [("a", 0.0)])
+    sb2.resize(300, 100)
+    assert not sb2.grab().toImage().isNull()
+    sb3 = StackedBar("None", [])
+    sb3.resize(300, 100)
+    assert not sb3.grab().toImage().isNull()
 
 
 def test_bar_chart_renders_nonempty():
