@@ -67,6 +67,7 @@ class DashboardWindow(QWidget):
         self._daily_path = os.path.join(claude_dir, daily.DAILY_FILENAME)
         self._rows = daily.load_daily(self._daily_path)
         self._range_days: int | None = 30
+        self._stats = None  # latest live UsageStats (for hourly/heatmap charts)
 
         self.setWindowTitle("Claude Usage — History")
         self.resize(960, 780)
@@ -83,6 +84,17 @@ class DashboardWindow(QWidget):
         """
         self._rows = daily.load_daily(self._daily_path)
         self._render(self._range_days)
+
+    def set_stats(self, stats) -> None:
+        """Store the latest live ``UsageStats`` so the History tab can chart the
+        rich live-only series (hourly activity, etc.) alongside the daily store.
+
+        Only re-renders if the panel is currently showing — the per-refresh
+        snapshot is cheap to stash but we avoid rebuilding an unseen tab.
+        """
+        self._stats = stats
+        if self.isVisible():
+            self._render(self._range_days)
 
     # -- construction ------------------------------------------------------
     def _build(self) -> None:
@@ -191,6 +203,17 @@ class DashboardWindow(QWidget):
             "Output tokens by project",
             [(_short_project(p), v) for p, v in top_proj],
             value_fmt=_fmt_tokens, theme=th, accent_key="text_link"))
+
+        # Live-only series: "Activity by hour of day" from the 24-bucket hourly
+        # histogram (computed each refresh, previously trapped in the text popup).
+        # Values are normalized 0-1 intensities (relative activity), so render as
+        # a percentage of the busiest hour rather than a raw count.
+        hourly = list(getattr(self._stats, "hourly_histogram", []) or [])
+        if len(hourly) == 24 and any(v > 0 for v in hourly):
+            self._body_layout.addWidget(BarChart(
+                "Activity by hour of day  (relative intensity, local)",
+                [(f"{h:02d}", float(hourly[h]) * 100.0) for h in range(24)],
+                value_fmt=lambda v: f"{v:.0f}%", theme=th, accent_key="warn"))
 
         self._body_layout.addStretch(1)
 

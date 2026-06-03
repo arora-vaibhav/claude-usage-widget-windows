@@ -201,6 +201,13 @@ class UnifiedWindow(QWidget):
                 rebuild(stats)
             except Exception:
                 pass
+        # Route the live snapshot to the History tab too, so it can chart the
+        # live-only series (hourly activity, etc.) alongside the daily store.
+        if hasattr(self._dashboard, "set_stats"):
+            try:
+                self._dashboard.set_stats(stats)
+            except Exception:
+                pass
 
     def show_tab(self, index: int) -> None:
         """Select a tab by index (0 = Overview, 1 = History) before showing."""
