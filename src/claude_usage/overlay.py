@@ -151,6 +151,9 @@ class UsageOverlay(QWidget):
     # Emitted when the user right-clicks. Handler should show a context menu.
     rightClicked = Signal(QPoint)
     positionSaved = Signal(int, int)  # emitted after drag
+    # Emitted when the user toggles the collapsed state, so the app can persist
+    # it (osd_minimized) the same way it persists the dragged position.
+    minimizedChanged = Signal(bool)
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         super().__init__()
@@ -167,7 +170,9 @@ class UsageOverlay(QWidget):
         self._last_stats: UsageStats | None = None
         self._scale: float = float(cfg.get("osd_scale", 1.0))
         self._opacity: float = float(cfg.get("osd_opacity", 0.75))
-        self._minimized: bool = False
+        # Restored from config so a user who parks the OSD minimized stays
+        # minimized across restarts (persisted via minimizedChanged below).
+        self._minimized: bool = bool(cfg.get("osd_minimized", False))
 
         # Live stats — updated externally via update_stats()
         self._session_pct: float = 0.0
@@ -406,9 +411,12 @@ class UsageOverlay(QWidget):
         # Restarting requires the bars view mode too (gauge view has no ticker).
         if self._minimized:
             self._ticker_timer.stop()
+            self._pulse_timer.stop()  # no near-limit pulse while collapsed
         elif self._ticker_items and self._view_mode == VIEW_MODE_BARS:
             self._ticker_timer.start()
         self.update()
+        # Let the app persist the new state (-> config osd_minimized).
+        self.minimizedChanged.emit(self._minimized)
 
     # ------------------------------------------------------------- internals
 

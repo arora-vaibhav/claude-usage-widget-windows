@@ -1139,6 +1139,19 @@ class ClaudeUsageApp(QObject):
                 pass
         self.overlay.positionSaved.connect(_save_osd_position)
 
+        # Persist the collapsed/expanded state the same way, so an OSD parked
+        # minimized comes back minimized after a restart.
+        def _save_osd_minimized(minimized: bool) -> None:
+            from claude_usage.config import save_config, user_config_path
+            _cfg_copy = dict(config)
+            _cfg_copy["osd_minimized"] = bool(minimized)
+            config["osd_minimized"] = bool(minimized)
+            try:
+                save_config(user_config_path(), _cfg_copy)
+            except OSError:
+                pass
+        self.overlay.minimizedChanged.connect(_save_osd_minimized)
+
         # Show the overlay and kick off the first refresh.
         self.overlay.show()
         

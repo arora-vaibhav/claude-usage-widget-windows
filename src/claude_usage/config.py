@@ -65,6 +65,10 @@ DEFAULT_CONFIG: Config = {
     "show_ticker": True,
     # OSD view mode — "bars" (default) or "gauge". See overlay.VIEW_MODES.
     "osd_view_mode": "bars",
+    # Whether the OSD starts collapsed to its thin minimized strip. Updated at
+    # runtime whenever the user toggles Minimize/Restore, so the parked state
+    # survives restarts (like osd_x / osd_y do for position).
+    "osd_minimized": False,
 }
 
 
