@@ -35,3 +35,22 @@ def test_toggle_emits_state_for_persistence():
     ov.toggle_minimized()
     assert seen == [True, False]
     assert ov._minimized is False
+
+
+def test_saved_position_accepts_taskbar_band():
+    # Regression: the restore guard used availableGeometry (which excludes the
+    # taskbar), so an OSD parked over the taskbar snapped back to the default
+    # position on every restart. The check must use the FULL screen geometry —
+    # only positions with no presence on ANY screen (unplugged monitor) fail.
+    from PySide6.QtGui import QGuiApplication
+
+    from claude_usage.widget import _rect_on_some_screen
+
+    geo = QGuiApplication.primaryScreen().geometry()
+    # Centre of the screen — trivially visible.
+    assert _rect_on_some_screen(geo.center().x(), geo.center().y(), 260, 100)
+    # Bottom edge / taskbar band (like a minimized strip parked on the taskbar).
+    assert _rect_on_some_screen(geo.x() + 36, geo.bottom() - 20, 260, 6)
+    # Far beyond every connected screen — the unplugged-monitor case.
+    assert not _rect_on_some_screen(geo.right() + 10_000, geo.bottom() + 10_000, 260, 100)
+    assert not _rect_on_some_screen(-20_000, -20_000, 260, 100)

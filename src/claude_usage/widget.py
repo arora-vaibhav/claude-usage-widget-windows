@@ -129,6 +129,30 @@ def _format_session_duration(total_seconds: int) -> str:
     return f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m"
 
 
+def _rect_on_some_screen(x: int, y: int, w: int, h: int) -> bool:
+    """True if a rect at (x, y) of size (w, h) has real presence on a screen.
+
+    Used to validate the saved OSD position before restoring it. Checks each
+    connected screen's **full** geometry — deliberately NOT availableGeometry,
+    which excludes the taskbar: users park the always-on-top OSD over the
+    taskbar, and that's a perfectly reachable spot (the old available-area
+    check silently snapped such positions back to the default). The guard's
+    only job is the truly-unreachable case — a monitor that was unplugged or
+    shrank — i.e. a rect with no meaningful overlap on ANY screen. The height
+    floor is small (4px) so even the minimized 6px strip parked at the very
+    bottom edge still counts as visible.
+    """
+    from PySide6.QtCore import QRect
+    from PySide6.QtGui import QGuiApplication
+
+    rect = QRect(x, y, max(w, 80), max(h, 24))
+    for screen in QGuiApplication.screens():
+        inter = screen.geometry().intersected(rect)
+        if inter.width() >= 24 and inter.height() >= 4:
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Custom-painted atomic widgets
 # ---------------------------------------------------------------------------
@@ -1731,24 +1755,8 @@ class ClaudeUsageApp(QObject):
         self._context_menu.popup(global_pos)
 
     def _osd_pos_visible(self, x: int, y: int) -> bool:
-        """True if an OSD placed at (x, y) would land on a connected screen.
-
-        Guards against restoring the overlay onto a monitor that was unplugged
-        or whose resolution shrank, which would otherwise strand it off-screen.
-        Checks the would-be top-left rect against each screen's available area;
-        requires a small visible overlap so a 1px sliver doesn't count.
-        """
-        from PySide6.QtCore import QRect
-        from PySide6.QtGui import QGuiApplication
-
-        w = max(self.overlay.width(), 80)
-        h = max(self.overlay.height(), 24)
-        rect = QRect(x, y, w, h)
-        for screen in QGuiApplication.screens():
-            inter = screen.availableGeometry().intersected(rect)
-            if inter.width() >= 24 and inter.height() >= 12:
-                return True
-        return False
+        """True if an OSD placed at (x, y) would land on a connected screen."""
+        return _rect_on_some_screen(x, y, self.overlay.width(), self.overlay.height())
 
     def _get_unified_window(self):
         """Return the singleton unified (Overview + History tabs) window.
