@@ -56,6 +56,11 @@ class UnifiedWindow(QWidget):
 
         self.setStyleSheet(self._build_qss())
 
+        # Native Win11 chrome: dark title bar + rounded corners (after the
+        # last setWindowFlags above — flag changes recreate the HWND).
+        from claude_usage.winchrome import apply_win11_chrome
+        apply_win11_chrome(self)
+
     @staticmethod
     def _wrap(inner: QWidget) -> QWidget:
         """Host an embedded page widget in a fresh container with a tight layout.
@@ -157,27 +162,33 @@ class UnifiedWindow(QWidget):
             QLabel#uniTitle {{ color: {t['text_primary']}; font-size: 13px; font-weight: bold; }}
             QPushButton#uniBtn {{
                 background: {t['bar_track']}; color: {t['text_secondary']};
-                border: 0; border-radius: 5px; padding: 5px 12px; font-size: 11px;
+                border: 0; border-radius: 6px; padding: 6px 14px; font-size: 11px;
             }}
             QPushButton#uniBtn:hover {{ color: {t['text_primary']}; background: {t['separator']}; }}
+            QPushButton#uniBtn:pressed {{ background: {t['bar_track']}; }}
+            QPushButton#uniBtn:focus {{ outline: none; }}
             QTabWidget::pane {{ border: 0; background: {t['bg']}; }}
+            QTabWidget::tab-bar {{ left: 10px; }}
             QTabBar {{ background: {t['bg']}; }}
             QTabBar::tab {{
-                background: {t['bar_track']};
+                background: transparent;
                 color: {t['text_secondary']};
                 padding: 7px 18px;
-                margin-right: 2px;
+                margin: 6px 6px 6px 0;
                 border: 0;
-                border-top-left-radius: 6px;
-                border-top-right-radius: 6px;
+                border-radius: 6px;
                 font-size: 12px;
+            }}
+            QTabBar::tab:hover:!selected {{
+                background: {t['bar_track']};
+                color: {t['text_primary']};
             }}
             QTabBar::tab:selected {{
                 background: {t['bar_blue']};
                 color: {t['bg']};
                 font-weight: bold;
             }}
-            QTabBar::tab:hover:!selected {{ color: {t['text_primary']}; }}
+            QTabBar::tab:focus {{ outline: none; }}
         """
 
     # -- live data + lifecycle --------------------------------------------

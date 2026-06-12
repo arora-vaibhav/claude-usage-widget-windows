@@ -71,10 +71,28 @@ class DashboardWindow(QWidget):
 
         self.setWindowTitle("Claude Usage — History")
         self.resize(960, 780)
-        self.setStyleSheet(
-            f"background:{self._theme['bg']}; color:{self._theme['text_primary']};"
-        )
+        # `* { ... }` is what a selector-less declaration already meant (Qt
+        # docs) — made explicit so the thin Win11-style scrollbar rules below
+        # can coexist in the same sheet.
+        th = self._theme
+        self.setStyleSheet(f"""
+            * {{ background: {th['bg']}; color: {th['text_primary']}; }}
+            QScrollBar:vertical {{
+                background: transparent; width: 10px;
+                margin: 2px 2px 2px 0; border: none;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {th['bar_track']}; border-radius: 4px; min-height: 32px;
+            }}
+            QScrollBar::handle:vertical:hover {{ background: {th['text_dim']}; }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; background: none; }}
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
+        """)
         self._build()
+
+        # Native Win11 chrome: dark title bar + rounded corners.
+        from claude_usage.winchrome import apply_win11_chrome
+        apply_win11_chrome(self)
 
     def reload(self) -> None:
         """Re-read the daily store from disk and re-render the current range.
@@ -244,11 +262,12 @@ class DashboardWindow(QWidget):
             if days == self._range_days:
                 b.setStyleSheet(
                     f"QPushButton{{background:{th['bar_blue']}; color:{th['bg']}; border:none;"
-                    f" border-radius:5px; padding:3px 12px; font-weight:bold;}}"
+                    f" border-radius:12px; padding:3px 14px; font-weight:bold;}}"
                 )
             else:
                 b.setStyleSheet(
                     f"QPushButton{{background:{th['bar_track']}; color:{th['text_secondary']};"
-                    f" border:none; border-radius:5px; padding:3px 12px;}}"
-                    f"QPushButton:hover{{color:{th['text_primary']};}}"
+                    f" border:none; border-radius:12px; padding:3px 14px;}}"
+                    f"QPushButton:hover{{color:{th['text_primary']}; background:{th['separator']};}}"
+                    f"QPushButton:pressed{{background:{th['bar_track']};}}"
                 )

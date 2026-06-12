@@ -385,6 +385,11 @@ class SkinPopupWidget(QWidget):
         self.resize(540, 360)
         self._resize_content()
 
+        # Native Win11 chrome: dark title bar + rounded corners. Must stay
+        # after the last setWindowFlags (flag changes recreate the HWND).
+        from claude_usage.winchrome import apply_win11_chrome
+        apply_win11_chrome(self)
+
     def apply_config(self, config: dict[str, Any]) -> None:
         """Re-bind the active skin module and restyle when the user picks
         a different theme at runtime."""
@@ -583,6 +588,11 @@ class UsagePopup(QWidget):
         self._layout.setSpacing(0)
         self._scroll.setWidget(self._content)
 
+        # Native Win11 chrome: dark title bar + rounded corners. Must stay
+        # after the last setWindowFlags (flag changes recreate the HWND).
+        from claude_usage.winchrome import apply_win11_chrome
+        apply_win11_chrome(self)
+
     # ------------------------------------------------------------------ QSS
 
     def _build_qss(self) -> str:
@@ -597,6 +607,16 @@ class UsagePopup(QWidget):
             QLabel[role="pct"]    {{ font-size: 12px; color: {t['text_secondary']}; }}
             QLabel[role="link"]   {{ font-size: 11px; color: {t['text_link']}; }}
             QLabel[role="error"]  {{ font-size: 11px; color: {t['error']}; }}
+            QScrollBar:vertical {{
+                background: transparent; width: 10px;
+                margin: 2px 2px 2px 0; border: none;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {t['bar_track']}; border-radius: 4px; min-height: 32px;
+            }}
+            QScrollBar::handle:vertical:hover {{ background: {t['text_dim']}; }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; background: none; }}
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
         """
 
     # -------------------------------------------------------------- helpers
@@ -1070,6 +1090,7 @@ class ClaudeUsageApp(QObject):
         self.stats = UsageStats()
         self._alive = True
         self._refreshing = False
+        self._apply_tooltip_qss()  # themed QToolTip (OSD hover tooltip)
         # Backoff / resilience state
         self._consecutive_errors: int = 0
         self._last_good_stats = None   # last UsageStats with no error
@@ -1370,6 +1391,29 @@ class ClaudeUsageApp(QObject):
         # Retint the context menu so it follows the new palette instead of
         # staying on the previous theme's colors.
         self._apply_menu_qss()
+        # The tray menu shares the context-menu sheet — keep it in step.
+        if getattr(self, "_tray_menu", None) is not None:
+            self._tray_menu.setStyleSheet(self._context_menu.styleSheet())
+        self._apply_tooltip_qss()
+
+    def _apply_tooltip_qss(self) -> None:
+        """Theme the QToolTip — the OSD's rich hover tooltip otherwise renders
+        in the stock Windows beige box, the last piece of unthemed chrome on
+        the overlay. App-level sheet scoped to QToolTip only."""
+        from claude_usage.themes import get_theme
+
+        t = get_theme(str(self.config.get("theme", "default")))
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(f"""
+                QToolTip {{
+                    background-color: {t['bg']};
+                    color: {t['text_primary']};
+                    border: 1px solid {t['separator']};
+                    padding: 6px 8px;
+                    font-size: 11px;
+                }}
+            """)
 
     def _on_pick_view_mode(self, mode: str) -> None:
         self.overlay.set_view_mode(mode)
@@ -1446,11 +1490,13 @@ class ClaudeUsageApp(QObject):
             background-color: {c["bg"]};
             color: {c["text"]};
             border: 1px solid {c["border"]};
-            padding: 6px 0;
+            padding: 6px 4px;
             font-size: 12px;
         }}
         QMenu::item {{
-            padding: 6px 28px 6px 18px;
+            padding: 6px 24px 6px 14px;
+            margin: 2px 6px;
+            border-radius: 5px;
             background: transparent;
             color: {c["text"]};
         }}
@@ -1872,6 +1918,10 @@ class ClaudeUsageApp(QObject):
         menu.addAction(act_quit)
 
         tray.setContextMenu(menu)
+        # The tray menu otherwise renders in the system's default grey — copy
+        # the themed context-menu stylesheet (_setup_tray runs after
+        # _build_context_menu in __init__, so it's already populated).
+        menu.setStyleSheet(self._context_menu.styleSheet())
         tray.activated.connect(self._on_tray_activated)
         tray.show()
         self._tray = tray
