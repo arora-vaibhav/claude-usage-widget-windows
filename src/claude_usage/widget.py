@@ -1308,6 +1308,15 @@ class ClaudeUsageApp(QObject):
         self._act_ticker.setChecked(self.overlay.is_ticker_enabled())
         self._act_ticker.toggled.connect(self._on_toggle_ticker)
         m.addAction(self._act_ticker)
+
+        # Launch-at-startup toggle — backed by the Startup-folder script, whose
+        # existence is the source of truth (checked state re-synced on open).
+        from claude_usage import autostart
+        self._act_autostart = QAction("🚀  Launch at startup", m)
+        self._act_autostart.setCheckable(True)
+        self._act_autostart.setChecked(autostart.is_enabled())
+        self._act_autostart.toggled.connect(self._on_toggle_autostart)
+        m.addAction(self._act_autostart)
         m.aboutToShow.connect(self._sync_menu_state)
 
         m.addSeparator()
@@ -1328,6 +1337,20 @@ class ClaudeUsageApp(QObject):
         self.overlay.set_ticker_enabled(checked)
         self.config["show_ticker"] = bool(checked)
         self._persist_config()
+
+    def _on_toggle_autostart(self, checked: bool) -> None:
+        from claude_usage import autostart
+        if not autostart.set_enabled(checked):
+            # Failed (exe not found / Startup folder unwritable): revert the
+            # checkbox to reality without re-firing this handler.
+            self._act_autostart.blockSignals(True)
+            self._act_autostart.setChecked(autostart.is_enabled())
+            self._act_autostart.blockSignals(False)
+            try:
+                from claude_usage.notifier import notify
+                notify("Claude Usage", "Couldn't change the launch-at-startup setting.")
+            except Exception:
+                pass
 
     def _on_pick_theme(self, name: str) -> None:
         # If either popup is open, close it — switching themes swaps the
@@ -1526,6 +1549,12 @@ class ClaudeUsageApp(QObject):
 
         # Tick marks on radio-grouped items.
         self._act_ticker.setChecked(self.overlay.is_ticker_enabled())
+        # Autostart reflects the Startup-folder file (may have been changed
+        # externally, e.g. via setup.ps1 or manual delete) — sync silently.
+        from claude_usage import autostart
+        self._act_autostart.blockSignals(True)
+        self._act_autostart.setChecked(autostart.is_enabled())
+        self._act_autostart.blockSignals(False)
         theme_act = self._theme_actions.get(current_theme)
         if theme_act is not None:
             theme_act.setChecked(True)
