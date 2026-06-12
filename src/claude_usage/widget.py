@@ -760,6 +760,11 @@ class UsagePopup(QWidget):
         self._theme = get_theme(theme_name)
         self._style = get_style(theme_name)
         self.setStyleSheet(self._build_qss())
+        # Built rows bake in the OLD theme's colors (bars, sparklines, …).
+        # Drop them so the next update/show rebuilds in the new palette —
+        # the showEvent flush only fires on an EMPTY layout.
+        if self._layout.count():
+            self._clear_layout()
 
     @Slot(object)
     def update_stats(self, stats: UsageStats) -> None:
@@ -1391,11 +1396,13 @@ class ClaudeUsageApp(QObject):
                 pass
 
     def _on_pick_theme(self, name: str) -> None:
-        # If either popup is open, close it — switching themes swaps the
-        # painter/layout wholesale, and leaving the old window visible
-        # causes a jarring mid-paint flicker. User can re-open to see the
-        # new theme.
-        if self.popup.isVisible():
+        # If a STANDALONE popup is open, close it — switching themes swaps
+        # the painter/layout wholesale, and leaving the old window visible
+        # causes a jarring mid-paint flicker. The classic popup is normally
+        # EMBEDDED in the unified window's Overview tab: hiding it there
+        # blanks the tab permanently (hidden children skip the deferred
+        # rebuild and nothing re-shows them), so only hide real windows.
+        if self.popup.isWindow() and self.popup.isVisible():
             self.popup.hide()
         if self.skin_popup.isVisible():
             self.skin_popup.hide()
@@ -1405,6 +1412,18 @@ class ClaudeUsageApp(QObject):
         self.skin_popup.apply_config(merged)
         self.config["theme"] = name
         self._persist_config()
+        # The unified window caches its construction-time palette — re-theme
+        # it live (tabs/toolbar/History dashboard) and rebuild the Overview
+        # tab from the latest stats so no stale-colored rows linger.
+        unified = getattr(self, "_unified", None)
+        if unified is not None:
+            try:
+                unified.apply_config(merged)
+                shown = getattr(self, "_last_display", None) or getattr(self, "stats", None)
+                if shown is not None:
+                    unified.update_stats(shown)
+            except RuntimeError:
+                self._unified = None  # C++ object gone — recreated on next open
         # Retint the context menu so it follows the new palette instead of
         # staying on the previous theme's colors.
         self._apply_menu_qss()
@@ -1730,6 +1749,10 @@ class ClaudeUsageApp(QObject):
             self._last_good_stats = stats
             display = stats
         # ────────────────────────────────────────────────────────────────
+        # What the UI is currently showing (grace-substituted) — theme picks
+        # and lazy window creation rebuild from this, not raw self.stats, so
+        # they can't flash zeroed bars during a transient network blip.
+        self._last_display = display
 
         self.overlay.update_stats(display)
         # Exactly ONE driver for the embedded popup: once the unified window
@@ -1871,10 +1894,12 @@ class ClaudeUsageApp(QObject):
             w = UnifiedWindow(self.config, self.popup, dashboard,
                               on_refresh=self._refresh_async)
             self._unified = w
-            # Seed the Overview tab with the latest stats we already have.
-            if getattr(self, "stats", None) is not None:
+            # Seed the Overview tab with what the UI is showing (grace-
+            # substituted display stats, falling back to the raw snapshot).
+            seed = getattr(self, "_last_display", None) or getattr(self, "stats", None)
+            if seed is not None:
                 try:
-                    w.update_stats(self.stats)
+                    w.update_stats(seed)
                 except Exception:
                     pass
         return w
@@ -1962,8 +1987,10 @@ class ClaudeUsageApp(QObject):
             return
 
         target = self.skin_popup
-        # Hide the classic popup if it somehow leaked onto screen.
-        if self.popup.isVisible():
+        # Hide the classic popup if it somehow leaked onto screen — but only
+        # when it's a real window; embedded in the unified Overview tab a
+        # hide() here would blank that tab for good.
+        if self.popup.isWindow() and self.popup.isVisible():
             self.popup.hide()
         # Position popup relative to the OSD overlay
         try:

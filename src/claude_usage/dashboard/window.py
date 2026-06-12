@@ -71,11 +71,19 @@ class DashboardWindow(QWidget):
 
         self.setWindowTitle("Claude Usage — History")
         self.resize(960, 780)
+        self.setStyleSheet(self._window_qss())
+        self._build()
+
+        # Native Win11 chrome: dark title bar + rounded corners.
+        from claude_usage.winchrome import apply_win11_chrome
+        apply_win11_chrome(self)
+
+    def _window_qss(self) -> str:
         # `* { ... }` is what a selector-less declaration already meant (Qt
         # docs) — made explicit so the thin Win11-style scrollbar rules below
         # can coexist in the same sheet.
         th = self._theme
-        self.setStyleSheet(f"""
+        return f"""
             * {{ background: {th['bg']}; color: {th['text_primary']}; }}
             QScrollBar:vertical {{
                 background: transparent; width: 10px;
@@ -87,12 +95,25 @@ class DashboardWindow(QWidget):
             QScrollBar::handle:vertical:hover {{ background: {th['text_dim']}; }}
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; background: none; }}
             QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
-        """)
-        self._build()
+        """
 
-        # Native Win11 chrome: dark title bar + rounded corners.
-        from claude_usage.winchrome import apply_win11_chrome
-        apply_win11_chrome(self)
+    def apply_config(self, config: dict | None) -> None:
+        """Re-theme in place after a runtime theme switch.
+
+        The window is a long-lived singleton (embedded as the unified
+        window's History tab), so a theme pick must restyle it live —
+        charts pick up the new palette on the `_render` below because they
+        are rebuilt from ``self._theme`` every render.
+        """
+        cfg = config or {}
+        self._theme = get_theme(str(cfg.get("theme", "default")))
+        th = self._theme
+        self.setStyleSheet(self._window_qss())
+        self._header_box.setStyleSheet(
+            f"background:{th['bg']}; border-bottom:1px solid {th['separator']};")
+        self._header_title.setStyleSheet(f"color:{th['text_primary']};")
+        self._summary.setStyleSheet(f"color:{th['text_secondary']};")
+        self._render(self._range_days)
 
     def reload(self) -> None:
         """Re-read the daily store from disk and re-render the current range.
@@ -137,6 +158,7 @@ class DashboardWindow(QWidget):
         th = self._theme
         box = QWidget()
         box.setStyleSheet(f"background:{th['bg']}; border-bottom:1px solid {th['separator']};")
+        self._header_box = box  # kept for live re-theming (apply_config)
         lay = QVBoxLayout(box)
         lay.setContentsMargins(16, 14, 16, 12)
         lay.setSpacing(6)
@@ -147,6 +169,7 @@ class DashboardWindow(QWidget):
         tf.setBold(True)
         title.setFont(tf)
         title.setStyleSheet(f"color:{th['text_primary']};")
+        self._header_title = title
         lay.addWidget(title)
 
         self._summary = QLabel("")

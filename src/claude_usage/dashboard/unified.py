@@ -191,6 +191,22 @@ class UnifiedWindow(QWidget):
             QTabBar::tab:focus {{ outline: none; }}
         """
 
+    def apply_config(self, config: dict[str, Any]) -> None:
+        """Re-theme the live window after a runtime theme switch.
+
+        The window is a cached singleton; without this it would keep its
+        construction-time palette forever. The embedded popup is re-themed
+        by the caller (it owns that object); the dashboard is ours.
+        """
+        self._config = config
+        self._theme = get_theme(str(config.get("theme", "default")))
+        self.setStyleSheet(self._build_qss())
+        if hasattr(self._dashboard, "apply_config"):
+            try:
+                self._dashboard.apply_config(config)
+            except Exception:
+                pass
+
     # -- live data + lifecycle --------------------------------------------
     def update_stats(self, stats: Any) -> None:
         """Forward a fresh stats snapshot to the embedded live Overview page.
@@ -202,6 +218,12 @@ class UnifiedWindow(QWidget):
         whether or not a ``showEvent`` has fired.
         """
         popup = self._popup
+        # Heal an explicit hide(): other code paths historically hid the
+        # standalone popup without realising it was embedded here, leaving
+        # the Overview tab permanently blank (hidden children are skipped
+        # by deferred rebuilds and never re-shown by the tab widget).
+        if not popup.isVisible():
+            popup.show()
         if hasattr(popup, "update_stats"):
             popup.update_stats(stats)
         # Force a build if the deferred path left the layout empty.
