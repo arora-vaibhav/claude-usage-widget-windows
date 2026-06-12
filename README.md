@@ -6,16 +6,16 @@ This is a **full-source, Windows-focused fork** of [`claude-usage-widget`](https
 
 ---
 
-## What's new in v1.1
+## What's new in v1.4
 
-- **📊 Usage-history dashboard** — a full window (open from the tray icon or the OSD right-click → "Dashboard…") with custom-painted charts: a cost-per-day trend, output-tokens/day, messages/day, and per-model + per-project breakdowns, with a **7 / 30 / 90-day / All** range selector.
-- **🗂️ Persistent usage history** — a daily rollup store (`~/.claude/usage-daily.jsonl`) records tokens, cost, messages, per-model and per-project totals each refresh, and **backfills from your existing transcripts** so the dashboard has real depth on first run.
-- **🖥️ System-tray icon** — always-reachable entry point (open dashboard, details, refresh, quit) so the widget is never "lost" behind other windows.
-- **💲 Accurate today's cost** — an incremental, memory-safe transcript scanner counts the full day (the old budget-capped scan under-counted heavy days), bucketed by your **local** day so it lines up with what you actually used today.
-- **📌 Reliable always-on-top** — the OSD re-asserts its top-most position on a short timer (raise-only, never steals focus) so it no longer sinks behind other windows over time.
-- **🎨 At-a-glance limit colors** — session/weekly percentages tint green → amber → red with usage.
-- **🩺 Honest connection state** — a "STALE" badge when the live API can't be reached, plus a rotating log at `~/.claude/claude-usage.log`; single-instance lock; opt-in launch-at-login (`setup.ps1 -Autostart`).
-- **🔢 Correct model pricing** — adds `claude-opus-4-8` and infers tier for future model releases (Opus was previously priced as Sonnet).
+- **🪟 Windows 11 look:** native dark title bars and rounded corners on every window, pill-style tabs and range buttons, slim rounded scrollbars, themed menus and tooltips.
+- **🚀 Launch at startup:** a toggle right in the OSD/tray menu (no script needed). It drops a tiny launcher in your Startup folder and removes it when switched off.
+- **📍 The OSD stays where you put it:** position (even parked on the taskbar) and minimized state are remembered across restarts.
+- **🎨 Theme switching fixed:** changing themes no longer blanks the Details window; the tabbed window, History charts, menus and tooltips all retint live. Verified across all 11 themes.
+- **⚡ Much lighter when idle:** history pruning runs once a day instead of rewriting a file every 30 seconds, scanner state saves at most every 5 minutes, and hidden windows skip their rebuild work entirely.
+- **🔢 Fable 5 priced correctly:** the newest frontier model previously fell back to Sonnet rates, undercounting today's cost.
+
+(Earlier highlights: v1.1 added the history dashboard, tray icon, accurate local-day cost and always-on-top fixes; v1.2-1.3 added the unified tabbed window, message dedup accuracy fixes, interactive charts, near-limit pulse and hover tooltip. Full history on the [releases page](../../releases).)
 
 ---
 
