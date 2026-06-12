@@ -417,7 +417,17 @@ class SkinPopupWidget(QWidget):
 
     def update_stats(self, stats) -> None:
         """Project the latest UsageStats into the skin's popup-data shape
-        and trigger a repaint."""
+        and trigger a repaint.
+
+        Hidden popups defer the (non-trivial) projection until shown —
+        mirroring UsagePopup — so users who never open this window don't
+        rebuild heatmap/ticker projections every 30s refresh."""
+        self._pending_raw_stats = stats
+        if not self.isVisible():
+            # No point animating a hidden loading placeholder either.
+            if self._loading_timer.isActive():
+                self._loading_timer.stop()
+            return
         from claude_usage.skins._adapter import build_popup_data
         self._data = build_popup_data(stats)
         # First-data-in: stop the loading animation and repaint immediately
@@ -426,6 +436,13 @@ class SkinPopupWidget(QWidget):
             self._loading_timer.stop()
         self._resize_content()
         self._content.update()
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        """Flush stats that arrived while hidden (deferred build above)."""
+        pending = getattr(self, "_pending_raw_stats", None)
+        if pending is not None:
+            self.update_stats(pending)
+        super().showEvent(event)
 
     def _tick_loading(self) -> None:
         if self._data is not None:
@@ -1715,23 +1732,23 @@ class ClaudeUsageApp(QObject):
         # ────────────────────────────────────────────────────────────────
 
         self.overlay.update_stats(display)
-        # Guarded: the popup may be embedded in the unified window; if that
-        # window were ever destroyed, Qt would delete the child popup and this
-        # unconditional call would raise every refresh. Defensive by design.
-        try:
-            self.popup.update_stats(display)
-        except RuntimeError:
-            pass
-        self.skin_popup.update_stats(display)
-        # If the unified window is open, keep its Overview tab live too. (It
-        # embeds self.popup, so the call above already refreshed the content;
-        # this also lets the window react to fresh stats if needed.)
+        # Exactly ONE driver for the embedded popup: once the unified window
+        # exists, its update_stats refreshes the popup internally — calling
+        # both rebuilt the whole label tree twice per refresh. Before the
+        # window is first opened, drive the popup directly (guarded: if Qt
+        # ever deleted the embedded child, the call would raise per refresh).
         _unified = getattr(self, "_unified", None)
-        if _unified is not None:
+        if _unified is None:
+            try:
+                self.popup.update_stats(display)
+            except RuntimeError:
+                pass
+        else:
             try:
                 _unified.update_stats(display)
             except RuntimeError:
-                self._unified = None  # window was closed/destroyed
+                self._unified = None  # window was destroyed — fall back next tick
+        self.skin_popup.update_stats(display)
         self.notifier.check_stats(stats)
 
         # Webhook: anomaly

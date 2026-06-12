@@ -41,6 +41,15 @@ MODEL_PRICING: Dict[str, Dict[str, float]] = {
         "cache_read": 0.50,
         "cache_creation": 6.25,
     },
+    # Fable 5 (2026 frontier flagship): priced at the Opus frontier tier.
+    # No separate public rate observed yet — if Anthropic publishes a distinct
+    # Fable rate, update here.
+    "claude-fable-5": {
+        "input": 5.0,
+        "output": 25.0,
+        "cache_read": 0.50,
+        "cache_creation": 6.25,
+    },
     # Sonnet 4.6: $3 input, $15 output (standard mid-tier pricing).
     "claude-sonnet-4-6": {
         "input": 3.0,
@@ -82,6 +91,9 @@ _TIER_EXEMPLAR: Dict[str, str] = {
     "opus": "claude-opus-4-7",
     "sonnet": "claude-sonnet-4-6",
     "haiku": "claude-haiku-4-5-20251001",
+    # Fable variants ("claude-fable-5[1m]", dated point releases) price at the
+    # frontier tier via the explicit entry above.
+    "fable": "claude-fable-5",
 }
 
 # Conversion factor: prices are per one million tokens.

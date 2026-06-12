@@ -29,6 +29,16 @@ _log = get_logger()
 
 HISTORY_FILENAME = "usage-history.jsonl"
 HISTORY_KEEP_DAYS = 90  # keep 90 days for trend/anomaly analysis
+
+# Prune rewrites the entire (multi-MB) history file; appending one ~60-byte
+# sample per refresh between daily prunes is negligible, so once a day is
+# plenty. (Running it every 30s refresh amounted to tens of GB/day of writes.)
+_LAST_PRUNE_DAY: str = ""
+
+# Cache-opportunity analysis re-parses up to 80 MB of week-old transcripts;
+# the result changes on the scale of hours, so a 15-minute TTL is generous.
+_CACHE_OPPS_CACHE: tuple[float, list] | None = None
+_CACHE_OPPS_TTL = 900.0  # seconds
 SESSION_WINDOW_SECONDS = 5 * 3600
 SESSION_BUCKETS = 30
 WEEKLY_WINDOW_SECONDS = 7 * 86400
@@ -979,7 +989,11 @@ def collect_all(config: dict[str, Any]) -> UsageStats:
         stats.fallback_status = rate_limits["fallback_status"]
         try:
             append_sample(samples_path, now_ts, stats.session_utilization, stats.weekly_utilization)
-            prune(samples_path, keep_seconds=HISTORY_KEEP_DAYS * 86400, now=now_ts)
+            global _LAST_PRUNE_DAY
+            _today_local = datetime.now().strftime("%Y-%m-%d")
+            if _today_local != _LAST_PRUNE_DAY:
+                prune(samples_path, keep_seconds=HISTORY_KEEP_DAYS * 86400, now=now_ts)
+                _LAST_PRUNE_DAY = _today_local
         except OSError:
             pass
 
@@ -1014,12 +1028,18 @@ def collect_all(config: dict[str, Any]) -> UsageStats:
     stats.hourly_histogram = hourly_histogram(samples, now=now_ts)
 
     # Prompt-cache savings opportunities — scans ~/.claude/projects/ for
-    # repeated prompt prefixes; bounded cost by the mtime cutoff in the
-    # analyser, so this stays cheap on every refresh.
-    try:
-        stats.cache_opportunities = analyze_cache_opportunities(claude_dir, days=7, now=now_ts)
-    except OSError:
-        stats.cache_opportunities = []
+    # repeated prompt prefixes. The 7-day mtime window means every transcript
+    # touched this WEEK is re-read and re-parsed, so memoize with a 15-min TTL:
+    # opportunities change on the scale of hours, not refresh cycles.
+    global _CACHE_OPPS_CACHE
+    if _CACHE_OPPS_CACHE is not None and now_ts - _CACHE_OPPS_CACHE[0] < _CACHE_OPPS_TTL:
+        stats.cache_opportunities = _CACHE_OPPS_CACHE[1]
+    else:
+        try:
+            stats.cache_opportunities = analyze_cache_opportunities(claude_dir, days=7, now=now_ts)
+        except OSError:
+            stats.cache_opportunities = []
+        _CACHE_OPPS_CACHE = (now_ts, stats.cache_opportunities)
 
     # Live-activity rate: scans the same tree but only touches recently-
     # modified files, so it's O(active-sessions) per refresh.

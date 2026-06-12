@@ -35,6 +35,11 @@ _STATE_FILENAME = ".usage-token-scan.json"
 # discards any pre-dedup persisted state so totals self-correct on upgrade.
 _STATE_SCHEMA = 2
 _KEEP_DAYS = 14                       # prune persisted day buckets beyond this
+# State persists offsets + 14 days of buckets + per-day seen-ids — a multi-MB
+# JSON on heavy days. Dumping it every 30s scan is pointless churn; throttle.
+# Crash-safe: everything is saved as one consistent snapshot, so a crash just
+# re-reads the last <=5 min of appended lines and re-derives identical buckets.
+_SAVE_INTERVAL = 300.0  # seconds between state saves (first save is immediate)
 
 
 def _empty_day() -> dict:
@@ -74,6 +79,7 @@ class IncrementalTokenScanner:
         # with its day bucket (a flat set would keep ids forever, which under-
         # counts if a >14-day-old file is ever rewritten and re-scanned).
         self._seen_by_day: dict[str, set[str]] = {}
+        self._last_save: float = 0.0  # 0 -> first save fires immediately
         self._load_state()
 
     # -- persistence -------------------------------------------------------
@@ -154,7 +160,9 @@ class IncrementalTokenScanner:
             if budget <= 0:
                 break
             budget -= self._scan_file(path, off, budget)
-        self._save_state()
+        if time.time() - self._last_save >= _SAVE_INTERVAL:
+            self._save_state()
+            self._last_save = time.time()
         return self._days
 
     def _scan_file(self, path: str, off: int, budget: int) -> int:
