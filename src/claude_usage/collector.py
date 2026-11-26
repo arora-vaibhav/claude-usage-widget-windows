@@ -714,8 +714,16 @@ def fetch_rate_limits(claude_dir: str) -> dict[str, Any]:
         return {"error": "No credentials found -- run 'claude' to log in"}
 
     # Long-lived tokens (sk-ant-oat...) can't use /api/oauth/usage (no
-    # user:profile scope) — read plan utilization from the unified headers.
+    # user:profile scope). Claude Code's own access token can, and carries the
+    # scoped limits, surface breakdown and extra usage the headers lack, so use
+    # it while it is unexpired (read-only: never refreshed or rewritten here),
+    # else fall back to the unified headers.
     if _load_long_lived_token(claude_dir):
+        oauth = _read_oauth_token(claude_dir)
+        if oauth:
+            res = _fetch_oauth_usage(oauth)
+            if "error" not in res:
+                return res
         return _fetch_unified_headers_via_messages(token)
 
     # Primary path — the OAuth usage endpoint Claude Code itself uses.
@@ -817,38 +825,130 @@ def _fetch_oauth_usage(token: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {"error": "Unexpected /api/oauth/usage payload"}
 
-    def _pct_to_frac(v: Any) -> float:
+    return _parse_oauth_usage(payload)
+
+
+def _read_oauth_token(claude_dir: str) -> str | None:
+    """Claude Code's OAuth access token if it has not expired. Never refreshes."""
+    try:
+        with open(os.path.join(claude_dir, ".credentials.json"), encoding="utf-8-sig") as f:
+            oauth = json.load(f)["claudeAiOauth"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    expires = oauth.get("expiresAt")
+    if isinstance(expires, (int, float)) and expires / 1000 < time.time() + 60:
+        return None
+    return oauth.get("accessToken") or None
+
+
+def _frac(v: Any, scale: float = 100.0) -> float | None:
+    """A percentage (or a fraction with scale=1) as a 0..1 fraction; None when missing."""
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        f = float(v) / scale
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(f) or math.isinf(f):
+        return None
+    return max(0.0, min(f, 1.0))
+
+
+def _epoch(v: Any) -> int | None:
+    """An ISO 8601 string or epoch number (s or ms) as epoch seconds; None when missing."""
+    if isinstance(v, str):
         try:
-            f = float(v) / 100.0
-        except (TypeError, ValueError):
-            return 0.0
-        if math.isnan(f) or math.isinf(f):
-            return 0.0
-        return max(0.0, min(f, 1.0))
+            return int(datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp())
+        except ValueError:
+            try:
+                v = float(v)
+            except ValueError:
+                return None
+    if not isinstance(v, (int, float)) or isinstance(v, bool) or not v:
+        return None
+    v = int(v)
+    return v // 1000 if v > 4_102_444_800 else v
 
-    def _iso_to_epoch(v: Any) -> int:
-        if not isinstance(v, str) or not v:
-            return 0
-        try:
-            # Python's fromisoformat handles "+00:00" suffixes natively.
-            from datetime import datetime
-            return int(datetime.fromisoformat(v).timestamp())
-        except (ValueError, TypeError):
-            return 0
 
-    five = payload.get("five_hour") or {}
-    seven = payload.get("seven_day") or {}
-    extra = payload.get("extra_usage") or {}
+def _parse_oauth_usage(payload: dict[str, Any]) -> dict[str, Any]:
+    """Translate an /api/oauth/usage payload. Missing values stay None, never 0.
 
+    The first six keys are the shape the old widget reads (0.0 when absent);
+    the rest are the full limits model for the native app.
+    """
+    def obj(v: Any) -> dict:
+        return v if isinstance(v, dict) else {}
+
+    five = obj(payload.get("five_hour"))
+    seven = obj(payload.get("seven_day"))
+    extra = payload.get("extra_usage") if isinstance(payload.get("extra_usage"), dict) else None
+    raw_limits = [x for x in payload.get("limits") or [] if isinstance(x, dict)]
+    shares = {x.get("limit_index"): x for x in payload.get("weekly_scoped_shares") or [] if isinstance(x, dict)}
+    limits = []
+    for i, x in enumerate(raw_limits):
+        share = obj(shares.get(i))
+        limits.append({
+            "kind": x.get("kind"),
+            "group": x.get("group"),
+            "name": obj(obj(x.get("scope")).get("model")).get("display_name"),
+            "pct": _frac(x.get("percent")),
+            "severity": x.get("severity"),
+            "resets_at": _epoch(x.get("resets_at")),
+            "active": x.get("is_active"),
+            "allowance": _frac(share.get("allowance_percent_of_weekly")),
+            "used_of_weekly": _frac(share.get("used_percent_of_weekly")),
+        })
+    weekly_all = next((x for x in limits if x["kind"] == "weekly_all"), {})
+    weekly_pct = _frac(seven.get("utilization"))
+    if weekly_pct is None:
+        weekly_pct = weekly_all.get("pct")
+    weekly = None
+    if weekly_pct is not None:
+        weekly = {"pct": weekly_pct, "resets_at": _epoch(seven.get("resets_at")) or weekly_all.get("resets_at"),
+                  "severity": weekly_all.get("severity")}
+    five_pct = _frac(five.get("utilization"))
+    five_hour = None if five_pct is None else {
+        "pct": five_pct, "resets_at": _epoch(five.get("resets_at")), "severity": None}
+    bd = obj(payload.get("seven_day_breakdown"))
+    surfaces = [{"key": r.get("key"), "name": r.get("display_name") or r.get("key"), "pct": _frac(r.get("percent")),
+                 "pct_of_limit": _frac(r.get("percent_of_limit"))}
+                for r in bd.get("rows") or [] if isinstance(r, dict)]
+    extra_out = None
+    if extra is not None:
+        dp = extra.get("decimal_places")
+        div = 10 ** (dp if isinstance(dp, int) else 2)
+        used = obj(obj(payload.get("spend")).get("used"))
+        used_val = None
+        if isinstance(used.get("amount_minor"), (int, float)):
+            used_val = used["amount_minor"] / 10 ** int(used.get("exponent") or 2)
+        elif isinstance(extra.get("used_credits"), (int, float)):
+            used_val = extra["used_credits"] / div
+        limit = extra.get("monthly_limit")
+        extra_out = {
+            "enabled": bool(extra.get("is_enabled")),
+            "monthly_limit": limit / div if isinstance(limit, (int, float)) else None,
+            "used": used_val,
+            "currency": extra.get("currency") or used.get("currency") or "",
+            "reason": extra.get("disabled_reason"),
+            "spend_limit_reached": extra.get("spend_limit_reached"),
+        }
     return {
-        "session_utilization": _pct_to_frac(five.get("utilization", 0)),
-        "session_reset": _iso_to_epoch(five.get("resets_at")),
-        "weekly_utilization": _pct_to_frac(seven.get("utilization", 0)),
-        "weekly_reset": _iso_to_epoch(seven.get("resets_at")),
-        "overage_status": (
-            "allowed" if extra.get("is_enabled") else "rejected"
-        ),
+        "session_utilization": five_pct or 0.0,
+        "session_reset": (five_hour or {}).get("resets_at") or 0,
+        "weekly_utilization": weekly_pct or 0.0,
+        "weekly_reset": (weekly or {}).get("resets_at") or 0,
+        "overage_status": "allowed" if extra and extra.get("is_enabled") else "rejected",
         "fallback_status": "",
+        "source": "oauth",
+        "fetched_at": int(time.time()),
+        "weekly": weekly,
+        "five_hour": five_hour,
+        "limits": limits,
+        "surfaces": surfaces,
+        "window_started_at": _epoch(bd.get("window_started_at")),
+        "extra_usage": extra_out,
+        "status": None,
+        "representative_claim": None,
     }
 
 
@@ -887,6 +987,9 @@ def _parse_rate_limit_headers(headers: dict[str, str]) -> dict[str, Any]:
         except (ValueError, TypeError):
             return default
 
+    weekly_pct = _frac(headers.get(prefix + "7d-utilization"), 1.0)
+    five_pct = _frac(headers.get(prefix + "5h-utilization"), 1.0)
+    overage = headers.get(prefix + "overage-status")
     return {
         "session_utilization": _safe_float("5h-utilization"),
         "session_reset": _safe_int("5h-reset"),
@@ -894,6 +997,20 @@ def _parse_rate_limit_headers(headers: dict[str, str]) -> dict[str, Any]:
         "weekly_reset": _safe_int("7d-reset"),
         "overage_status": headers.get(prefix + "overage-status", ""),
         "fallback_status": headers.get(prefix + "fallback", ""),
+        "source": "headers",
+        "fetched_at": int(time.time()),
+        "weekly": None if weekly_pct is None else {
+            "pct": weekly_pct, "resets_at": _epoch(headers.get(prefix + "7d-reset")), "severity": None},
+        "five_hour": None if five_pct is None else {
+            "pct": five_pct, "resets_at": _epoch(headers.get(prefix + "5h-reset")), "severity": None},
+        "limits": [],
+        "surfaces": [],
+        "window_started_at": None,
+        "extra_usage": None if overage is None else {
+            "enabled": overage == "allowed", "monthly_limit": None, "used": None, "currency": "",
+            "reason": headers.get(prefix + "overage-disabled-reason"), "spend_limit_reached": None},
+        "status": headers.get(prefix + "status"),
+        "representative_claim": headers.get(prefix + "representative-claim"),
     }
 
 

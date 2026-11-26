@@ -1,0 +1,167 @@
+import QtQuick
+import QtQuick.Shapes
+
+// One headline number for the range: value, change against the previous
+// equal stretch, and an edge-to-edge sparkline with a soft glow.
+Card {
+    id: card
+    property var k: null             // snapshot.kpis[i]
+    property color hue: Ui.p.accent
+    property bool dropLast: false    // the bucket still filling is left out of the trend
+    property int smoothing: 0
+    padding: 0
+    implicitHeight: 172
+
+    readonly property var delta: {
+        if (!k || k.delta == null || k.prev == null) return null
+        var d, txt
+        if (k.delta_unit === "pts") {
+            d = (k.value - k.prev) * 100
+            txt = (Math.abs(d) < 0.05 ? "" : d > 0 ? "↑" : "↓") + Math.abs(d).toFixed(1) + "pt"
+        } else {
+            if (!k.prev) return null
+            d = (k.value - k.prev) / k.prev * 100
+            var m = Math.abs(d)
+            txt = (m < 0.05 ? "" : d > 0 ? "↑" : "↓") + (m < 10 ? m.toFixed(1) : Ui.int(m)) + "%"
+        }
+        // colour only where the direction is good or bad: spend up is a caution
+        var kind = "none"
+        if (k.key === "cost" && Math.abs(d) >= 1) kind = d > 0 ? "warn" : "ok"
+        if (k.key === "cache_hit" && Math.abs(d) >= 0.05) kind = d > 0 ? "ok" : "warn"
+        return { text: txt, kind: kind }
+    }
+    readonly property var values: {
+        if (!k) return []
+        var v = k.series.slice(0, dropLast && k.series.length > 2 ? k.series.length - 1 : k.series.length)
+        return Ui.smooth(v, smoothing)
+    }
+
+    // glow from the bottom edge in the card's colour
+    Shape {
+        anchors.fill: parent
+        preferredRendererType: Shape.CurveRenderer
+        ShapePath {
+            strokeColor: "transparent"
+            fillGradient: RadialGradient {
+                centerX: card.width / 2; centerY: card.height * 1.25
+                centerRadius: card.width * 0.85
+                focalX: centerX; focalY: centerY
+                GradientStop { position: 0; color: Ui.alpha(card.hue, Ui.dark ? 0.22 : 0.10) }
+                GradientStop { position: 1; color: Ui.alpha(card.hue, 0) }
+            }
+            PathSvg { path: Ui.roundRect(1, 1, card.width - 2, card.height - 2, Ui.radius - 1) }
+        }
+    }
+
+    Column {
+        x: 20; y: 18
+        width: card.width - 40
+        spacing: 4
+        Row {
+            spacing: 8
+            height: 20
+            Rectangle { anchors.verticalCenter: parent.verticalCenter; width: 8; height: 8; radius: 4; color: card.hue }
+            Txt { height: 20; text: card.k ? card.k.label : ""; color: Ui.p.text_muted }
+        }
+        Txt {
+            width: parent.width
+            height: 38
+            text: card.k ? Ui.fmt(card.k.format, card.k.value) : ""
+            display: true
+            font.pixelSize: 28
+            font.weight: 600
+            font.features: ({})
+        }
+        Row {
+            spacing: 6
+            height: 20
+            Rectangle {
+                visible: !!card.delta
+                anchors.verticalCenter: parent.verticalCenter
+                width: dl.implicitWidth + 12; height: 18; radius: 9
+                color: !card.delta ? "transparent" : card.delta.kind === "ok" ? Ui.p.ok_bg : card.delta.kind === "warn" ? Ui.p.warn_bg : Ui.p.track
+                Txt {
+                    id: dl
+                    anchors.centerIn: parent
+                    text: card.delta ? card.delta.text : ""
+                    font.pixelSize: 12; font.weight: 600
+                    color: !card.delta ? "transparent" : card.delta.kind === "ok" ? Ui.p.ok : card.delta.kind === "warn" ? Ui.p.warn : Ui.p.text_muted
+                }
+            }
+            Txt {
+                height: 20
+                width: Math.min(implicitWidth, card.width - 40 - (card.delta ? dl.implicitWidth + 18 : 0))
+                text: card.k ? card.k.note : ""
+                font.pixelSize: 12
+                color: Ui.p.text_faint
+            }
+        }
+    }
+
+    Item {
+        id: spark
+        width: card.width; height: 62
+        y: card.height - height
+        readonly property var pts: {
+            var v = card.values, n = v.length
+            if (n < 2) return []
+            var lo = card.k && card.k.format === "pct" ? Math.min.apply(null, v) : 0
+            var hi = Math.max.apply(null, v)
+            if (hi - lo <= 0) hi = lo + 1
+            // the lowest value sits above the rounded corners
+            return v.map(function (x, i) { return [1 + i * (width - 2) / (n - 1), 8 + (1 - (x - lo) / (hi - lo)) * (height - 8 - Ui.radius - 2)] })
+        }
+        readonly property string line: Ui.pathFwd(pts)
+        Shape {
+            anchors.fill: parent
+            visible: spark.pts.length > 1
+            preferredRendererType: Shape.CurveRenderer
+            ShapePath {
+                strokeColor: "transparent"
+                fillGradient: LinearGradient {
+                    x1: 0; y1: 0; x2: 0; y2: spark.height
+                    GradientStop { position: 0; color: Ui.alpha(card.hue, Ui.dark ? 0.36 : 0.24) }
+                    GradientStop { position: 1; color: Ui.alpha(card.hue, 0) }
+                }
+                PathSvg {
+                    readonly property real r: Ui.radius - 1
+                    path: spark.pts.length > 1 ? spark.line + "L" + Ui.f1(spark.width - 1) + "," + Ui.f1(spark.height - 1 - r)
+                          + "Q" + Ui.f1(spark.width - 1) + "," + Ui.f1(spark.height - 1) + " " + Ui.f1(spark.width - 1 - r) + "," + Ui.f1(spark.height - 1)
+                          + "H" + Ui.f1(1 + r) + "Q1," + Ui.f1(spark.height - 1) + " 1," + Ui.f1(spark.height - 1 - r) + "Z" : ""
+                }
+            }
+            ShapePath {
+                strokeColor: Ui.alpha(card.hue, Ui.dark ? 0.22 : 0.0)
+                strokeWidth: 6
+                fillColor: "transparent"
+                capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+                PathSvg { path: spark.line }
+            }
+            ShapePath {
+                strokeColor: card.hue
+                strokeWidth: 2
+                fillColor: "transparent"
+                capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+                PathSvg { path: spark.line }
+            }
+        }
+    }
+
+    MouseArea {
+        id: hov
+        anchors.fill: parent
+        hoverEnabled: true
+        acceptedButtons: Qt.NoButton
+        onEntered: if (card.k && (card.k.hint || card.k.prev != null)) {
+            tip.title = card.k.label
+            tip.value = Ui.fmt(card.k.format, card.k.value)
+            tip.rows = card.k.prev != null ? [{ c: Ui.p.text_faint, name: "Previous period", v: Ui.fmt(card.k.format, card.k.prev) }] : []
+            tip.note = card.k.hint || ""
+            tip.showAt(card, card.width / 2, 12)
+        }
+        onExited: tip.hide()
+    }
+    ChartTip { id: tip }
+    Accessible.role: Accessible.StaticText
+    Accessible.name: k ? k.label + " " + Ui.fmt(k.format, k.value) + (delta ? ", " + delta.text + " " + k.note : "") : ""
+}

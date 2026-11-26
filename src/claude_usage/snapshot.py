@@ -1,0 +1,866 @@
+"""Snapshots for every UI surface: pure functions of the store, the latest limits and the clock.
+
+``build`` returns the whole app view for one range and project filter;
+``now_state`` returns the small range-independent part the OSD needs. Both
+follow tests/unit/snapshot_contract.py. Times are ISO 8601 with the local
+offset, money is API-equivalent USD computed from tokens at read time.
+"""
+
+from __future__ import annotations
+
+import math
+import sqlite3
+import statistics
+import time as _time
+from datetime import date, datetime, time, timedelta
+from typing import Any, Optional
+
+from claude_usage import pricing, store, tokens
+
+SCHEMA = 1
+RANGES = {
+    "24h": (1, "hour", "last 24 hours"),
+    "7d": (7, "6h", "last 7 days"),
+    "30d": (30, "day", "last 30 days"),
+    "90d": (90, "day", "last 90 days"),
+    "all": (None, "week", "all time"),
+}
+TOP = 5
+OTHER = -1
+LEGACY = -2  # timeline series of days that only have the old usage-daily totals
+SESSION_CAP = 2000
+ACTIVITY_DAYS = 84
+LIVE_MS = 2 * 60_000
+ACTIVE_MS = 5 * 60_000
+STALE_S = 15 * 60
+WEEK_S = 7 * 86400
+HIT = 0.995  # utilization is reported in whole percents; 100% reads as 1.0
+USUAL_STEPS = 56  # one usual-week point every 3 hours
+COST_NOTE = ("Cost is API-equivalent: every API call in your local transcripts, subagents included, priced at "
+             "Anthropic's published per-token rates (as of {as_of}). It is not a bill.")
+
+_SUMS = "COUNT(*), SUM(input), SUM(output), SUM(cache_read), SUM(cache_write_5m), SUM(cache_write_1h), SUM(web_search)"
+_PROJ = "coalesce(project, 'Unknown')"
+
+
+# ---------------------------------------------------------------- small helpers
+
+def _iso(ts: Optional[float]) -> Optional[str]:
+    if ts is None:
+        return None
+    return datetime.fromtimestamp(ts).astimezone().isoformat(timespec="seconds")
+
+
+def _midnight(d: date) -> float:
+    return datetime.combine(d, time()).timestamp()
+
+
+def _money(x: float) -> str:
+    if 0 < x < 0.005:
+        return "<$0.01"
+    return f"${x:,.0f}" if x >= 100 else f"${x:,.2f}"
+
+
+def _dur(ms: float) -> str:
+    m = int(round(ms / 60000))
+    if ms < 60000:
+        return f"{int(ms // 1000)}s"
+    return f"{m}m" if m < 60 else f"{m // 60}h {m % 60}m"
+
+
+def _md(ts: float) -> str:
+    d = datetime.fromtimestamp(ts)
+    return f"{d:%b} {d.day}"
+
+
+def _clock(ts: float, now: float) -> str:
+    d = datetime.fromtimestamp(ts)
+    hm = f"{d.hour % 12 or 12}:{d.minute:02d} {'AM' if d.hour < 12 else 'PM'}"
+    return hm if d.date() == datetime.fromtimestamp(now).date() else f"{d:%a} {hm}"
+
+
+def model_name(cid: str) -> str:
+    """'claude-opus-5-5' -> 'Opus 5.5'; unknown ids are returned as they are."""
+    parts = cid.split("-")
+    if len(parts) < 3 or parts[0] != "claude":
+        return cid
+    nums = [p for p in parts[2:] if p.isdigit() and len(p) <= 2]
+    return parts[1].capitalize() + (" " + ".".join(nums) if nums else "")
+
+
+_RATES: dict = {}
+
+
+def _rate(model: str, speed: str, long: int) -> tuple:
+    """(canonical id, priced, ri, ro, rr, r5, r1) with the call's multiplier folded in, per MTok."""
+    key = (model, speed, long)
+    r = _RATES.get(key)
+    if r is None:
+        cid, rates, priced = pricing.resolve(model)
+        k = pricing.multiplier(model, bool(long), speed or None) / 1e6
+        r = (cid, priced) + tuple(x * k for x in (rates or (0, 0, 0, 0, 0)))
+        _RATES[key] = r
+    return r
+
+
+def _price(model, speed, long, i, o, r, w5, w1, ws) -> tuple:
+    """Cost parts (input incl. web search, output, cache read, cache write) and caching savings."""
+    _, _, ri, ro, rr, r5, r1 = _rate(model, speed, long)
+    saved = r * (ri - rr) - w5 * (r5 - ri) - w1 * (r1 - ri)
+    return i * ri + ws * pricing.WEB_SEARCH_USD, o * ro, r * rr, w5 * r5 + w1 * r1, saved
+
+
+def _pfilter(project: Optional[str]) -> tuple:
+    return (f" AND {_PROJ} = ?", (project,)) if project else ("", ())
+
+
+# ---------------------------------------------------------------- data access
+
+def _call_rows(conn, t0_ms: int, t1_ms: int, project: Optional[str]) -> list:
+    """Per-hour detail straight from calls (used for windows of a few days)."""
+    pf, pa = _pfilter(project)
+    return conn.execute(
+        f"SELECT day, hour, session_id, agent_id, is_subagent, {_PROJ}, model, coalesce(speed, ''), "
+        f"input + cache_read + cache_write_5m + cache_write_1h > {pricing.LONG_PROMPT_TOKENS}, {_SUMS}, "
+        f"MIN(ts_ms), MAX(ts_ms) FROM calls WHERE ts_ms >= ? AND ts_ms < ?{pf} GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9",
+        (t0_ms, t1_ms) + pa).fetchall()
+
+
+def _rollup_rows(conn, d0: str, d1: str, project: Optional[str]) -> list:
+    pf, pa = _pfilter(project)
+    return conn.execute(
+        "SELECT day, NULL, session_id, agent_id, is_subagent, project, model, speed, long, calls, input, output, "
+        f"cache_read, cache_write_5m, cache_write_1h, web_search, first_ms, last_ms FROM rollup "
+        f"WHERE day >= ? AND day <= ?{pf}", (d0, d1) + pa).fetchall()
+
+
+def _turn_rows(conn, t0_ms: int, t1_ms: int, project: Optional[str]) -> list:
+    pf, pa = _pfilter(project)
+    return conn.execute(
+        f"SELECT day, hour, session_id, {_PROJ}, model, duration_ms FROM turns WHERE ts_ms >= ? AND ts_ms < ?{pf}",
+        (t0_ms, t1_ms) + pa).fetchall()
+
+
+def _legacy(conn, cov: Optional[str]) -> dict:
+    """Usable legacy rows before coverage_from: day -> (cost, tokens, messages)."""
+    if not cov:
+        return {}
+    return {d: (c, t, m) for d, c, t, m in conn.execute(
+        "SELECT day, cost, tokens, messages FROM legacy_days WHERE quality = 'legacy' AND cost > 0 AND day < ?",
+        (cov,))}
+
+
+def _alltime(conn) -> tuple:
+    """All-time cost per project and per canonical model, and their colour ranks."""
+    pc: dict = {}
+    mc: dict = {}
+    for project, model, speed, long, *s in conn.execute(
+            f"SELECT project, model, speed, long, SUM(input), SUM(output), SUM(cache_read), SUM(cache_write_5m), "
+            f"SUM(cache_write_1h), SUM(web_search) FROM rollup GROUP BY 1, 2, 3, 4"):
+        c = sum(_price(model, speed, long, *s)[:4])
+        pc[project] = pc.get(project, 0.0) + c
+        cid = _rate(model, speed, long)[0]
+        mc[cid] = mc.get(cid, 0.0) + c
+
+    def rank(d):
+        return {k: i for i, k in enumerate(sorted(d, key=lambda k: (-d[k], k)))}
+
+    return pc, rank(pc), mc, rank(mc)
+
+
+# ---------------------------------------------------------------- range windows
+
+def _buckets(kind: str, n_days: Optional[int], now: float, first_day: date) -> tuple:
+    """Bucket starts (naive local datetimes) and a mapper from (day, hour) to bucket index."""
+    nd = datetime.fromtimestamp(now)
+    if kind == "hour":
+        b = nd.replace(minute=0, second=0, microsecond=0)
+        starts = [b - timedelta(hours=23 - i) for i in range(24)]
+        idx = {(s.date().isoformat(), s.hour): i for i, s in enumerate(starts)}
+        return starts, lambda day, hour: idx.get((day, hour))
+    if kind == "6h":
+        b = nd.replace(hour=nd.hour - nd.hour % 6, minute=0, second=0, microsecond=0)
+        starts = [b - timedelta(hours=6 * (27 - i)) for i in range(28)]
+        idx = {(s.date().isoformat(), s.hour): i for i, s in enumerate(starts)}
+        return starts, lambda day, hour: idx.get((day, hour - hour % 6))
+    today = nd.date()
+    if kind == "day":
+        starts = [datetime.combine(today - timedelta(days=n_days - 1 - i), time()) for i in range(n_days)]
+        idx = {s.date().isoformat(): i for i, s in enumerate(starts)}
+        return starts, lambda day, hour: idx.get(day)
+    first = min(first_day, today)
+    w0 = first - timedelta(days=first.weekday())
+    w1 = today - timedelta(days=today.weekday())
+    n = max(2, (w1 - w0).days // 7 + 1)
+    starts = [datetime.combine(w1 - timedelta(weeks=n - 1 - i), time()) for i in range(n)]
+    d0 = starts[0].date()
+
+    def week(day, hour):
+        i = (date.fromisoformat(day) - d0).days // 7
+        return i if 0 <= i < n else None
+
+    return starts, week
+
+
+# ---------------------------------------------------------------- limits and the pace engine
+
+def _samples(conn, t0: float = 0.0) -> list:
+    return conn.execute("SELECT ts, weekly, session FROM samples WHERE ts >= ? ORDER BY ts", (t0,)).fetchall()
+
+
+def _at(points: list, t: float) -> Optional[float]:
+    """Utilization at time t: the last sample at or before t."""
+    best = None
+    for tt, u in points:
+        if tt > t:
+            break
+        best = u
+    return best
+
+
+_PAST: dict = {}
+
+
+def _past_windows(conn, reset: Optional[float], now: float) -> list:
+    """Complete weekly windows before the current one, aligned to the reset schedule.
+
+    shortcut: windows are cut at whole weeks before the current reset, so a
+    week from before a change of the plan's reset day is split across two.
+    """
+    cur_start = reset - WEEK_S if reset else now
+    n_before = conn.execute("SELECT COUNT(*) FROM samples WHERE ts < ?", (cur_start,)).fetchone()[0]
+    key = (round(cur_start), n_before)
+    if key in _PAST:
+        return _PAST[key]
+    pts = [(t, w) for t, w, _s in conn.execute(
+        "SELECT ts, weekly, session FROM samples WHERE ts < ? AND weekly IS NOT NULL ORDER BY ts", (cur_start,))]
+    wins: dict = {}
+    for t, u in pts:
+        if reset:
+            k = math.ceil((cur_start - t) / WEEK_S)
+            start = cur_start - k * WEEK_S
+        else:
+            k = int(t // WEEK_S)
+            start = k * WEEK_S
+        w = wins.setdefault(k, {"start": start, "end": start + WEEK_S, "pts": [], "peak": 0.0, "hit": None})
+        w["pts"].append((t, u))
+        w["peak"] = max(w["peak"], u)
+        if u >= HIT and w["hit"] is None:
+            w["hit"] = t
+    out = []
+    for w in sorted(wins.values(), key=lambda w: w["start"]):
+        seen = w["pts"][-1][0] - w["pts"][0][0]
+        if seen >= 4 * 86400 or w["hit"] is not None:
+            w["seen"] = seen
+            out.append(w)
+    _PAST.clear()
+    _PAST[key] = out
+    return out
+
+
+def _limits(conn, limits: Optional[dict], now: float, thresholds: tuple) -> tuple:
+    """The LIMITS section and the weekly/5-hour projections now_state reuses."""
+    lim = limits or {}
+    wk = lim.get("weekly") or None
+    reset = (wk or {}).get("resets_at")
+    start = lim.get("window_started_at") or (reset - WEEK_S if reset else None)
+    past = _past_windows(conn, reset, now)
+    weekly = None
+    proj = {"weekly": None, "session": None}
+    cur_pts: list = []
+    if wk and wk.get("pct") is not None and reset and start:
+        u = float(wk["pct"])
+        cur_pts = [(t, w) for t, w, _s in _samples(conn, start) if w is not None]
+        span = max(reset - start, 1.0)
+        elapsed = min(max((now - start) / span, 0.0), 1.0)
+        hours = max((now - start) / 3600, 1e-6)
+        avg_rate = u / hours
+        recent = [p for p in cur_pts if p[0] >= now - 86400]
+        rate24 = None
+        if len(recent) >= 2 and recent[-1][0] - recent[0][0] >= 2 * 3600:
+            rate24 = max((recent[-1][1] - recent[0][1]) / ((recent[-1][0] - recent[0][0]) / 3600), 0.0)
+        rate = max(avg_rate, rate24 or 0.0)
+        eta = None
+        if u >= HIT:
+            eta = next((t for t, w in cur_pts if w >= HIT), now)
+        elif rate > 0:
+            eta = now + (1 - u) / rate * 3600
+        hits = eta is not None and eta < reset
+        series: dict = {}
+        for t, w in cur_pts:
+            h = int(t // 3600) * 3600
+            series[h] = max(series.get(h, 0.0), w)
+        usable = [w for w in past if w["seen"] >= 5 * 86400]
+        usual_series = []
+        if len(usable) >= 2:
+            for i in range(USUAL_STEPS + 1):
+                vals = [v for v in (_at(w["pts"], w["start"] + i / USUAL_STEPS * WEEK_S) for w in usable)
+                        if v is not None]
+                if len(vals) >= 2:
+                    usual_series.append({"elapsed": round(i / USUAL_STEPS, 4), "pct": round(statistics.median(vals), 4)})
+        usual = None
+        if len(usable) >= 2:
+            vals = [v for v in (_at(w["pts"], w["start"] + elapsed * WEEK_S) for w in usable) if v is not None]
+            usual = round(statistics.median(vals), 4) if len(vals) >= 2 else None
+        days_left = (reset - now) / 86400
+        weekly = {
+            "pct": u,
+            "resets_at": _iso(reset),
+            "window_start": _iso(start),
+            "level": tokens.level(u, *thresholds),
+            "elapsed": round(elapsed, 4),
+            "pace": round(u / elapsed, 3) if elapsed > 0.01 else None,
+            "usual": usual,
+            "eta": _iso(eta) if hits else None,
+            "hits_before_reset": hits,
+            "locked_hours": round((reset - eta) / 3600, 1) if hits else None,
+            "daily_budget": round(max(1 - u, 0.0) / days_left, 4) if days_left > 0 else None,
+            "hourly_rate": round(rate, 5),
+            "series": [{"t": _iso(h), "pct": round(v, 4)} for h, v in sorted(series.items())],
+            "usual_series": usual_series,
+        }
+        at_reset = min(u + rate * max(reset - now, 0) / 3600, 9.99)
+        proj["weekly"] = {"pct": u, "reset": reset, "eta": eta if hits else None, "at_reset": at_reset}
+
+    five = lim.get("five_hour") or None
+    session = None
+    if five and five.get("pct") is not None:
+        p, r5 = float(five["pct"]), five.get("resets_at")
+        session = {"pct": p, "resets_at": _iso(r5), "level": tokens.level(p, *thresholds)}
+        eta5, at_reset5 = None, p
+        if r5:
+            hours = max((now - (r5 - 5 * 3600)) / 3600, 1e-6)
+            rate5 = p / hours
+            at_reset5 = p + rate5 * max(r5 - now, 0) / 3600
+            if p < HIT and rate5 > 0 and now + (1 - p) / rate5 * 3600 < r5:
+                eta5 = now + (1 - p) / rate5 * 3600
+            elif p >= HIT:
+                eta5 = now
+        proj["session"] = {"pct": p, "reset": r5, "eta": eta5, "at_reset": at_reset5}
+
+    note = None
+    if session is None:
+        last = conn.execute("SELECT MAX(ts) FROM samples WHERE session > 0").fetchone()[0]
+        note = (f"Your plan has not reported a 5-hour limit since {_md(last)}." if last
+                else "Your plan does not report a 5-hour limit.")
+
+    scoped = []
+    for x in lim.get("limits") or []:
+        if x.get("kind") == "weekly_all" or x.get("pct") is None:
+            continue
+        scoped.append({"name": x.get("name") or str(x.get("kind") or "Limit").replace("_", " ").capitalize(),
+                       "pct": x["pct"], "active": bool(x.get("active")), "allowance": x.get("allowance"),
+                       "resets_at": _iso(x.get("resets_at"))})
+    surfaces = [{"name": s["name"], "pct": s["pct"], "pct_of_limit": s["pct_of_limit"]}
+                for s in lim.get("surfaces") or [] if s.get("pct") is not None and s.get("pct_of_limit") is not None]
+    ex = lim.get("extra_usage")
+    extra = None
+    if ex and ex.get("used") is not None:
+        extra = {"enabled": bool(ex.get("enabled")), "monthly_limit": ex.get("monthly_limit"), "used": ex["used"],
+                 "currency": ex.get("currency") or "", "reason": ex.get("reason")}
+
+    weeks = []
+    for w in past[-12:]:
+        hours_at = (w["end"] - w["hit"]) / 3600 if w["hit"] else 0.0
+        weeks.append({"start": _iso(w["start"]), "peak": round(min(w["peak"], 1.0), 4),
+                      "hours_at_limit": round(hours_at, 1), "current": False})
+    counted = len(weeks)
+    hit = sum(1 for w in weeks if w["peak"] >= HIT)
+    if weekly is not None:
+        cur_hit = next((t for t, w in cur_pts if w >= HIT), None)
+        weeks.append({"start": weekly["window_start"], "peak": round(max([w for _t, w in cur_pts] + [weekly["pct"]]), 4),
+                      "hours_at_limit": round((now - cur_hit) / 3600, 1) if cur_hit else 0.0, "current": True})
+    section = {"weekly": weekly, "session": session, "session_note": note, "scoped": scoped, "surfaces": surfaces,
+               "extra_usage": extra, "past_weeks": weeks, "weeks_hit": hit, "weeks_counted": counted}
+    return section, proj
+
+
+def _forecast(p: Optional[dict], now: float) -> tuple:
+    if not p:
+        return None, None
+    if p["eta"] is not None:
+        if p["pct"] >= HIT:
+            return f"Limited until {_clock(p['reset'], now)}" if p["reset"] else "Limited", _iso(p["eta"])
+        return f"Limit {_clock(p['eta'], now)}", _iso(p["eta"])
+    return f"About {round(min(p['at_reset'], 1.0) * 100)}% at reset", None
+
+
+def _state(limits: Optional[dict], now: float) -> tuple:
+    lim = limits or {}
+    err = lim.get("error")
+    if err and ("credentials" in err.lower() or "log in" in err.lower() or "re-authenticate" in err.lower()):
+        return "signed_out", err
+    has_data = bool(lim.get("weekly") or lim.get("five_hour"))
+    if err:
+        return ("stale" if has_data else "error"), err
+    if not limits:
+        return "loading", None
+    fetched = lim.get("fetched_at")
+    if fetched and now - fetched > STALE_S:
+        return "stale", None
+    return "ok", None
+
+
+# ---------------------------------------------------------------- now
+
+def now_state(conn: sqlite3.Connection, limits: Optional[dict], now: Optional[float] = None,
+              thresholds: Optional[tuple] = None) -> dict:
+    """The range-independent state the OSD shows. ``limits`` is the latest good
+    fetch_rate_limits() result, with an ``error`` key added when the last fetch failed."""
+    now = _time.time() if now is None else now
+    thresholds = thresholds or (tokens.CAUTION, tokens.CRITICAL)
+    _section, proj = _limits(conn, limits, now, thresholds)
+    return _now(conn, limits, now, thresholds, proj)
+
+
+def _now(conn, limits, now, thresholds, proj) -> dict:
+    lim = limits or {}
+
+    def meter(key, p):
+        if not p:
+            return None
+        forecast, eta = _forecast(p, now)
+        return {"pct": p["pct"], "resets_at": _iso(p["reset"]), "level": tokens.level(p["pct"], *thresholds),
+                "forecast": forecast, "eta": eta}
+
+    weekly, session = meter("weekly", proj["weekly"]), meter("session", proj["session"])
+    primary = "weekly"
+    pw, ps = proj["weekly"], proj["session"]
+    if ps and (ps["eta"] is not None and (not pw or pw["eta"] is None or ps["eta"] <= pw["eta"])
+               or (not pw or pw["eta"] is None) and ps["pct"] > (pw or {}).get("pct", -1)):
+        primary = "session"
+    today = datetime.fromtimestamp(now).date().isoformat()
+    cost = 0.0
+    tok = 0
+    for model, speed, long, n, i, o, r, w5, w1, ws in conn.execute(
+            f"SELECT model, speed, long, SUM(calls), SUM(input), SUM(output), SUM(cache_read), SUM(cache_write_5m), "
+            f"SUM(cache_write_1h), SUM(web_search) FROM rollup WHERE day = ? GROUP BY 1, 2, 3", (today,)):
+        cost += sum(_price(model, speed, long, i, o, r, w5, w1, ws)[:4])
+        tok += i + o + r + w5 + w1
+    now_ms = int(now * 1000)
+    out5, sessions, last = conn.execute(
+        "SELECT SUM(output), COUNT(DISTINCT session_id), MAX(ts_ms) FROM calls WHERE ts_ms >= ?",
+        (now_ms - ACTIVE_MS,)).fetchone()
+    agents = conn.execute("SELECT COUNT(DISTINCT agent_id) FROM calls WHERE ts_ms >= ? AND is_subagent = 1",
+                          (now_ms - LIVE_MS,)).fetchone()[0]
+    state, message = _state(limits, now)
+    return {
+        "primary": primary,
+        "weekly": weekly,
+        "session": session,
+        "today_cost": round(cost, 4),
+        "today_tokens": int(tok),
+        "tokens_per_min": round((out5 or 0) / (ACTIVE_MS / 60000), 1),
+        "active_sessions": int(sessions or 0),
+        "active_subagents": int(agents or 0),
+        "live": bool(last and last >= now_ms - LIVE_MS),
+        "state": state,
+        "as_of": _iso(lim.get("fetched_at")),
+        "message": message,
+    }
+
+
+# ---------------------------------------------------------------- build
+
+class _Tot:
+    __slots__ = ("cost", "tok", "calls", "cr", "prompt", "agent", "turns", "sessions", "sub")
+
+    def __init__(self):
+        self.cost = 0.0
+        self.tok = self.calls = self.cr = self.prompt = self.agent = self.turns = 0
+        self.sub = 0.0
+        self.sessions: set = set()
+
+    def add(self, sid, n, i, o, r, w5, w1, cost, sub):
+        self.cost += cost
+        self.tok += i + o + r + w5 + w1
+        self.calls += n
+        self.cr += r
+        self.prompt += i + r + w5 + w1
+        self.sessions.add(sid)
+        if sub:
+            self.sub += cost
+
+    def hit(self):
+        return self.cr / self.prompt if self.prompt else None
+
+
+def build(conn: sqlite3.Connection, range_key: str = "7d", project: Optional[str] = None,
+          now: Optional[float] = None, limits: Optional[dict] = None, *, indexing: Optional[dict] = None,
+          updated_at: Optional[float] = None, thresholds: Optional[tuple] = None) -> dict:
+    """The whole app view. ``project`` filters everything except ``limits`` and ``now``."""
+    now = _time.time() if now is None else now
+    thresholds = thresholds or (tokens.CAUTION, tokens.CRITICAL)
+    n_days, kind, label = RANGES[range_key]
+    now_ms = int(now * 1000)
+    today = datetime.fromtimestamp(now).date()
+    cov = store.get_meta(conn, "coverage_from")
+    cov_ts = _midnight(date.fromisoformat(cov)) if cov else None
+    legacy = _legacy(conn, cov) if project is None else {}
+    first = conn.execute("SELECT MIN(day) FROM rollup").fetchone()[0]
+    first_day = min([date.fromisoformat(first)] if first else [today]
+                    + ([date.fromisoformat(min(legacy))] if legacy else []))
+    starts, bucket_of = _buckets(kind, n_days, now, first_day)
+    nb = len(starts)
+    t0 = starts[0].timestamp()
+    t0_ms = int(t0 * 1000)
+    hourly = kind in ("hour", "6h")
+    rows = (_call_rows(conn, t0_ms, now_ms + 1, project) if hourly
+            else _rollup_rows(conn, starts[0].date().isoformat(), today.isoformat(), project))
+    turns = _turn_rows(conn, t0_ms, now_ms + 1, project)
+    pc_all, prank, mc_all, mrank = _alltime(conn)
+
+    # Days before coverage_from fall back to the legacy totals when those are larger.
+    priced = []
+    day_cost: dict = {}
+    for row in rows:
+        parts = _price(row[6], row[7], row[8], *row[10:16])
+        priced.append((row, parts))
+        if cov and row[0] < cov:
+            day_cost[row[0]] = day_cost.get(row[0], 0.0) + sum(parts[:4])
+    legacy_used = {d: v for d, v in legacy.items() if v[0] > day_cost.get(d, 0.0)} if range_key == "all" else {}
+
+    total = _Tot()
+    buckets = [_Tot() for _ in range(nb)]
+    by = {"project": {}, "model": {}}
+    ent_cost = {"project": {}, "model": {}}
+    models: dict = {}
+    sessions: dict = {}
+    proj_range: dict = {}
+    split = [[0.0, 0] for _ in range(4)]
+    saved = 0.0
+    day_tot: dict = {}
+
+    def series(group, key):
+        g = by[group].get(key)
+        if g is None:
+            g = by[group][key] = {m: [0.0] * nb for m in ("cost", "tokens", "messages", "agent_time")}
+        return g
+
+    for row, parts in priced:
+        day, hour, sid, agent, is_sub, proj, model, speed, long, n, i, o, r, w5, w1, ws, f_ms, l_ms = row
+        if day in legacy_used:
+            continue
+        b = bucket_of(day, hour)
+        if b is None:
+            continue
+        cost = parts[0] + parts[1] + parts[2] + parts[3]
+        tk = i + o + r + w5 + w1
+        cid, prc = _rate(model, speed, long)[:2]
+        total.add(sid, n, i, o, r, w5, w1, cost, is_sub)
+        buckets[b].add(sid, n, i, o, r, w5, w1, cost, is_sub)
+        for grp, key in (("project", proj), ("model", cid)):
+            s = series(grp, key)
+            s["cost"][b] += cost
+            s["tokens"][b] += tk
+            s["messages"][b] += n
+            ent_cost[grp][key] = ent_cost[grp].get(key, 0.0) + cost
+        m = models.setdefault(cid, {"cost": 0.0, "output": 0, "calls": 0, "cr": 0, "prompt": 0, "priced": prc})
+        m["cost"] += cost
+        m["output"] += o
+        m["calls"] += n
+        m["cr"] += r
+        m["prompt"] += i + r + w5 + w1
+        for k, (c, t) in enumerate(((parts[0], i), (parts[1], o), (parts[2], r), (parts[3], w5 + w1))):
+            split[k][0] += c
+            split[k][1] += t
+        saved += parts[4]
+        s = sessions.setdefault(sid, {"cost": 0.0, "tok": 0, "cr": 0, "prompt": 0, "models": {}, "projects": {},
+                                      "agents": set(), "first": f_ms, "last": l_ms, "agent": 0, "turns": 0})
+        s["cost"] += cost
+        s["tok"] += tk
+        s["cr"] += r
+        s["prompt"] += i + r + w5 + w1
+        s["models"][cid] = s["models"].get(cid, 0.0) + cost
+        s["projects"][proj] = s["projects"].get(proj, 0.0) + cost
+        if agent:
+            s["agents"].add(agent)
+        s["first"], s["last"] = min(s["first"], f_ms), max(s["last"], l_ms)
+        pr = proj_range.setdefault(proj, [0.0, set()])
+        pr[0] += cost
+        pr[1].add(sid)
+        dk = (day, hour) if range_key == "24h" else (day, None)
+        day_tot[dk] = day_tot.get(dk, 0.0) + cost
+
+    for day, hour, sid, proj, model, dur in turns:
+        b = bucket_of(day, hour)
+        if b is None:
+            continue
+        total.agent += dur
+        total.turns += 1
+        buckets[b].agent += dur
+        buckets[b].turns += 1
+        cid = pricing.resolve(model)[0] if model else None
+        series("project", proj)["agent_time"][b] += dur
+        series("model", cid or "")["agent_time"][b] += dur
+        if sid in sessions:
+            sessions[sid]["agent"] += dur
+            sessions[sid]["turns"] += 1
+
+    leg_series = None
+    if legacy_used:
+        leg_series = {m: [0.0] * nb for m in ("cost", "tokens", "messages", "agent_time")}
+        for d, (c, t, msg) in legacy_used.items():
+            b = bucket_of(d, None)
+            if b is None:
+                continue
+            for tot in (total, buckets[b]):
+                tot.cost += c
+                tot.tok += t
+                tot.calls += msg
+            leg_series["cost"][b] += c
+            leg_series["tokens"][b] += t
+            leg_series["messages"][b] += msg
+
+    # ---- timeline groups: top five by cost in range, coloured by all-time rank
+    def group(grp, ranks, name):
+        costs = ent_cost[grp]
+        keys = sorted((k for k in by[grp] if k and costs.get(k, 0) > 0), key=lambda k: (-costs[k], k))[:TOP]
+        out = {"keys": [name(k) for k in keys], "colors": [ranks.get(k, OTHER) for k in keys],
+               "values": {m: [[round(v, 4) for v in by[grp][k][m]] for k in keys] for m in by[grp].get(keys[0], {})}
+               if keys else {m: [] for m in ("cost", "tokens", "messages", "agent_time")}}
+        rest = [k for k in by[grp] if k not in keys]
+        other = {m: [sum(by[grp][k][m][b] for k in rest) for b in range(nb)]
+                 for m in ("cost", "tokens", "messages", "agent_time")}
+        if any(any(v) for v in other.values()):
+            out["keys"].append("Other")
+            out["colors"].append(OTHER)
+            for m in other:
+                out["values"].setdefault(m, []).append([round(v, 4) for v in other[m]])
+        if leg_series:
+            out["keys"].append("Legacy")
+            out["colors"].append(LEGACY)
+            for m in leg_series:
+                out["values"].setdefault(m, []).append([round(v, 4) for v in leg_series[m]])
+        for m in ("cost", "tokens", "messages", "agent_time"):
+            out["values"].setdefault(m, [])
+        return out
+
+    timeline = {
+        "bucket": kind,
+        "starts": [_iso(s.timestamp()) for s in starts],
+        "partial_last": True,
+        "totals": {"cost": round(total.cost, 4), "tokens": total.tok, "messages": total.calls,
+                   "agent_time": total.agent},
+        "by": {"project": group("project", prank, str), "model": group("model", mrank, model_name)},
+    }
+
+    # ---- previous equal-length window, ending where this one starts
+    prev = None
+    p0 = t0 - (now - t0)
+    if range_key != "all" and cov_ts is not None and p0 >= cov_ts:
+        p0_ms = int(p0 * 1000)
+        if hourly:
+            prows = _call_rows(conn, p0_ms, t0_ms, project)
+        else:
+            pday = datetime.fromtimestamp(p0).date()
+            edge = int(_midnight(pday + timedelta(days=1)) * 1000)
+            prows = _call_rows(conn, p0_ms, edge, project) + _rollup_rows(
+                conn, (pday + timedelta(days=1)).isoformat(), (starts[0].date() - timedelta(days=1)).isoformat(),
+                project)
+        prev = _Tot()
+        for row in prows:
+            parts = _price(row[6], row[7], row[8], *row[10:16])
+            prev.add(row[2], *row[9:15], sum(parts[:4]), row[4])
+        pf, pa = _pfilter(project)
+        prev.agent = conn.execute(f"SELECT coalesce(SUM(duration_ms), 0) FROM turns WHERE ts_ms >= ? AND ts_ms < ?{pf}",
+                                  (p0_ms, t0_ms) + pa).fetchone()[0]
+
+    note = ("all time" if range_key == "all" else
+            f"vs prior {'24 hours' if range_key == '24h' else str(n_days) + ' days'}" if prev else
+            "no complete prior period")
+
+    def kpi(key, label, fmt, value, pval, unit, ser, hint=None):
+        delta = None
+        if pval is not None and value is not None:
+            if unit == "pts":
+                delta = round(value - pval, 4)
+            elif pval:
+                delta = round((value - pval) / pval, 4)
+        return {"key": key, "label": label, "format": fmt, "value": value if value is not None else 0.0,
+                "prev": pval, "delta": delta, "delta_unit": unit, "series": ser, "note": note, "hint": hint}
+
+    hit_now = total.hit()
+    kpis = [
+        kpi("cost", "Cost", "usd", round(total.cost, 2), round(prev.cost, 2) if prev else None, "pct",
+            [round(b.cost, 2) for b in buckets],
+            f"{round(total.sub / total.cost * 100)}% from subagents" if total.cost and total.sub else None),
+        kpi("tokens", "Tokens", "tokens", total.tok, prev.tok if prev else None, "pct", [b.tok for b in buckets],
+            f"{round(total.cr / total.tok * 100)}% cache reads" if total.tok else None),
+        kpi("sessions", "Sessions", "int", len(total.sessions), len(prev.sessions) if prev else None, "pct",
+            [len(b.sessions) for b in buckets]),
+        kpi("agent_time", "Agent time", "duration", int(total.agent), int(prev.agent) if prev else None, "pct",
+            [int(b.agent) for b in buckets], "Parallel sessions add up" if total.agent else None),
+        kpi("cache_hit", "Cache hit rate", "pct", round(hit_now, 4) if hit_now is not None else None,
+            round(prev.hit(), 4) if prev and prev.hit() is not None else None, "pts",
+            [round(b.hit() or 0.0, 4) for b in buckets]),
+    ]
+
+    # ---- sidebar projects: every project ever seen, active ones first
+    projects = []
+    for name in sorted(pc_all, key=lambda k: (k not in proj_range, -(proj_range.get(k, [0.0])[0]), -pc_all[k], k)):
+        pr = proj_range.get(name)
+        projects.append({"name": name, "sessions": len(pr[1]) if pr else 0, "cost": round(pr[0], 2) if pr else 0.0,
+                         "color": prank.get(name, OTHER), "idle": pr is None})
+
+    # ---- sessions
+    sids = sorted(sessions, key=lambda k: -sessions[k]["last"])
+    meta = {}
+    for i in range(0, len(sids), 500):
+        chunk = sids[i:i + 500]
+        for sid, title, entry in conn.execute(
+                f"SELECT session_id, title, entrypoint FROM sessions WHERE session_id IN ({','.join('?' * len(chunk))})",
+                chunk):
+            meta[sid] = (title, entry)
+    has_turns = {sid for (sid,) in conn.execute("SELECT DISTINCT session_id FROM turns")}
+    sess_out = []
+    for sid in sids:
+        s = sessions[sid]
+        title, entry = meta.get(sid, (None, None))
+        proj = max(s["projects"], key=s["projects"].get)
+        sess_out.append({
+            "id": sid or "",
+            "title": title,
+            "project": proj,
+            "color": prank.get(proj, OTHER),
+            "model": model_name(max(s["models"], key=s["models"].get)),
+            "entrypoint": entry or "unknown",
+            "started": _iso(s["first"] / 1000),
+            "ended": _iso(s["last"] / 1000),
+            "agent_ms": int(s["agent"]),
+            "turns": int(s["turns"]),
+            "tokens": int(s["tok"]),
+            "cost": round(s["cost"], 4),
+            "cache_hit": round(s["cr"] / s["prompt"], 4) if s["prompt"] else None,
+            "subagents": len(s["agents"]),
+            "interactive": bool(entry) and not entry.startswith("sdk") and sid in has_turns,
+        })
+
+    # ---- models and cost split
+    model_out = [{"name": model_name(cid), "id": cid, "cost": round(m["cost"], 4),
+                  "share": round(m["cost"] / total_ledger, 4) if (total_ledger := sum(x["cost"] for x in models.values())) else 0.0,
+                  "output": int(m["output"]), "cache_hit": round(m["cr"] / m["prompt"], 4) if m["prompt"] else None,
+                  "calls": int(m["calls"]), "color": mrank.get(cid, OTHER), "priced": m["priced"]}
+                 for cid, m in sorted(models.items(), key=lambda kv: -kv[1]["cost"])]
+    cost_split = {k: {"cost": round(split[i][0], 4), "tokens": int(split[i][1])}
+                  for i, k in enumerate(("input", "output", "cache_read", "cache_write"))}
+    cost_split["caching_saved"] = round(saved, 2)
+
+    section, proj_now = _limits(conn, limits, now, thresholds)
+    activity = _activity(conn, project, now, cov, legacy, sess_out, day_tot, range_key, limits, section)
+    state, message = _state(limits, now)
+    if state == "ok" and indexing and indexing.get("done", 0) < indexing.get("total", 0) and not total.calls:
+        state = "loading"
+    return {
+        "schema": SCHEMA,
+        "generated_at": _iso(now),
+        "range": {"key": range_key, "days": n_days, "from": _iso(t0), "to": _iso(now), "label": label},
+        "project": project,
+        "status": {
+            "state": state,
+            "message": message,
+            "updated_at": _iso(updated_at if updated_at is not None else now),
+            "limits_as_of": _iso((limits or {}).get("fetched_at")),
+            "indexing": indexing,
+            "transcripts": conn.execute("SELECT COUNT(*) FROM files").fetchone()[0],
+            "coverage_from": cov,
+            "legacy_before": cov if legacy else None,
+        },
+        "now": _now(conn, limits, now, thresholds, proj_now),
+        "limits": section,
+        "kpis": kpis,
+        "timeline": timeline,
+        "projects": projects,
+        "sessions": sess_out[:SESSION_CAP],
+        "sessions_total": len(sess_out),
+        "activity": activity,
+        "models": model_out,
+        "cost_split": cost_split,
+    }
+
+
+def cost_note() -> str:
+    """One line for the UI's "How cost is computed" popover."""
+    return COST_NOTE.format(as_of=pricing.PRICES_AS_OF)
+
+
+# ---------------------------------------------------------------- activity
+
+def _activity(conn, project, now, cov, legacy, sessions, day_tot, range_key, limits, section) -> dict:
+    today = datetime.fromtimestamp(now).date()
+    days = [today - timedelta(days=ACTIVITY_DAYS - 1 - i) for i in range(ACTIVITY_DAYS)]
+    d0 = days[0].isoformat()
+    pf, pa = _pfilter(project)
+    cost: dict = {}
+    for day, model, speed, long, *s in conn.execute(
+            f"SELECT day, model, speed, long, SUM(input), SUM(output), SUM(cache_read), SUM(cache_write_5m), "
+            f"SUM(cache_write_1h), SUM(web_search) FROM rollup WHERE day >= ?{pf} GROUP BY 1, 2, 3, 4",
+            (d0,) + pa):
+        cost[day] = cost.get(day, 0.0) + sum(_price(model, speed, long, *s)[:4])
+    for d, (c, _t, _m) in legacy.items():
+        if d >= d0 and c > cost.get(d, 0.0):
+            cost[d] = c
+    agent = dict(conn.execute(f"SELECT day, SUM(duration_ms) FROM turns WHERE day >= ?{pf} GROUP BY day",
+                              (d0,) + pa).fetchall())
+    vals = sorted(v for v in agent.values() if v > 0)
+    p95 = vals[min(len(vals) - 1, int(len(vals) * 0.95))] if vals else 0
+    out_days = []
+    for d in days:
+        k = d.isoformat()
+        a, c = int(agent.get(k, 0)), cost.get(k, 0.0)
+        level = 0
+        if a > 0 and p95:
+            level = 1 + min(3, int(a / p95 * 4 - 1e-9))
+        elif c > 0:
+            level = 1
+        out_days.append({"date": k, "agent_ms": a, "cost": round(c, 2), "level": max(level, 1 if c > 0 else 0),
+                         "partial": (cov is None or k < cov) or d == today})
+    active = [x["cost"] > 0 for x in out_days]
+    longest = run = 0
+    for on in active:
+        run = run + 1 if on else 0
+        longest = max(longest, run)
+    streak = 0
+    i = len(active) - 1 if active[-1] else len(active) - 2
+    while i >= 0 and active[i]:
+        streak += 1
+        i -= 1
+
+    facts = []
+    if day_tot:
+        (bd, bh), bc = max(day_tot.items(), key=lambda kv: kv[1])
+        if range_key == "24h":
+            bt = datetime.combine(date.fromisoformat(bd), time(hour=bh)).timestamp()
+            facts.append({"label": "Busiest hour", "value": _money(bc), "detail": _clock(bt, now)})
+        else:
+            a = agent.get(bd, 0)
+            facts.append({"label": "Busiest day", "value": _money(bc),
+                          "detail": _md(_midnight(date.fromisoformat(bd))) + (f", {_dur(a)} agent time" if a else "")})
+    if sessions:
+        longest_s = max(sessions, key=lambda s: s["agent_ms"])
+        if longest_s["agent_ms"]:
+            facts.append({"label": "Longest session", "value": _dur(longest_s["agent_ms"]),
+                          "detail": f"{longest_s['project']}, {_md(datetime.fromisoformat(longest_s['started']).timestamp())}"})
+        n = len(sessions)
+        facts.append({"label": "Average per session",
+                      "value": f"{_dur(sum(s['agent_ms'] for s in sessions) / n)}, {_money(sum(s['cost'] for s in sessions) / n)}",
+                      "detail": None})
+        facts.append({"label": "Median session cost", "value": _money(statistics.median(s["cost"] for s in sessions)),
+                      "detail": None})
+        inter = [s for s in sessions if s["interactive"]]
+        turns = sum(s["turns"] for s in inter)
+        if turns:
+            facts.append({"label": "Cost per turn", "value": _money(sum(s["cost"] for s in inter) / turns),
+                          "detail": "interactive sessions"})
+    wk = section.get("weekly")
+    if project is None and wk and wk["pct"] > 0.05 and wk["window_start"]:
+        ws_ms = int(datetime.fromisoformat(wk["window_start"]).timestamp() * 1000)
+        spent = sum(sum(_price(m, sp, lg, *s)[:4]) for m, sp, lg, *s in conn.execute(
+            f"SELECT model, coalesce(speed, ''), input + cache_read + cache_write_5m + cache_write_1h > "
+            f"{pricing.LONG_PROMPT_TOKENS}, SUM(input), SUM(output), SUM(cache_read), SUM(cache_write_5m), "
+            f"SUM(cache_write_1h), SUM(web_search) FROM calls WHERE ts_ms >= ? GROUP BY 1, 2, 3", (ws_ms,)))
+        if spent > 0:
+            facts.append({"label": "Weekly limit value", "value": f"{_money(spent / (wk['pct'] * 100))} per 1%",
+                          "detail": f"about {_money(spent / wk['pct'])} a week at API prices"})
+    return {"days": out_days, "active_days": sum(active), "span_days": ACTIVITY_DAYS, "streak": streak,
+            "longest_streak": longest, "facts": facts}

@@ -1,0 +1,222 @@
+"""The app's own SQLite store: API calls, turns, sessions, utilization samples.
+
+Claude Code deletes transcripts after ``cleanupPeriodDays``, so this store is
+the system of record for history. Cost is never stored: it is computed from
+tokens and :mod:`claude_usage.pricing` when read, so a price fix corrects all
+past days. Use one connection per thread (:func:`connect`); WAL lets the GUI
+read while the worker writes.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+from typing import Any, Optional
+
+SCHEMA_VERSION = 1
+
+# Additive only: each entry upgrades the schema from version i to i + 1.
+MIGRATIONS = [
+    """
+    CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+    CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, size INTEGER, mtime INTEGER, offset INTEGER);
+    CREATE TABLE IF NOT EXISTS calls(
+        msg_id TEXT PRIMARY KEY, ts_ms INTEGER NOT NULL, day TEXT NOT NULL, hour INTEGER NOT NULL,
+        session_id TEXT, agent_id TEXT, is_subagent INTEGER NOT NULL DEFAULT 0, project TEXT, cwd TEXT,
+        model TEXT, speed TEXT, input INTEGER NOT NULL DEFAULT 0, output INTEGER NOT NULL DEFAULT 0,
+        cache_read INTEGER NOT NULL DEFAULT 0, cache_write_5m INTEGER NOT NULL DEFAULT 0,
+        cache_write_1h INTEGER NOT NULL DEFAULT 0, web_search INTEGER NOT NULL DEFAULT 0);
+    CREATE INDEX IF NOT EXISTS calls_day ON calls(day);
+    CREATE INDEX IF NOT EXISTS calls_session ON calls(session_id);
+    CREATE INDEX IF NOT EXISTS calls_ts ON calls(ts_ms);
+    CREATE TABLE IF NOT EXISTS turns(
+        uuid TEXT PRIMARY KEY, session_id TEXT, ts_ms INTEGER NOT NULL, day TEXT NOT NULL, hour INTEGER NOT NULL,
+        project TEXT, duration_ms INTEGER NOT NULL DEFAULT 0, src TEXT, model TEXT);
+    CREATE INDEX IF NOT EXISTS turns_day ON turns(day);
+    CREATE INDEX IF NOT EXISTS turns_ts ON turns(ts_ms);
+    CREATE TABLE IF NOT EXISTS rollup(
+        day TEXT NOT NULL, session_id TEXT, agent_id TEXT, is_subagent INTEGER, project TEXT, model TEXT,
+        speed TEXT, long INTEGER, calls INTEGER, input INTEGER, output INTEGER, cache_read INTEGER,
+        cache_write_5m INTEGER, cache_write_1h INTEGER, web_search INTEGER, first_ms INTEGER, last_ms INTEGER);
+    CREATE INDEX IF NOT EXISTS rollup_day ON rollup(day);
+    CREATE TABLE IF NOT EXISTS dirty_days(day TEXT PRIMARY KEY);
+    CREATE TABLE IF NOT EXISTS sessions(
+        session_id TEXT PRIMARY KEY, title TEXT, title_src TEXT, entrypoint TEXT, cwd TEXT, project TEXT);
+    CREATE TABLE IF NOT EXISTS samples(ts REAL PRIMARY KEY, weekly REAL, session REAL, payload TEXT);
+    CREATE TABLE IF NOT EXISTS legacy_days(day TEXT PRIMARY KEY, cost REAL, tokens INTEGER, messages INTEGER, quality TEXT);
+    """,
+]
+
+# usage-daily.jsonl rows written before the dedupe fix (2026-06-03) counted
+# every streamed line of a message, about 2.2x the real usage.
+_PRE_DEDUPE_BEFORE = "2026-06-03"
+
+
+def default_path() -> str:
+    base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), ".local", "share")
+    return os.path.join(base, "claude-usage", "usage.db")
+
+
+def connect(path: Optional[str] = None) -> sqlite3.Connection:
+    """Open (and create or migrate) the store. Call once per thread."""
+    path = path or default_path()
+    if path != ":memory:":
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    conn = sqlite3.connect(path, timeout=10)
+    conn.execute("PRAGMA busy_timeout=10000")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    migrate(conn)
+    return conn
+
+
+def migrate(conn: sqlite3.Connection) -> None:
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    for i in range(version, len(MIGRATIONS)):
+        with conn:
+            conn.executescript(MIGRATIONS[i])
+            conn.execute(f"PRAGMA user_version={i + 1}")
+            conn.execute("INSERT OR REPLACE INTO meta VALUES('schema_version', ?)", (str(i + 1),))
+
+
+def get_meta(conn: sqlite3.Connection, key: str, default: Any = None) -> Any:
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return json.loads(row[0]) if row else default
+
+
+def set_meta(conn: sqlite3.Connection, key: str, value: Any) -> None:
+    with conn:
+        conn.execute("INSERT OR REPLACE INTO meta VALUES(?, ?)", (key, json.dumps(value)))
+
+
+def add_sample(conn: sqlite3.Connection, ts: float, weekly: Optional[float], session: Optional[float],
+               payload: Optional[dict] = None) -> None:
+    """Store one utilization sample. ``None`` means the limit was not reported (never 0)."""
+    with conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO samples VALUES(?, ?, ?, ?)",
+            (float(ts), weekly, session, json.dumps(payload) if payload is not None else None),
+        )
+
+
+# ---------------------------------------------------------------- rollup
+
+def rollup(conn: sqlite3.Connection) -> int:
+    """Rebuild the per-day rollup for every day the ingest touched. Returns the number of days.
+
+    The rollup holds token sums per (day, session, agent, project, model,
+    speed, prompt tier) so long ranges read thousands of rows, not every call.
+    """
+    from claude_usage.pricing import LONG_PROMPT_TOKENS
+
+    n = conn.execute("SELECT COUNT(*) FROM dirty_days").fetchone()[0]
+    if not n:
+        return 0
+    with conn:
+        conn.execute("DELETE FROM rollup WHERE day IN (SELECT day FROM dirty_days)")
+        conn.execute(
+            "INSERT INTO rollup SELECT day, session_id, agent_id, is_subagent, coalesce(project, 'Unknown'), model, "
+            "coalesce(speed, ''), input + cache_read + cache_write_5m + cache_write_1h > ?, COUNT(*), SUM(input), "
+            "SUM(output), SUM(cache_read), SUM(cache_write_5m), SUM(cache_write_1h), SUM(web_search), MIN(ts_ms), "
+            "MAX(ts_ms) FROM calls WHERE day IN (SELECT day FROM dirty_days) GROUP BY 1, 2, 3, 4, 5, 6, 7, 8",
+            (LONG_PROMPT_TOKENS,))
+        conn.execute("DELETE FROM dirty_days")
+    return n
+
+
+# ---------------------------------------------------------------- legacy import
+
+def import_legacy(conn: sqlite3.Connection, claude_dir: str, force: bool = False) -> dict:
+    """Copy usage-daily.jsonl and usage-history.jsonl in once (read-only on both)."""
+    if get_meta(conn, "legacy_imported") and not force:
+        return {"skipped": True}
+    days = _legacy_days(os.path.join(claude_dir, "usage-daily.jsonl"))
+    samples = []
+    for row in _jsonl(os.path.join(claude_dir, "usage-history.jsonl")):
+        try:
+            ts = float(row["ts"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        weekly, session = _frac(row.get("weekly")), _frac(row.get("session"))
+        # The old collector wrote 0.0 when the 5h limit was not reported.
+        samples.append((ts, weekly, None if not session else session, None))
+    with conn:
+        conn.executemany("INSERT OR REPLACE INTO legacy_days VALUES(?, ?, ?, ?, ?)", days)
+        conn.executemany("INSERT OR IGNORE INTO samples VALUES(?, ?, ?, ?)", samples)
+    set_meta(conn, "legacy_imported", {"days": len(days), "samples": len(samples)})
+    update_coverage(conn)
+    return {"days": len(days), "samples": len(samples), "corrupt": sum(1 for d in days if d[4] == "corrupt")}
+
+
+def _legacy_days(path: str) -> list:
+    rows = sorted((r for r in _jsonl(path) if isinstance(r.get("date"), str)), key=lambda r: r["date"])
+    out, prev = [], None
+    for r in rows:
+        t = r.get("tokens") if isinstance(r.get("tokens"), dict) else {}
+        tokens = sum(int(t.get(k) or 0) for k in ("input", "output", "cache_read", "cache_creation"))
+        cost, msgs = float(r.get("cost") or 0), int(r.get("messages") or 0)
+        copied = prev is not None and cost > 0 and cost == prev[0] and msgs == prev[1]
+        pre_dedupe = r["date"] < _PRE_DEDUPE_BEFORE and not r.get("backfilled") and cost > 0
+        out.append((r["date"], cost, tokens, msgs, "corrupt" if copied or pre_dedupe else "legacy"))
+        prev = (cost, msgs)
+    return out
+
+
+def _jsonl(path: str):
+    try:
+        fh = open(path, encoding="utf-8-sig")
+    except OSError:
+        return
+    with fh:
+        for line in fh:
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict):
+                yield row
+
+
+def _frac(v: Any) -> Optional[float]:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if 0.0 <= f <= 1.5 else None
+
+
+# ---------------------------------------------------------------- coverage
+
+def update_coverage(conn: sqlite3.Connection) -> Optional[str]:
+    """Recompute meta 'coverage_from': the first day from which the ledger can be trusted.
+
+    It is the first day D such that every usable legacy day on or after D with
+    cost has ledger cost of at least half the legacy cost. Earlier days were
+    partly cleaned up by Claude Code and fall back to legacy rows.
+    """
+    from claude_usage import pricing
+
+    ledger = {}
+    for day, model, speed, long, i, o, r, w5, w1, ws in conn.execute(
+        "SELECT day, model, speed, long, SUM(input), SUM(output), SUM(cache_read), SUM(cache_write_5m), "
+        "SUM(cache_write_1h), SUM(web_search) FROM rollup GROUP BY day, model, speed, long"
+    ):
+        ledger[day] = ledger.get(day, 0.0) + pricing.group_cost(model, speed, long, i, o, r, w5, w1, ws)
+    legacy = conn.execute(
+        "SELECT day, cost FROM legacy_days WHERE quality='legacy' AND cost > 0 ORDER BY day"
+    ).fetchall()
+    cov = None
+    if ledger:
+        cov = min(ledger)
+        for day, cost in legacy:
+            if ledger.get(day, 0.0) < 0.5 * cost:
+                cov = max(cov, _next_day(day))
+    set_meta(conn, "coverage_from", cov)
+    return cov
+
+
+def _next_day(day: str) -> str:
+    from datetime import date, timedelta
+
+    return (date.fromisoformat(day) + timedelta(days=1)).isoformat()
