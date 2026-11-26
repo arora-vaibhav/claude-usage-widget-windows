@@ -33,7 +33,7 @@ Card {
         for (var i = 0; i < grp.keys.length; i++) {
             var arr = grp.values[metric][i], sum = 0
             for (var j = 0; j < arr.length; j++) sum += arr[j]
-            if (sum > 0) out.push({ key: grp.keys[i], color: Ui.seriesColor(grp.colors[i]), other: grp.colors[i] < 0, arr: arr, sum: sum })
+            if (sum > 0) out.push({ key: grp.keys[i], color: Ui.seriesColor(grp.colors[i]), other: grp.colors[i] === -1, legacy: grp.colors[i] === -2, arr: arr, sum: sum })
         }
         return out
     }
@@ -47,7 +47,7 @@ Card {
     readonly property real total: tl ? (anyHidden ? tot.reduce(function (a, b) { return a + b }, 0) : tl.totals[metric]) : 0
     readonly property int lastFull: tl && tl.partial_last ? n - 2 : n - 1
 
-    function seriesName(s) { return s.other ? (group === "model" ? "Other models" : "Other projects") : s.key }
+    function seriesName(s) { return s.legacy ? "Old daily totals" : s.other ? (group === "model" ? "Other models" : "Other projects") : s.key }
     function bucketLabel(k) {
         var d = starts[k]
         if (!d) return ""
@@ -189,10 +189,10 @@ Card {
         readonly property var direct: {
             var out = [], boxes = []
             if (soFar) boxes.push({ x: soFar.x - 60, y: soFar.y - 30, w: 70, h: 44 })
-            var named = bands.filter(function (b) { return !b.s.other && b.best.th >= 26 }).sort(function (a, b) { return b.s.sum - a.s.sum }).slice(0, 3)
+            var named = bands.filter(function (b) { return !b.s.other && !b.s.legacy && b.best.th >= 26 }).sort(function (a, b) { return b.s.sum - a.s.sum }).slice(0, 3)
             for (var i = 0; i < named.length; i++) {
-                var b = named[i], name = b.key.length > 26 ? b.key.slice(0, 25) + "." : b.key
-                var w = fm.advanceWidth(name) + 28, lastX = px(Math.max(0, card.lastFull))
+                var b = named[i], name = b.key
+                var w = Math.min(fm.advanceWidth(name), 180) + 28, lastX = px(Math.max(0, card.lastFull))
                 var cx = Math.max(xL + w / 2 + 4, Math.min(lastX - w / 2 - 4, px(b.best.k)))
                 var box = { x: cx - w / 2, y: b.best.y - 11, w: w, h: 22 }
                 if (box.x < xL) continue
@@ -288,7 +288,7 @@ Card {
                 opacity: card.iso === "" || card.iso === modelData.key ? 1 : 0
                 Behavior on opacity { NumberAnimation { duration: Ui.fast } }
                 Rectangle { x: 9; y: 7.5; width: 7; height: 7; radius: 3.5; color: modelData.color }
-                Txt { x: 21; height: 22; text: modelData.name; font.pixelSize: 12 }
+                Txt { x: 21; width: parent.width - 28; height: 22; text: modelData.name; font.pixelSize: 12 }
             }
         }
 

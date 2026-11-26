@@ -17,10 +17,18 @@ Rectangle {
     readonly property var active: projects.filter(function (p) { return !p.idle }).sort(function (a, b) { return b.cost - a.cost || b.sessions - a.sessions })
     readonly property var idle: projects.filter(function (p) { return p.idle }).sort(function (a, b) { return b.cost - a.cost })
     readonly property string current: snap && snap.project ? snap.project : ""
-    readonly property int total: projects.reduce(function (a, p) { return a + p.sessions }, 0)
+    // A session that moved between folders counts once per project, so the
+    // unfiltered snapshot's own total is the true "All projects" figure.
+    property int total: 0
+    onSnapChanged: if (snap && !snap.project) total = snap.sessions_total
+                   else if (snap && !total) total = projects.reduce(function (a, p) { return a + p.sessions }, 0)
     readonly property var status: snap ? snap.status : null
-    property bool showIdle: false
-    readonly property var listed: active.concat(showIdle ? idle : idle.filter(function (p) { return p.name === side.current }))
+    // A busy month can touch a hundred folders; list the biggest and fold the rest.
+    readonly property int topN: 8
+    property bool showAll: false
+    readonly property var rest: active.slice(topN).concat(idle)
+    readonly property var listed: showAll ? active.concat(idle)
+        : active.slice(0, topN).concat(rest.filter(function (p) { return p.name === side.current }))
 
     Rectangle { anchors.right: parent.right; width: 1; height: parent.height; color: Ui.p.line }
 
@@ -97,11 +105,11 @@ Rectangle {
         }
         footer: T.AbstractButton {
             id: more
-            visible: side.idle.length > 0
+            visible: side.rest.length > 0
             width: list.width; height: visible ? 34 : 0
             hoverEnabled: true
-            text: side.showIdle ? "Hide idle projects" : "Show " + side.idle.length + " idle"
-            onClicked: side.showIdle = !side.showIdle
+            text: side.showAll ? "Show fewer" : "Show " + Ui.int(side.rest.length) + " more"
+            onClicked: side.showAll = !side.showAll
             contentItem: Txt { leftPadding: 12; text: more.text; font.pixelSize: 12; color: more.hovered ? Ui.p.text : Ui.p.text_muted }
             background: Rectangle { radius: 10; color: more.hovered ? Ui.alpha(Ui.p.text, 0.05) : "transparent"; Focus { show: more.visualFocus } }
         }

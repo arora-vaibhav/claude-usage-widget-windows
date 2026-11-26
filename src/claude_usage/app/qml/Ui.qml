@@ -24,7 +24,8 @@ QtObject {
     readonly property var wd: ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
     readonly property var mon: ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
-    function seriesColor(i) { return i >= 0 && i < s.length ? s[i] : other }
+    // -1 is "Other", -2 the days that only have the old daily totals.
+    function seriesColor(i) { return i >= 0 && i < s.length ? s[i] : i === -2 ? mix(other, p.surface || "#888", 0.45) : other }
     function alpha(c, a) { var q = Qt.darker(c, 1.0); return Qt.rgba(q.r, q.g, q.b, a) }
     function mix(a, b, t) { var x = Qt.darker(a, 1.0), y = Qt.darker(b, 1.0); return Qt.rgba(x.r + (y.r - x.r) * t, x.g + (y.g - x.g) * t, x.b + (y.b - x.b) * t, 1) }
 
@@ -71,6 +72,8 @@ QtObject {
         return kind === "usd" ? money(v) : kind === "tokens" ? tok(v) : kind === "duration" ? dur(v)
              : kind === "pct" ? pct(v, 1) : int(v)
     }
+    // "in the last 7 days", or "over all time" for the all range.
+    function inRange(r) { return !r ? "in this range" : r.key === "all" ? "over all time" : "in the " + r.label }
     function plural(n, w) { return int(n) + " " + w + (n === 1 ? "" : "s") }
 
     // ---- time

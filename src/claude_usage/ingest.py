@@ -6,6 +6,8 @@ partial ``output_tokens``, so each usage field keeps the maximum seen across
 the message's lines (in any file) and the timestamp keeps the earliest; the
 local day and hour follow that timestamp. Subagent and workflow transcripts
 (``<session>/subagents/**``) are included and belong to their parent session.
+A session's calls and turns all count toward the project of its first
+working directory (records follow the shell into subfolders).
 
 Turns are human prompts in main transcripts. Agent time per turn is the
 ``system/turn_duration`` record when Claude Code wrote one, else the span from
@@ -136,6 +138,8 @@ class Ingestor:
         self.clock = clock
         self._files = {p: (s, m, o) for p, s, m, o in conn.execute("SELECT path, size, mtime, offset FROM files")}
         self._names = {}
+        self._cwd_names = {}
+        self._sess_proj = {}
         for (name,) in conn.execute("SELECT DISTINCT project FROM calls WHERE project IS NOT NULL"):
             self._names.setdefault(name.lower(), name)
         self._dirs = {}  # dir -> mtime_ns as of the last look
@@ -154,21 +158,26 @@ class Ingestor:
         found = self._walk()
         todo = sorted(p for p, st in found.items() if self._changed(p, st))
         calls = done = 0
+        cancelled = False
         if progress:
             progress(0, len(todo))
         for rel in todo:
             if cancel and cancel():
+                cancelled = True
                 break
             calls += self._read(rel, *found[rel], cancel=cancel)
             done += 1
             if progress:
                 progress(done, len(todo))
+            if self._files[rel][0] != found[rel][0] and cancel and cancel():
+                cancelled = True  # stopped inside this file
+                break
         self._last_full = self.clock()
         self._pick_hot(found)
         if store.rollup(self.conn):
             store.update_coverage(self.conn)
         return {"files": len(found), "read": done, "todo": len(todo), "calls": calls,
-                "cancelled": done < len(todo), "ms": round((time.perf_counter() - t0) * 1000, 1), "full": True}
+                "cancelled": cancelled, "ms": round((time.perf_counter() - t0) * 1000, 1), "full": True}
 
     def tail(self) -> dict:
         """Read what changed since the last call; cheap when nothing did."""
@@ -203,22 +212,27 @@ class Ingestor:
     def _walk(self) -> dict:
         found = {}
         self._dirs.clear()
+        cut = len(self.root) + 1
+        try:
+            self._dirs[self.root] = os.stat(self.root).st_mtime_ns
+        except OSError:
+            return found
         stack = [self.root]
         while stack:
-            d = stack.pop()
             try:
-                self._dirs[d] = os.stat(d).st_mtime_ns
-                it = os.scandir(d)
+                it = os.scandir(stack.pop())
             except OSError:
                 continue
             with it:
                 for e in it:
                     try:
+                        # On Windows the scandir entry carries size and mtime, so these are not extra syscalls.
                         if e.is_dir(follow_symlinks=False):
+                            self._dirs[e.path] = e.stat(follow_symlinks=False).st_mtime_ns
                             stack.append(e.path)
                         elif e.name.endswith(".jsonl"):
                             st = e.stat(follow_symlinks=False)
-                            found[os.path.relpath(e.path, self.root)] = (st.st_size, st.st_mtime_ns)
+                            found[e.path[cut:]] = (st.st_size, st.st_mtime_ns)
                     except OSError:
                         continue
         return found
@@ -227,12 +241,12 @@ class Ingestor:
         cutoff = (self.clock() - HOT_SECONDS) * 1e9
         self._hot_files = {p for p, (_s, m) in found.items() if m >= cutoff}
         # Live sessions add subagent files under <slug>/<session>/ at any time.
-        live = {os.path.join(self.root, p[:-6]) for p in self._hot_files if p.count(os.sep) == 1}
+        live = {p[:-6] for p in self._hot_files if p.count(os.sep) == 1}
+        cut = len(self.root) + 1
         self._hot_dirs = set()
         for d, m in self._dirs.items():
-            rel = os.path.relpath(d, self.root)
-            if rel == "." or rel.count(os.sep) == 0 or m >= cutoff or any(
-                    d == s or d.startswith(s + os.sep) for s in live):
+            parts = d[cut:].split(os.sep, 2)
+            if len(parts) == 1 or m >= cutoff or os.sep.join(parts[:2]) in live:
                 self._hot_dirs.add(d)
 
     def _scan_dir(self, d: str) -> None:
@@ -250,7 +264,7 @@ class Ingestor:
                             self._hot_dirs.add(e.path)
                             self._scan_dir(e.path)
                     elif e.name.endswith(".jsonl"):
-                        self._hot_files.add(os.path.relpath(e.path, self.root))
+                        self._hot_files.add(e.path[len(self.root) + 1:])
                 except OSError:
                     continue
 
@@ -273,41 +287,55 @@ class Ingestor:
             fh = open(os.path.join(self.root, rel), "rb")
         except OSError:
             return 0
-        n_lines = 0
+        done = True  # False when we stop before the end, so the next pass resumes at pos
         with fh:
             fh.seek(offset)
             pos = offset
-            while True:
-                raw = fh.readline(MAX_LINE + 1)
-                if not raw:
-                    break
-                if raw[-1:] != b"\n":
-                    if len(raw) <= MAX_LINE:
-                        break  # partial last line: wait for the rest
-                    end = pos + len(raw)
-                    while raw and raw[-1:] != b"\n":
-                        raw = fh.readline(MAX_LINE)
-                        end += len(raw)
+            try:
+                while True:
+                    raw = fh.readline(MAX_LINE + 1)
                     if not raw:
-                        break  # an over-long line still being written
-                    pos = end
-                    continue
-                pos += len(raw)
-                ctx.line(raw)
-                n_lines += 1
-                if len(ctx.calls) >= _BATCH:
-                    ctx.flush(rel, size, mtime, pos, final=False)
-                    if cancel and cancel():
                         break
-        ctx.flush(rel, size, mtime, pos, final=True)
-        self._files[rel] = (size, mtime, pos)
+                    if raw[-1:] != b"\n":
+                        if len(raw) <= MAX_LINE:
+                            break  # partial last line: wait for the rest
+                        end = pos + len(raw)
+                        while raw and raw[-1:] != b"\n":
+                            raw = fh.readline(MAX_LINE)
+                            end += len(raw)
+                        if not raw:
+                            break  # an over-long line still being written
+                        pos = end
+                        continue
+                    ctx.line(raw)
+                    pos += len(raw)
+                    if len(ctx.calls) >= _BATCH:
+                        ctx.flush(rel, pos, mtime, pos, final=False)
+                        if cancel and cancel():
+                            done = False
+                            break
+            except MemoryError:
+                # Low system memory: keep what was read and retry from pos next pass.
+                done = False
+        seen = size if done else pos
+        ctx.flush(rel, seen, mtime, pos, final=True)
+        self._files[rel] = (seen, mtime, pos)
         return ctx.n_calls
 
     def _project(self, cwd: Optional[str]) -> Optional[str]:
-        name = project_name(cwd)
+        name = self._cwd_names.get(cwd)
+        if name is None and cwd:
+            name = project_name(cwd)
+            name = self._cwd_names[cwd] = self._names.setdefault(name.lower(), name)
+        return name
+
+    def _session_project(self, sid: str) -> Optional[str]:
+        name = self._sess_proj.get(sid)
         if name is None:
-            return None
-        return self._names.setdefault(name.lower(), name)
+            row = self.conn.execute("SELECT project FROM sessions WHERE session_id=?", (sid,)).fetchone()
+            if row and row[0]:
+                name = self._sess_proj[sid] = row[0]
+        return name
 
 
 class _FileCtx:
@@ -323,6 +351,7 @@ class _FileCtx:
         self.n_calls = 0
         self.seen = set()
         self.turn = None
+        self.project = ing._session_project(file_sid) if file_sid else None
         if not is_sub and file_sid:
             row = ing.conn.execute(
                 "SELECT uuid, ts_ms, day, hour, project, duration_ms, src, model FROM turns WHERE session_id=? "
@@ -333,17 +362,28 @@ class _FileCtx:
                              "sid": file_sid, "day": row[2], "hour": row[3], "project": row[4]}
         self.turn_rows = []
 
+    def _proj(self, cwd: Optional[str]) -> Optional[str]:
+        # Records follow the shell into subfolders; a session (with its subagents) belongs where it started.
+        if self.project is None and cwd:
+            self.project = self.ing._project(cwd)
+            if self.file_sid:
+                self.ing._sess_proj[self.file_sid] = self.project
+        return self.project
+
     def line(self, raw: bytes) -> None:
-        if b'"type":"assistant"' in raw and b'"usage"' in raw:
-            self._assistant(raw)
-        elif self.is_sub:
-            return
-        elif b'"type":"user"' in raw and b'"tool_use_id"' not in raw:
-            self._user(raw)
-        elif b'"turn_duration"' in raw:
-            self._turn_duration(raw)
-        elif raw.startswith((b'{"type":"custom-title"', b'{"type":"ai-title"')):
-            self._title(raw)
+        try:
+            if b'"type":"assistant"' in raw and b'"usage"' in raw:
+                self._assistant(raw)
+            elif self.is_sub:
+                return
+            elif b'"type":"user"' in raw and b'"tool_use_id"' not in raw:
+                self._user(raw)
+            elif b'"turn_duration"' in raw:
+                self._turn_duration(raw)
+            elif raw.startswith((b'{"type":"custom-title"', b'{"type":"ai-title"')):
+                self._title(raw)
+        except (AttributeError, TypeError, ValueError):
+            pass  # a record of an unexpected shape must not stall the file
 
     def _assistant(self, raw: bytes) -> None:
         try:
@@ -362,15 +402,16 @@ class _FileCtx:
         day, hour = _local(ts)
         sid = self.file_sid if self.is_sub else (e.get("sessionId") or self.file_sid)
         cwd = e.get("cwd")
-        project = self.ing._project(cwd)
+        project = self._proj(cwd)
         cc = int(u.get("cache_creation_input_tokens") or 0)
         br = u.get("cache_creation")
         w1 = int(br.get("ephemeral_1h_input_tokens") or 0) if isinstance(br, dict) else 0
         w5 = max(cc - w1, 0)  # no breakdown means the default 5-minute TTL
         web = int((u.get("server_tool_use") or {}).get("web_search_requests") or 0)
+        # Thinking is part of output_tokens; an interrupted stream can leave output at 0 with thinking counted.
+        out = max(int(u.get("output_tokens") or 0), int((u.get("output_tokens_details") or {}).get("thinking_tokens") or 0))
         self.calls.append((mid, ts, day, hour, sid, e.get("agentId"), int(self.is_sub or bool(e.get("isSidechain"))),
-                           project, cwd, model,
-                           u.get("speed"), int(u.get("input_tokens") or 0), int(u.get("output_tokens") or 0),
+                           project, cwd, model, u.get("speed"), int(u.get("input_tokens") or 0), out,
                            int(u.get("cache_read_input_tokens") or 0), w5, w1, web))
         main = not self.is_sub and not e.get("isSidechain")
         if sid and sid not in self.ing._known_sessions and sid not in self.seen:
@@ -397,7 +438,7 @@ class _FileCtx:
         day, hour = _local(ts)
         self.turn = {"uuid": e["uuid"], "start": ts, "last": ts, "rec": False, "dur": 0, "dirty": True, "model": None,
                      "sid": e.get("sessionId") or self.file_sid, "day": day, "hour": hour,
-                     "project": self.ing._project(e.get("cwd"))}
+                     "project": self._proj(e.get("cwd"))}
 
     def _turn_duration(self, raw: bytes) -> None:
         try:
@@ -417,7 +458,7 @@ class _FileCtx:
             day, hour = _local(ts - dur)
             self.turn = {"uuid": e["uuid"], "start": ts - dur, "last": ts, "rec": True, "dur": dur, "dirty": True,
                          "model": None, "sid": e.get("sessionId") or self.file_sid, "day": day, "hour": hour,
-                         "project": self.ing._project(e.get("cwd"))}
+                         "project": self._proj(e.get("cwd"))}
             return
         t["rec"], t["dur"], t["dirty"] = True, dur, True
 

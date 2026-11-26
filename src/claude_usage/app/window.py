@@ -155,15 +155,19 @@ class Backend(QObject):
 
     # -- Python side ------------------------------------------------------
     def reload(self) -> None:
-        """Ask the provider for the current range and project and show it."""
+        """Ask the provider for the current range and project and show it.
+
+        A provider that returns None is building in the background; the page
+        stays dimmed until the controller calls :meth:`update_snapshot`.
+        """
         try:
             snap = self._provider(self._range, self._project or None)
         except Exception:  # keep the last good frame on screen
             log.exception("snapshot provider failed")
-            snap = None
+            self._set_busy(False)
+            return
         if snap is not None:
             self.update_snapshot(snap)
-        self._set_busy(False)
 
     def update_snapshot(self, snap: dict) -> None:
         # The header controls show what the data actually covers.
@@ -171,6 +175,7 @@ class Backend(QObject):
         self._project = snap.get("project") or ""
         self._json = json.dumps(snap, separators=(",", ":"))
         self.snapshotChanged.emit()
+        self._set_busy(False)
 
     def set_dark(self, dark: bool) -> None:
         if dark != self._dark:

@@ -2,9 +2,15 @@
 
 Rates are USD per million tokens: input, output, cache read, 5-minute cache
 write, 1-hour cache write. Source: Anthropic's published first-party API
-prices (claude-api skill model table, cached 2026-11-03, checked against the
-model notes for cache-read and cache-write rates). Cost is API-equivalent: what
-the same tokens would cost on the API, not a subscription bill.
+prices (claude-api skill model table, cached 2026-11-03, with its model notes
+for cache reads, fast mode and the Haiku 5.5 long-prompt card). Writes are
+1.25x input for the 5-minute TTL and 2x for 1 hour. Cost is API-equivalent:
+what the same tokens would cost on the API, not a subscription bill.
+
+Checked against Claude Code's own per-session cost records: its costUSD
+equals these rates times its token counts once cache writes it does not split
+by TTL are priced at the 1-hour rate (nearly all Opus 5.5 and Sonnet 5.5
+records within 2%).
 
 Model ids are normalised before lookup ("[1m]" and date suffixes dropped). An
 id that is not in the table but names a known family is priced at that

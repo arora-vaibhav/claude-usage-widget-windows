@@ -83,8 +83,9 @@ Page {
     }
     Card {
         visible: page.signedOut
-        width: page.cw; height: 132
+        width: page.cw; height: 112
         Row {
+            anchors.verticalCenter: parent.verticalCenter
             spacing: 20
             Rectangle {
                 width: 48; height: 48; radius: 24; color: Ui.p.warn_bg
@@ -152,7 +153,7 @@ Page {
         Column {
             anchors.centerIn: parent
             spacing: 6
-            Txt { anchors.horizontalCenter: parent.horizontalCenter; text: "No activity in the " + (page.range ? page.range.label : "range"); font.pixelSize: 15; font.weight: 600 }
+            Txt { anchors.horizontalCenter: parent.horizontalCenter; text: "No activity " + Ui.inRange(page.range); font.pixelSize: 15; font.weight: 600 }
             Txt {
                 anchors.horizontalCenter: parent.horizontalCenter
                 color: Ui.p.text_muted
@@ -177,7 +178,7 @@ Page {
             model: page.snap ? page.snap.kpis : []
             KpiCard {
                 width: (page.cw - Ui.gap * (page.snap.kpis.length - 1)) / page.snap.kpis.length
-                height: 172
+                height: 180
                 k: modelData
                 hue: kpis.hues[modelData.key] || Ui.p.accent
                 dropLast: page.snap.timeline.partial_last && modelData.series.length === page.snap.timeline.starts.length
@@ -227,7 +228,7 @@ Page {
                 Rectangle { width: parent.width; height: 1; color: Ui.p.line; y: -1 }
                 Txt {
                     height: 40
-                    text: page.snap ? "Showing " + sessCard.rows.length + " of " + Ui.int(page.snap.sessions_total) + ". Values cover the " + page.snap.range.label + "." : ""
+                    text: page.snap ? "Showing " + sessCard.rows.length + " of " + Ui.plural(page.snap.sessions_total, "session") + " " + Ui.inRange(page.snap.range) + "." : ""
                     font.pixelSize: 12; color: Ui.p.text_faint
                 }
                 Btn { anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; text: "All sessions"; glyph: ""; onClicked: page.openSessions() }

@@ -69,9 +69,7 @@ Item {
                     contentItem: Item {
                         Txt {
                             id: hl
-                            anchors.right: parent.right
-                            horizontalAlignment: modelData[0] === "project" ? Text.AlignLeft : Text.AlignRight
-                            x: modelData[0] === "project" ? 12 : 0
+                            x: modelData[0] === "project" ? 12 : parent.width - width
                             height: 34; text: modelData[1]; font.pixelSize: 12
                             color: hb.on || hb.hovered ? Ui.p.text : Ui.p.text_faint
                         }
@@ -98,7 +96,11 @@ Item {
                 readonly property var s: modelData
                 readonly property var started: Ui.date(s.started)
                 HoverHandler { id: hh }
-                Rectangle { anchors.fill: parent; color: hh.hovered ? Ui.alpha(Ui.p.text, Ui.dark ? 0.04 : 0.03) : "transparent" }
+                Rectangle {
+                    anchors.fill: parent
+                    color: hh.hovered ? Ui.alpha(Ui.p.text, Ui.dark ? 0.04 : 0.03) : Ui.alpha(Ui.p.text, 0)
+                    Behavior on color { ColorAnimation { duration: Ui.fast } }
+                }
                 Rectangle { width: parent.width; height: 1; color: Ui.p.line }
                 Column {
                     x: Ui.pad; y: 11
@@ -117,7 +119,8 @@ Item {
                         }
                     }
                     Rectangle {
-                        width: t.maxCost > 0 ? Math.max(2, (t.nameW - 40) * row.s.cost / t.maxCost) : 0
+                        // short, so the bar ranks rows without shouting over the text
+                        width: t.maxCost > 0 ? Math.max(3, Math.min(t.nameW - 40, 160) * row.s.cost / t.maxCost) : 0
                         height: 2; radius: 1
                         color: Ui.seriesColor(row.s.color)
                         opacity: 0.85

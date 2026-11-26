@@ -56,6 +56,14 @@ ApplicationWindow {
         currentIndex: ["overview", "sessions", "settings"].indexOf(root.page)
         opacity: backend.busy ? 0.55 : 1
         Behavior on opacity { NumberAnimation { duration: Ui.fast } }
+        // a page arrives with a short rise and fade, once per switch
+        transform: Translate { id: rise }
+        onCurrentIndexChanged: { fade.target = children[currentIndex]; enter.restart() }
+        ParallelAnimation {
+            id: enter
+            NumberAnimation { target: rise; property: "y"; from: 10; to: 0; duration: 150; easing.type: Easing.OutCubic }
+            NumberAnimation { id: fade; property: "opacity"; from: 0; to: 1; duration: 150; easing.type: Easing.OutCubic }
+        }
 
         OverviewPage { id: overview; snap: root.snap; nowMs: root.nowMs; onOpenSessions: root.page = "sessions" }
         SessionsPage { id: sessions; snap: root.snap }

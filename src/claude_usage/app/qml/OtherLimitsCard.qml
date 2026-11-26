@@ -7,6 +7,12 @@ Card {
     property var limits: null
     readonly property real natural: col.implicitHeight + 24 + 8 + 2 * padding
 
+    // The API sends codes like "out_of_credits"; show them as a short sentence.
+    function reasonText(code) {
+        var known = { out_of_credits: "Off because the account is out of credits.", org_disabled: "Turned off by your organization." }
+        var t = known[code] || String(code).replace(/_/g, " ")
+        return known[code] ? t : t.charAt(0).toUpperCase() + t.slice(1) + "."
+    }
     function meterColor(v) { return v >= 1 ? Ui.p.bad_fill : v >= Ui.critical ? Ui.p.bad_fill : v >= Ui.caution ? Ui.p.warn_fill : Ui.p.accent }
 
     readonly property var rows: {
@@ -29,7 +35,7 @@ Card {
             var used = ex.used ? ex.currency + " " + ex.used.toFixed(2) + " used this month. " : "Nothing used this month. "
             var s = ex.enabled ? (cap ? "Pays past the limit, up to " + cap + " a month. " : "Pays past the limit. ") : (cap ? "Monthly cap " + cap + ". " : "")
             out.push({ label: "Extra usage", pill: ex.enabled ? "On" : "Off", pillKind: ex.enabled ? "ok" : "none",
-                       sub: s + used + "Billed in " + ex.currency + ", separate from the API-equivalent USD in this app." + (ex.reason ? " " + ex.reason : "") })
+                       sub: s + used + "Billed in " + ex.currency + ", separate from the API-equivalent USD in this app." + (ex.reason ? " " + card.reasonText(ex.reason) : "") })
         }
         return out
     }

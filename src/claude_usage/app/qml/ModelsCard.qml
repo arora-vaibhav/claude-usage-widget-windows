@@ -7,7 +7,7 @@ Card {
     property var models: []
     property var split: null
     property var range: null
-    readonly property bool wide: width >= 900
+    readonly property bool wide: width >= 1100
     implicitHeight: 2 * padding + head.height + 16 + (wide ? Math.max(tbl.height, tiles.height) : tbl.height + 20 + tiles.height)
 
     readonly property real total: split ? split.input.cost + split.output.cost + split.cache_read.cost + split.cache_write.cost : 0
@@ -17,7 +17,7 @@ Card {
         id: head
         spacing: 2
         Txt { height: 22; text: "Models and cost"; font.pixelSize: 15; font.weight: 600; display: true }
-        Txt { text: "Share of cost in the " + (card.range ? card.range.label : "range"); font.pixelSize: 12; color: Ui.p.text_muted }
+        Txt { text: "Share of cost " + Ui.inRange(card.range); font.pixelSize: 12; color: Ui.p.text_muted }
     }
 
     Column {
@@ -62,7 +62,7 @@ Card {
                     anchors.right: parent.right
                     height: parent.height
                     Repeater {
-                        model: [Ui.cents(modelData.cost), Ui.share(modelData.share), Ui.tok(modelData.output), Ui.pct(modelData.cache_hit, 1), Ui.int(modelData.calls)]
+                        model: [Ui.cents(modelData.cost), Ui.share(modelData.share || (modelData.cost > 0 ? 1e-6 : 0)), Ui.tok(modelData.output), Ui.pct(modelData.cache_hit, 1), Ui.int(modelData.calls)]
                         Txt {
                             width: card.cols[index][1]; height: 42
                             horizontalAlignment: Text.AlignRight
@@ -91,13 +91,14 @@ Card {
         width: card.wide ? parent.width - tbl.width - 32 : parent.width
         spacing: 12
         Grid {
-            columns: 2
+            id: grid
+            columns: card.wide ? 2 : 4
             columnSpacing: 12; rowSpacing: 12
             width: parent.width
             Repeater {
                 model: card.split ? [["Input", card.split.input], ["Output", card.split.output], ["Cache read", card.split.cache_read], ["Cache write", card.split.cache_write]] : []
                 Rectangle {
-                    width: (tiles.width - 12) / 2; height: 92
+                    width: (tiles.width - 12 * (grid.columns - 1)) / grid.columns; height: 92
                     radius: 12
                     color: Ui.p.track
                     border.color: Ui.p.line
@@ -122,7 +123,7 @@ Card {
         }
         Rectangle {
             visible: !!card.split && card.split.caching_saved > 0
-            width: parent.width; height: 46
+            width: parent.width; height: Math.max(46, saved.implicitHeight + 24)
             radius: 12
             color: Ui.p.ok_bg
             Row {
@@ -130,13 +131,15 @@ Card {
                 spacing: 10
                 Icon { height: parent.height; glyph: ""; font.pixelSize: 13; color: Ui.p.ok }
                 Text {
-                    height: parent.height
-                    verticalAlignment: Text.AlignVCenter
+                    id: saved
+                    width: tiles.width - 32 - 23
+                    anchors.verticalCenter: parent.verticalCenter
+                    wrapMode: Text.WordWrap
                     textFormat: Text.StyledText
                     font.family: Ui.fontUi; font.pixelSize: 13
                     font.features: { "tnum": 1 }
                     color: Ui.p.text
-                    text: card.split ? "Prompt caching saved <b><font color='" + Ui.p.ok + "'>" + Ui.money(card.split.caching_saved) + "</font></b> in the " + (card.range ? card.range.label : "range") + ", at API prices." : ""
+                    text: card.split ? "Prompt caching saved <b><font color='" + Ui.p.ok + "'>" + Ui.money(card.split.caching_saved) + "</font></b> " + Ui.inRange(card.range) + ", at API prices." : ""
                 }
             }
         }

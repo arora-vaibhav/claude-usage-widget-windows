@@ -130,16 +130,16 @@ Card {
         Repeater {
             model: card.act ? card.act.facts : []
             Item {
-                width: rcol.width; height: 40
+                width: rcol.width; height: modelData.detail ? 52 : 40
                 Rectangle { width: parent.width; height: 1; color: Ui.p.line }
-                Txt { height: parent.height; text: modelData.label; color: Ui.p.text_muted; width: parent.width * 0.42 }
-                Row {
-                    anchors.right: parent.right
-                    height: parent.height
-                    spacing: 8
-                    Txt { visible: !!modelData.detail; height: parent.height; text: modelData.detail || ""; font.pixelSize: 12; color: Ui.p.text_faint; width: Math.min(implicitWidth, rcol.width * 0.58 - val.implicitWidth - 8) }
-                    Txt { id: val; height: parent.height; text: modelData.value; font.weight: 600 }
+                Column {
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: parent.width - val.implicitWidth - 16
+                    spacing: 1
+                    Txt { width: parent.width; height: 18; text: modelData.label; color: Ui.p.text_muted }
+                    Txt { visible: !!modelData.detail; width: parent.width; height: 16; text: modelData.detail || ""; font.pixelSize: 12; color: Ui.p.text_faint }
                 }
+                Txt { id: val; anchors.right: parent.right; height: parent.height; text: modelData.value; font.weight: 600 }
             }
         }
         Rectangle { width: parent.width; height: 1; color: Ui.p.line }

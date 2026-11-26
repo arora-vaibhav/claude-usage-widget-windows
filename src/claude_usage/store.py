@@ -35,11 +35,17 @@ MIGRATIONS = [
         project TEXT, duration_ms INTEGER NOT NULL DEFAULT 0, src TEXT, model TEXT);
     CREATE INDEX IF NOT EXISTS turns_day ON turns(day);
     CREATE INDEX IF NOT EXISTS turns_ts ON turns(ts_ms);
+    CREATE INDEX IF NOT EXISTS turns_session ON turns(session_id, ts_ms);
     CREATE TABLE IF NOT EXISTS rollup(
-        day TEXT NOT NULL, session_id TEXT, agent_id TEXT, is_subagent INTEGER, project TEXT, model TEXT,
-        speed TEXT, long INTEGER, calls INTEGER, input INTEGER, output INTEGER, cache_read INTEGER,
+        day TEXT NOT NULL, hour INTEGER NOT NULL, session_id TEXT, agent_id TEXT, is_subagent INTEGER, project TEXT,
+        model TEXT, speed TEXT, long INTEGER, calls INTEGER, input INTEGER, output INTEGER, cache_read INTEGER,
         cache_write_5m INTEGER, cache_write_1h INTEGER, web_search INTEGER, first_ms INTEGER, last_ms INTEGER);
-    CREATE INDEX IF NOT EXISTS rollup_day ON rollup(day);
+    CREATE INDEX IF NOT EXISTS rollup_by_day ON rollup(day);
+    CREATE TABLE IF NOT EXISTS rollup_day(
+        day TEXT NOT NULL, session_id TEXT, is_subagent INTEGER, project TEXT, model TEXT, speed TEXT, long INTEGER,
+        calls INTEGER, input INTEGER, output INTEGER, cache_read INTEGER, cache_write_5m INTEGER,
+        cache_write_1h INTEGER, web_search INTEGER, first_ms INTEGER, last_ms INTEGER);
+    CREATE INDEX IF NOT EXISTS rollup_day_day ON rollup_day(day);
     CREATE TABLE IF NOT EXISTS dirty_days(day TEXT PRIMARY KEY);
     CREATE TABLE IF NOT EXISTS sessions(
         session_id TEXT PRIMARY KEY, title TEXT, title_src TEXT, entrypoint TEXT, cwd TEXT, project TEXT);
@@ -91,22 +97,32 @@ def set_meta(conn: sqlite3.Connection, key: str, value: Any) -> None:
 
 
 def add_sample(conn: sqlite3.Connection, ts: float, weekly: Optional[float], session: Optional[float],
-               payload: Optional[dict] = None) -> None:
-    """Store one utilization sample. ``None`` means the limit was not reported (never 0)."""
+               payload: Optional[dict] = None, min_gap: float = 300) -> bool:
+    """Store one utilization sample; ``None`` means the limit was not reported (never 0).
+
+    A sample that repeats the last one within ``min_gap`` seconds is skipped,
+    so the table grows by a few hundred rows a day, not one per refresh.
+    """
+    last = conn.execute("SELECT ts, weekly, session FROM samples ORDER BY ts DESC LIMIT 1").fetchone()
+    if last and last[1] == weekly and last[2] == session and 0 <= ts - last[0] < min_gap:
+        return False
     with conn:
         conn.execute(
             "INSERT OR REPLACE INTO samples VALUES(?, ?, ?, ?)",
             (float(ts), weekly, session, json.dumps(payload) if payload is not None else None),
         )
+    return True
 
 
 # ---------------------------------------------------------------- rollup
 
 def rollup(conn: sqlite3.Connection) -> int:
-    """Rebuild the per-day rollup for every day the ingest touched. Returns the number of days.
+    """Rebuild the rollups for every day the ingest touched. Returns the number of days.
 
-    The rollup holds token sums per (day, session, agent, project, model,
-    speed, prompt tier) so long ranges read thousands of rows, not every call.
+    ``rollup`` holds token sums per (local day, hour, session, agent, project,
+    model, speed, prompt tier), about a tenth of the calls; ``rollup_day``
+    drops hour and agent for the long ranges. Together with calls for a
+    part-hour edge they give any window exactly.
     """
     from claude_usage.pricing import LONG_PROMPT_TOKENS
 
@@ -116,11 +132,17 @@ def rollup(conn: sqlite3.Connection) -> int:
     with conn:
         conn.execute("DELETE FROM rollup WHERE day IN (SELECT day FROM dirty_days)")
         conn.execute(
-            "INSERT INTO rollup SELECT day, session_id, agent_id, is_subagent, coalesce(project, 'Unknown'), model, "
-            "coalesce(speed, ''), input + cache_read + cache_write_5m + cache_write_1h > ?, COUNT(*), SUM(input), "
-            "SUM(output), SUM(cache_read), SUM(cache_write_5m), SUM(cache_write_1h), SUM(web_search), MIN(ts_ms), "
-            "MAX(ts_ms) FROM calls WHERE day IN (SELECT day FROM dirty_days) GROUP BY 1, 2, 3, 4, 5, 6, 7, 8",
+            "INSERT INTO rollup SELECT day, hour, session_id, agent_id, is_subagent, coalesce(project, 'Unknown'), "
+            "model, coalesce(speed, ''), input + cache_read + cache_write_5m + cache_write_1h > ?, COUNT(*), "
+            "SUM(input), SUM(output), SUM(cache_read), SUM(cache_write_5m), SUM(cache_write_1h), SUM(web_search), "
+            "MIN(ts_ms), MAX(ts_ms) FROM calls WHERE day IN (SELECT day FROM dirty_days) GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9",
             (LONG_PROMPT_TOKENS,))
+        conn.execute("DELETE FROM rollup_day WHERE day IN (SELECT day FROM dirty_days)")
+        conn.execute(
+            "INSERT INTO rollup_day SELECT day, session_id, is_subagent, project, model, speed, long, SUM(calls), "
+            "SUM(input), SUM(output), SUM(cache_read), SUM(cache_write_5m), SUM(cache_write_1h), SUM(web_search), "
+            "MIN(first_ms), MAX(last_ms) FROM rollup WHERE day IN (SELECT day FROM dirty_days) "
+            "GROUP BY 1, 2, 3, 4, 5, 6, 7")
         conn.execute("DELETE FROM dirty_days")
     return n
 
@@ -156,11 +178,20 @@ def _legacy_days(path: str) -> list:
         t = r.get("tokens") if isinstance(r.get("tokens"), dict) else {}
         tokens = sum(int(t.get(k) or 0) for k in ("input", "output", "cache_read", "cache_creation"))
         cost, msgs = float(r.get("cost") or 0), int(r.get("messages") or 0)
-        copied = prev is not None and cost > 0 and cost == prev[0] and msgs == prev[1]
-        pre_dedupe = r["date"] < _PRE_DEDUPE_BEFORE and not r.get("backfilled") and cost > 0
-        out.append((r["date"], cost, tokens, msgs, "corrupt" if copied or pre_dedupe else "legacy"))
+        # The backfill flagged these rows too, so the date alone decides.
+        pre_dedupe = r["date"] < _PRE_DEDUPE_BEFORE and cost > 0
+        bad = pre_dedupe or (cost > 0 and prev is not None and _copied(cost, msgs, *prev))
+        out.append((r["date"], cost, tokens, msgs, "corrupt" if bad else "legacy"))
         prev = (cost, msgs)
     return out
+
+
+def _copied(cost: float, msgs: int, prev_cost: float, prev_msgs: int) -> bool:
+    """The overnight copy bug: yesterday's totals written into today's row, then max()-merged with
+    today's own, so a copy shares the cost or the message count with the row before, or is within 0.5%."""
+    if cost == prev_cost or (msgs and msgs == prev_msgs):
+        return True
+    return prev_cost > 0 and prev_msgs > 0 and abs(cost / prev_cost - 1) < 0.005 and abs(msgs / prev_msgs - 1) < 0.005
 
 
 def _jsonl(path: str):
@@ -191,27 +222,36 @@ def _frac(v: Any) -> Optional[float]:
 def update_coverage(conn: sqlite3.Connection) -> Optional[str]:
     """Recompute meta 'coverage_from': the first day from which the ledger can be trusted.
 
-    It is the first day D such that every usable legacy day on or after D with
-    cost has ledger cost of at least half the legacy cost. Earlier days were
-    partly cleaned up by Claude Code and fall back to legacy rows.
+    A usable legacy day "fails" when the ledger has fewer than 90% of its
+    main-thread messages (the old widget counted exactly those) or less than
+    half its cost. Claude Code's cleanup deletes whole old sessions, so
+    cleaned-up days fail densely; scattered failures are bad legacy rows
+    (overnight copies the detector missed). Coverage starts the day after the
+    latest failing day with at least 3 failures among the last 5 legacy days.
+    Earlier days fall back to legacy rows.
     """
     from claude_usage import pricing
 
-    ledger = {}
-    for day, model, speed, long, i, o, r, w5, w1, ws in conn.execute(
-        "SELECT day, model, speed, long, SUM(input), SUM(output), SUM(cache_read), SUM(cache_write_5m), "
-        "SUM(cache_write_1h), SUM(web_search) FROM rollup GROUP BY day, model, speed, long"
+    ledger, main = {}, {}
+    for day, model, speed, long, sub, n, i, o, r, w5, w1, ws in conn.execute(
+        "SELECT day, model, speed, long, is_subagent, SUM(calls), SUM(input), SUM(output), SUM(cache_read), "
+        "SUM(cache_write_5m), SUM(cache_write_1h), SUM(web_search) FROM rollup_day GROUP BY 1, 2, 3, 4, 5"
     ):
         ledger[day] = ledger.get(day, 0.0) + pricing.group_cost(model, speed, long, i, o, r, w5, w1, ws)
+        if not sub:
+            main[day] = main.get(day, 0) + n
     legacy = conn.execute(
-        "SELECT day, cost FROM legacy_days WHERE quality='legacy' AND cost > 0 ORDER BY day"
+        "SELECT day, cost, messages FROM legacy_days WHERE quality='legacy' AND cost > 0 ORDER BY day"
     ).fetchall()
     cov = None
     if ledger:
         cov = min(ledger)
-        for day, cost in legacy:
-            if ledger.get(day, 0.0) < 0.5 * cost:
-                cov = max(cov, _next_day(day))
+        fails = [ledger.get(d, 0.0) < 0.5 * c or main.get(d, 0) < 0.9 * (m or 0) for d, c, m in legacy]
+        for i in range(len(legacy) - 1, -1, -1):
+            recent = fails[max(0, i - 4):i + 1]
+            if fails[i] and sum(recent) >= min(3, len(recent)):
+                cov = max(cov, _next_day(legacy[i][0]))
+                break
     set_meta(conn, "coverage_from", cov)
     return cov
 

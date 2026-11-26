@@ -246,7 +246,72 @@ def test_project_name(cwd, name):
 
 def test_project_names_do_not_split_by_case(env):
     root, conn = env
-    write(root, "C--work-acme-api/s1.jsonl", [asst("m1", _ts(0), cwd=r"C:\work\Acme-Api"),
-                                              asst("m2", _ts(1), cwd="c:\\work\\acme-api\\")])
+    write(root, "C--work-acme-api/s1.jsonl", [asst("m1", _ts(0), cwd=r"C:\work\Acme-Api")])
+    write(root, "c--work-acme-api/s2.jsonl", [asst("m2", _ts(1), sid="s2", cwd="c:\\work\\acme-api\\")])
     ingest.Ingestor(conn, root).index()
     assert rows(conn, "SELECT DISTINCT project FROM calls") == [("Acme-Api",)]
+
+
+def test_a_session_keeps_the_project_it_started_in(env):
+    root, conn = env
+    # The shell moves into a subfolder mid-session; a subagent works in a worktree of another repo.
+    write(root, "C--work-acme-api/s1.jsonl", [
+        prompt("p1", _ts(0)),
+        asst("m1", _ts(1)),
+        asst("m2", _ts(2), cwd=r"C:\work\acme-api\src\billing"),
+    ])
+    write(root, "C--work-acme-api/s1/subagents/agent-a1.jsonl",
+          [asst("m3", _ts(3), agentId="a1", cwd=r"C:\work\web-console\.claude\worktrees\x")])
+    ingest.Ingestor(conn, root).index()
+    assert rows(conn, "SELECT DISTINCT project FROM calls") == [("acme-api",)]
+    assert rows(conn, "SELECT project FROM turns") == [("acme-api",)]
+    assert rows(conn, "SELECT project FROM sessions") == [("acme-api",)]
+
+
+def test_cancel_inside_a_file_resumes_where_it_stopped(env, monkeypatch):
+    root, conn = env
+    monkeypatch.setattr(ingest, "_BATCH", 2)
+    write(root, "C--work-acme-api/s1.jsonl", [asst(f"m{i}", _ts(i)) for i in range(6)])
+    first = ingest.Ingestor(conn, root).index(cancel=lambda: len(rows(conn)) >= 2)
+    assert first["cancelled"] and len(rows(conn)) == 2
+    ingest.Ingestor(conn, root).index()  # a fresh start (as after a restart) finds the unread rest
+    assert len(rows(conn)) == 6
+
+
+def test_memory_error_keeps_what_was_read_and_retries(env, monkeypatch):
+    root, conn = env
+    write(root, "C--work-acme-api/s1.jsonl", [asst(f"m{i}", _ts(i)) for i in range(4)])
+    real, calls = ingest._FileCtx.line, []
+
+    def flaky(self, raw):
+        calls.append(1)
+        if len(calls) == 3:
+            raise MemoryError
+        real(self, raw)
+
+    monkeypatch.setattr(ingest._FileCtx, "line", flaky)
+    ing = ingest.Ingestor(conn, root)
+    ing.index()
+    assert [r[0] for r in rows(conn)] == ["m0", "m1"]
+    ing.index()
+    assert [r[0] for r in rows(conn)] == ["m0", "m1", "m2", "m3"]
+
+
+def test_odd_shapes_are_skipped_not_fatal(env):
+    root, conn = env
+    odd = json.loads(asst("m1", _ts(0)))
+    odd["message"]["usage"]["output_tokens_details"] = ["not", "a", "dict"]
+    odd["message"]["usage"]["server_tool_use"] = 7
+    write(root, "C--work-acme-api/s1.jsonl", [json.dumps(odd, separators=(",", ":")), asst("m2", _ts(1)),
+                                              '{"type":"custom-title","customTitle":5,"sessionId":"s1"}'])
+    ingest.Ingestor(conn, root).index()
+    assert [r[0] for r in rows(conn)] == ["m2"]
+
+
+def test_interrupted_message_counts_its_thinking_as_output(env):
+    root, conn = env
+    rec = json.loads(asst("m1", _ts(0), out=0))
+    rec["message"]["usage"]["output_tokens_details"] = {"thinking_tokens": 900}
+    write(root, "C--work-acme-api/s1.jsonl", [json.dumps(rec, separators=(",", ":"))])
+    ingest.Ingestor(conn, root).index()
+    assert rows(conn)[0][1] == 900

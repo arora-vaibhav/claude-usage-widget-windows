@@ -47,12 +47,15 @@ Item {
     // Evenly spaced points along a polyline, for dotted and dashed strokes
     // drawn as small marks (crisp on every renderer).
     function sample(poly, step) {
-        var out = []
+        var out = [], carry = 0
         for (var i = 0; i + 1 < poly.length; i++) {
             var a = poly[i], b = poly[i + 1], len = Math.hypot(b[0] - a[0], b[1] - a[1])
-            var carry = out.carry || 0
-            for (var s = carry; s < len; s += step) out.push([a[0] + (b[0] - a[0]) * s / len, a[1] + (b[1] - a[1]) * s / len, Math.atan2(b[1] - a[1], b[0] - a[0])])
-            out.carry = s - len
+            // Bindings can see a half-updated snapshot for one pass (old t0/t1,
+            // new points), which puts a point light years off; skip it.
+            if (!(len < 4 * (width + height))) continue
+            var s = carry
+            for (; s < len; s += step) out.push([a[0] + (b[0] - a[0]) * s / len, a[1] + (b[1] - a[1]) * s / len, Math.atan2(b[1] - a[1], b[0] - a[0])])
+            carry = s - len
         }
         return out
     }

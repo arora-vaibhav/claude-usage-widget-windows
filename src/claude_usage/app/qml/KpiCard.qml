@@ -10,7 +10,7 @@ Card {
     property bool dropLast: false    // the bucket still filling is left out of the trend
     property int smoothing: 0
     padding: 0
-    implicitHeight: 172
+    implicitHeight: 180
 
     readonly property var delta: {
         if (!k || k.delta == null || k.prev == null) return null
@@ -33,6 +33,11 @@ Card {
     readonly property var values: {
         if (!k) return []
         var v = k.series.slice(0, dropLast && k.series.length > 2 ? k.series.length - 1 : k.series.length)
+        if (k.format === "pct") {
+            // a rate of 0 means no calls in that bucket, not a 0% rate: hold the last known value
+            var seen = v.filter(function (x) { return x > 0 }), last = seen.length ? seen[0] : 0
+            v = v.map(function (x) { if (x > 0) last = x; return last })
+        }
         return Ui.smooth(v, smoothing)
     }
 
@@ -100,7 +105,7 @@ Card {
 
     Item {
         id: spark
-        width: card.width; height: 62
+        width: card.width; height: 70
         y: card.height - height
         readonly property var pts: {
             var v = card.values, n = v.length

@@ -703,9 +703,9 @@ def fetch_rate_limits(claude_dir: str) -> dict[str, Any]:
 
     Two credential shapes are supported:
 
-    * **Subscription OAuth** (``.credentials.json``) — has the ``user:profile``
+    * **Subscription OAuth** (``.credentials.json``): has the ``user:profile``
       scope, so we use Claude Code's ``/api/oauth/usage`` endpoint directly.
-    * **Long-lived token** (``claude setup-token``) — lacks ``user:profile`` and
+    * **Long-lived token** (``claude setup-token``): lacks ``user:profile`` and
       403s on that endpoint, so we read the identical 5h/7d plan utilization
       from the ``/v1/messages`` unified rate-limit headers instead.
     """
@@ -726,7 +726,7 @@ def fetch_rate_limits(claude_dir: str) -> dict[str, Any]:
                 return res
         return _fetch_unified_headers_via_messages(token)
 
-    # Primary path — the OAuth usage endpoint Claude Code itself uses.
+    # Primary path: the OAuth usage endpoint Claude Code itself uses.
     primary = _fetch_oauth_usage(token)
     if "error" not in primary:
         return primary
