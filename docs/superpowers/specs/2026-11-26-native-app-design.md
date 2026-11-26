@@ -100,9 +100,10 @@ Cost is never stored. It is computed from tokens and the price table when read, 
 - Walk `~/.claude/projects/**/*.jsonl` recursively (main sessions and `subagents/**`, including workflow runs).
 - Per file, read from the stored offset to the last complete newline. If the file shrank or its mtime went back, re-read from 0 (dedupe makes that safe). Skip any line over 8 MB after advancing past it.
 - Cheap byte prefilter before `json.loads`: only lines that can be an assistant message with usage, a `turn_duration` record, or a title record.
-- Dedupe on `message.id` with `INSERT OR IGNORE`, keeping the earliest timestamp. Skip `<synthetic>` models.
+- One row per `message.id`. Claude Code writes a message on several lines while it streams, and early lines can carry a partial `output_tokens` (measured: keeping the first line drops 10.8% of output tokens). So upsert: every usage field keeps the maximum seen across the message's lines, the timestamp keeps the earliest. Skip `<synthetic>` models.
+- Claude Code's own `cost-state` records (`modelUsage.<model>.costUSD` per session) are an independent check on pricing, not a source of truth. Published per-token prices are the truth for "API-equivalent"; any systematic gap is explained and shown in the UI's cost note.
 - `day` and `hour` come from the call's own timestamp converted to local time. Never from `now()`.
-- Project = basename of the record's `cwd`, with `\.claude\worktrees\<x>` folded to the repo folder. Fallback: the decoded project directory name.
+- Project = basename of the record's `cwd`, with `\.claude\worktrees\<x>` and `.worktrees\<x>` folded to the repo folder, the home folder shown as "Home", and anything under the system temp folder grouped as "Temporary folders" (never a raw path). Fallback: the decoded project directory name.
 - `is_subagent` = the file lives under a `subagents` directory. Its session is the parent session id.
 - The first run indexes everything in the worker and reports `{done, total}` files; the UI shows progress. Target: the full 40 GB in a few minutes, with steady-state ticks under 50 ms when nothing changed.
 
