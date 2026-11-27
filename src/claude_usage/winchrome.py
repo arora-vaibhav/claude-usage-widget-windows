@@ -32,5 +32,8 @@ def apply_win11_chrome(widget, dark: bool = True, corner: int = 2) -> None:
             dwm.DwmSetWindowAttribute(hwnd, 19, ctypes.byref(val), ctypes.sizeof(val))
         pref = ctypes.c_int(corner)  # 33 = DWMWA_WINDOW_CORNER_PREFERENCE
         dwm.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(pref), ctypes.sizeof(pref))
+        # A shown window keeps its old title bar until the frame is redrawn (seen on a light/dark switch).
+        # SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
+        ctypes.windll.user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020)
     except Exception:
         pass

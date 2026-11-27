@@ -15,6 +15,7 @@ import pytest
 
 pytest.importorskip("PySide6")
 
+from PySide6.QtCore import QRect  # noqa: E402
 from PySide6.QtGui import QGuiApplication  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
@@ -475,3 +476,17 @@ def test_a_second_launch_opens_the_running_app(make, monkeypatch):
     assert widget.ask_running_instance()
     assert pump_until(lambda: opened, timeout=5)
     assert opened == [None]
+
+
+def test_the_overlay_menu_never_opens_over_the_overlay(make, monkeypatch):
+    # the overlay is top-most, so a menu drawn over it was hidden under the card (seen on a real screen)
+    ctl = make()
+    shown = []
+    monkeypatch.setattr(ctl.menu, "popup", lambda p: shown.append(QRect(p, ctl.menu.sizeHint())))
+    avail = QGuiApplication.primaryScreen().availableGeometry()
+    for style in ("card", "pill"):
+        ctl.osd.set_style(style)
+        for y in (avail.bottom() - ctl.osd.height(), avail.top()):  # parked at the bottom, then at the top
+            ctl.osd.move(avail.left() + 20, y)
+            ctl._popup_menu(ctl.osd.frameGeometry().center())
+            assert not shown[-1].intersects(ctl.osd.frameGeometry()), (style, y, shown[-1], ctl.osd.frameGeometry())

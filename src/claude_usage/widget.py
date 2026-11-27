@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Any, Callable, Optional
 
-from PySide6.QtCore import QObject, QRect, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, QPoint, QRect, Qt, QTimer, Signal
 from PySide6.QtGui import QGuiApplication, QIcon
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QToolTip
@@ -192,7 +192,7 @@ class Controller(QObject):
             else:
                 log.info("saved OSD position (%s, %s) is off-screen; using the default", x, y)
         self.osd.clicked.connect(lambda: self.open_app())
-        self.osd.right_clicked.connect(lambda pos: self.menu.popup(pos))
+        self.osd.right_clicked.connect(self._popup_menu)
         self.osd.moved.connect(self._on_osd_moved)
         self.osd.style_toggled.connect(self._on_style_toggled)
 
@@ -570,6 +570,14 @@ class Controller(QObject):
         menu.addAction("Quit").triggered.connect(self.quit)
         menu.aboutToShow.connect(self._on_menu_show)
         return menu
+
+    def _popup_menu(self, pos: QPoint) -> None:
+        # Open above (or below) the overlay, never over it: the overlay is top-most and would cover the menu.
+        self._on_menu_show()
+        r, h = self.osd.frameGeometry(), self.menu.sizeHint().height()
+        screen = self.osd.screen() or QGuiApplication.primaryScreen()
+        y = r.top() - h if r.top() - h >= screen.availableGeometry().top() else r.bottom() + 1
+        self.menu.popup(QPoint(pos.x(), y))
 
     def _on_menu_show(self) -> None:
         self._act_head.setText("  ·  ".join(_summary(self._now, self._shown, self._indexing)))
