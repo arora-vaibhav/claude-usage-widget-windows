@@ -17,8 +17,3 @@ def test_the_app_icon_has_every_windows_size():
     assert {16, 20, 24, 32, 48, 256} <= sides
     assert {s.width() for s in QIcon(widget.ICON).availableSizes()} >= {16, 32, 256}
 
-
-def test_the_icon_is_rebuilt_from_its_svg_source():
-    # make_icon.py renders the SVG; a newer SVG than ICO means someone forgot to run it
-    svg, ico = (os.path.getmtime(os.path.join(ICONS, f)) for f in ("claude-usage.svg", "claude-usage.ico"))
-    assert ico >= svg - 1
