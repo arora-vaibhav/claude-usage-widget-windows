@@ -162,7 +162,9 @@ def test_background_provider_keeps_the_page_dimmed_until_data_arrives(h):
         h.win.backend.setRange("90d")
         pump(80)
         assert pending == [("90d", None)] and h.win.backend.busy
-        h.win.update_snapshot(h.snap)
+        h.win.update_snapshot(h.snap)  # a build for the old range that was already running: not shown
+        assert h.win.backend.busy and h.win.backend.rangeKey == "90d"
+        h.win.update_snapshot(dict(h.snap, range=dict(h.snap["range"], key="90d")))
         assert not h.win.backend.busy
     finally:
         h.win.backend._provider = real
@@ -347,6 +349,30 @@ def test_past_weeks_quote_the_weekly_card_for_this_week(h):
         card = find(h.win, "PastWeeksCard")[0]
         labels = [js(c.property("labels")) for c in find_in(card) if c.property("labels") is not None][0]
         assert [x["text"].replace("Now ", "") for x in labels if x["now"]] == ["42%"]
+    finally:
+        h.win.update_snapshot(h.snap)
+        pump(60)
+
+
+def test_this_weeks_bar_stays_inside_the_past_weeks_chart(h):
+    # the scale once came from ended weeks only, so a long week at the limit
+    # ran off the top of the card and over the cards above it
+    snap = copy.deepcopy(h.snap)
+    weeks = snap["limits"]["past_weeks"]
+    longest = max(w["hours_at_limit"] for w in weeks[:-1])
+    weeks[-1].update(current=True, peak=1.0, hours_at_limit=longest * 3 + 40)
+    snap["limits"]["weekly"]["pct"] = 1.0
+    h.win.update_snapshot(snap)
+    pump(60)
+    try:
+        card = find(h.win, "PastWeeksCard")[0]
+        chart = [c for c in find_in(card) if c.property("yTop") is not None][0]
+        bars = [b for b in find_in(chart) if b.property("wk") is not None]
+        assert len(bars) == len(weeks)
+        assert min(b.y() for b in bars) >= chart.property("yTop") - 0.5, [b.y() for b in bars]
+        assert chart.property("maxH") >= weeks[-1]["hours_at_limit"]
+        labels = js(chart.property("labels"))
+        assert [x for x in labels if x["now"]] and min(x["y"] for x in labels) >= 0
     finally:
         h.win.update_snapshot(h.snap)
         pump(60)
@@ -761,11 +787,87 @@ def test_the_cost_note_folds_behind_about_this_data(h):
 def test_a_5_hour_limit_close_to_binding_leads_the_plan_limits(h):
     try:
         texts = show_state(h, "5h_critical")
-        assert any(t.startswith("5-hour limit at 93%, resets ") for t in texts), texts
+        assert any(t.startswith("5-hour 93%, resets ") for t in texts), texts
         rows = js(find(h.win, "OtherLimitsCard")[0].property("rows"))
         assert rows[0]["sub"].startswith("At this pace you reach 100% at "), rows[0]
     finally:
         h.win.update_snapshot(h.snap)
+        pump(30)
+
+
+def test_a_5_hour_limit_that_runs_out_before_its_reset_says_when(h):
+    # as the menu and tray do: the time to the limit, not the reset, when the limit comes first
+    from datetime import datetime, timedelta
+    now = datetime.now().astimezone()
+    # 45 s over the minute: the pill floors, as the menu does (rounding said 2h 11m)
+    eta, reset = (now + timedelta(hours=2, minutes=10, seconds=45)).isoformat(), (now + timedelta(hours=4)).isoformat()
+    try:
+        snap = copy.deepcopy(h.snap)
+        STATES["5h_critical"](snap)
+        snap["limits"]["session"]["resets_at"] = reset
+        snap["now"]["session"].update(resets_at=reset, eta=eta)
+        h.win.update_snapshot(snap)
+        h.win.backend.pageRequested.emit("overview")
+        pump(60)
+        texts = visible_texts(h.win)
+        assert "5-hour 93%, limit in ~2h 10m" in texts, texts  # the menu's words
+        snap = copy.deepcopy(snap)
+        snap["now"]["session"]["eta"] = (now + timedelta(hours=3, seconds=30)).isoformat()
+        h.win.update_snapshot(snap)
+        pump(60)
+        assert "5-hour 93%, limit in ~3h" in visible_texts(h.win)  # no "0m", as in the menu
+        soon = (now + timedelta(seconds=40)).isoformat()
+        snap = copy.deepcopy(snap)
+        snap["now"]["session"]["eta"] = soon
+        h.win.update_snapshot(snap)
+        pump(60)
+        assert "5-hour 93%, limit any minute" in visible_texts(h.win)
+        snap = copy.deepcopy(snap)
+        snap["limits"]["session"]["level"] = snap["now"]["session"]["level"] = "limited"
+        h.win.update_snapshot(snap)
+        pump(60)
+        assert any(t.startswith("5-hour limit reached, resets ") for t in visible_texts(h.win))
+    finally:
+        h.win.update_snapshot(h.snap)
+        pump(30)
+
+
+@pytest.mark.parametrize("width", [960, 1024])
+def test_the_usage_scope_line_is_whole_at_narrow_widths(h, width):
+    # it once held 200 px back for a pill that is not there, cutting what the deltas compare against
+    h.win.backend.pageRequested.emit("overview")
+    h.win.window.resize(width, 820)
+    pump(120)
+    try:
+        brow = [e for e in find(h.win, "Eyebrow") if e.property("title") == "USAGE"][0]
+        sub = [t for t in find_in(brow, "TipTxt") if "Changes compare" in t.property("text")][0]
+        assert sub.width() >= sub.implicitWidth(), (sub.width(), sub.implicitWidth())
+    finally:
+        h.win.window.resize(1280, 820)
+        pump(60)
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_every_heatmap_level_stands_out_from_the_card(h, dark):
+    from claude_usage import tokens
+
+    def lum(c):
+        c = c.lstrip("#")
+        ch = [int(c[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+        ch = [v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4 for v in ch]
+        return 0.2126 * ch[0] + 0.7152 * ch[1] + 0.0722 * ch[2]
+
+    h.win.set_dark(dark)
+    pump(30)
+    try:
+        ramp = js(find(h.win, "ActivityCard")[0].property("ramp"))
+        card = tokens.palette(dark)["surface"]
+        ratios = [(max(lum(c), lum(card)) + 0.05) / (min(lum(c), lum(card)) + 0.05) for c in ramp]
+        assert min(ratios) >= 3.0 and ratios == sorted(ratios), list(zip(ramp, ratios))  # WCAG 1.4.11, in ramp order
+        steps = [(max(lum(a), lum(b)) + 0.05) / (min(lum(a), lum(b)) + 0.05) for a, b in zip(ramp, ramp[1:])]
+        assert dark or min(steps) >= 1.4, steps  # light levels apart in lightness too (dark differs by hue)
+    finally:
+        h.win.set_dark(False)
         pump(30)
 
 

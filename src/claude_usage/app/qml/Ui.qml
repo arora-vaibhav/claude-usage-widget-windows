@@ -97,9 +97,10 @@ QtObject {
     function wmd(d) { return wd[d.getDay()] + ", " + md(d) }
     function when(d) { return wmd(d) + ", " + clock(d) }
     function whenShort(d) { return md(d) + ", " + clock(d) }
+    // floors and words like osd._span, so the app, the menu and the OSD read the same minute
     function span(ms) {
-        var m = Math.max(0, Math.round(ms / 60000)), dd = Math.floor(m / 1440), hh = Math.floor(m % 1440 / 60)
-        return dd ? dd + "d " + hh + "h" : hh ? hh + "h " + (m % 60) + "m" : (m % 60) + "m"
+        var m = Math.max(0, Math.floor(ms / 60000)), dd = Math.floor(m / 1440), hh = Math.floor(m % 1440 / 60), mm = m % 60
+        return dd ? dd + "d " + hh + "h" : hh ? hh + "h" + (mm ? " " + mm + "m" : "") : mm ? mm + "m" : "<1m"
     }
     function ago(ms) {
         var s = Math.max(0, Math.round(ms / 1000))

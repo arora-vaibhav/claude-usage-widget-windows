@@ -120,7 +120,8 @@ Card {
                 wrapMode: Text.WordWrap; elide: Text.ElideNone
                 font.pixelSize: 12; color: Ui.p.text_muted
                 lineHeight: 1.1
-                text: "Read from response headers, so Fable and other scoped limits, extra usage and the split by surface are missing. They show while Claude Code's saved sign-in is unexpired."
+                // true for every way here: a sign-in that could not be refreshed, an endpoint error, a 429 pause
+                text: "Read from response headers, so Fable and other scoped limits, extra usage and the split by surface are missing. The app keeps trying the full read. If this lasts, run claude in a terminal\u00a0once."  // no-break space: "once." never sits alone on a line
             }
         }
     }

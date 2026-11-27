@@ -34,7 +34,7 @@ The November 2026 audit measured the problems:
 
 - Pretty charts over wrong numbers.
 - A web page in a window (the owner asked for a proper app).
-- Writing into Claude Code's files or rotating its credentials differently than today.
+- Writing into Claude Code's files or rotating its sign-in differently than v1: with a long-lived token the app never refreshes Claude Code's OAuth token (a rotation could strand the refresh token a running `claude` process holds); it reads with that token only while it is valid. Without a long-lived token it refreshes as v1 did (see Limits).
 - Showing private project names or costs in anything committed to the repo.
 
 ## Constraints
@@ -55,7 +55,7 @@ The November 2026 audit measured the problems:
 
 ## Architecture
 
-One process, as today. The GUI thread owns the OSD (QWidget), tray, menus and the app window (QQmlApplicationEngine, created on first open, hidden on close, and freed after 5 minutes hidden). One worker thread does all collection.
+One process, as today. The GUI thread owns the OSD (QWidget), tray, menus and the app window (QQmlApplicationEngine, created on first open, hidden on close and kept: freeing a hidden window saved only about 10 MB and every reopen kept a little more, and a second engine once failed to import QtQuick again). One worker thread does all collection.
 
 ```
 worker (every refresh_seconds):
@@ -117,7 +117,7 @@ Import `~/.claude/usage-daily.jsonl` read-only into `legacy_days`. A row whose c
 
 ### Limits
 
-`fetch_rate_limits` keeps today's two paths (OAuth `/api/oauth/usage` via curl, unified headers for long-lived tokens) and its error strings, and returns in addition: weekly `{pct, resets_at, severity}`, five-hour (`None` when the payload has `null`), `limits[]` scoped entries joined with `weekly_scoped_shares`, `seven_day_breakdown.rows`, `seven_day_breakdown.window_started_at`, and `extra_usage`. Missing values stay `None`, never `0.0`. Tokens reach curl on stdin, never on its command line.
+`fetch_rate_limits` keeps v1's two paths (OAuth `/api/oauth/usage` via curl, unified headers for long-lived tokens) and its error strings. The OAuth path goes first: Claude Code's access token from `.credentials.json`. With a long-lived token it is used only while unexpired and never refreshed. Without one it is refreshed with v1's code when it expires within 5 minutes (one attempt per 5 minutes; the new access and refresh tokens, and the refresh token's expiry when the reply gives one, are written back compact, as Claude Code writes the file, through a temporary file and `os.replace`, retried for half a second while another process holds the file). The headers path is the fallback, with the long-lived token when there is one: when Claude Code's token is expired (and, without a long-lived token, could not be refreshed), or the endpoint fails. When a long-lived token can stand in, any endpoint failure pauses the endpoint for 5 minutes (one headers call per fetch meanwhile); without one, a 429 is reported and the worker backs off, and other errors try the headers with Claude Code's token. It returns in addition: weekly `{pct, resets_at, severity}`, five-hour (`None` when the payload has `null`), `limits[]` scoped entries joined with `weekly_scoped_shares`, `seven_day_breakdown.rows`, `seven_day_breakdown.window_started_at`, and `extra_usage`. Missing values stay `None`, never `0.0`. Tokens reach curl on stdin, never on its command line.
 
 ### Snapshot
 
@@ -130,7 +130,7 @@ Import `~/.claude/usage-daily.jsonl` read-only into `legacy_days`. A row whose c
 - `sessions`: the sessions with a call in range, ranked by cost and capped at 2,000, with title when Claude Code stored one. `top_sessions` holds the ten costliest of all of them, and `sessions_total` counts them.
 - `activity`: last 84 days, heatmap levels 0-4, streaks and pre-formatted facts.
 - `projects`: every project with its sessions and cost in the range, the same whatever the project filter, coloured as the unfiltered chart draws them; `sessions_total_all` counts the range's sessions over every project for the sidebar's "All projects".
-- `limits.source`: `oauth` or `headers`. The headers fallback (a long-lived token while Claude Code's own sign-in has expired) carries no scoped limits, surfaces or extra usage, and the app says so.
+- `limits.source`: `oauth` or `headers`. The headers fallback (when Claude Code's own sign-in is expired and not refreshed, or the usage endpoint failed) carries no scoped limits, surfaces or extra usage, and the app says so and what to do.
 - `now.error_kind`: `fetch` when the last limits fetch failed (the worker retries it), `store` when the store can't be used (a newer version's), else null.
 - Range keys: `24h`, `7d` (default), `30d`, `90d`, `all`. Project filter applies to everything except `limits`, `now`, `projects` and `sessions_total_all`.
 

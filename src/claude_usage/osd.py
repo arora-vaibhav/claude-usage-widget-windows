@@ -49,9 +49,9 @@ RANK = {"none": 0, "normal": 1, "caution": 2, "critical": 3, "limited": 4}
 NAMES = {"weekly": ("7d", "Weekly"), "session": ("5h", "5-hour")}  # pill tag, and the name the menu, tray and alerts use
 NO_LIMITS = "Claude didn't report a weekly or 5-hour limit."
 # Each pill countdown keeps the room of the widest string its limit shows in normal use
-# (weekly '6d 23h', '23h 59m', forecast '~6d 23h'; 5h '4h 59m', forecast '~4h 59m'), so the
+# (weekly '6d 23h', '23h 59m', forecast '~23h 59m'; 5h '4h 59m', forecast '~4h 59m'), so the
 # pill keeps its width and nothing in it moves as the numbers tick. Forecasts ('~') are semibold.
-SLOTS = {"weekly": ("00h 00m", "~0d 00h"), "session": ("0h 00m", "~0h 00m")}
+SLOTS = {"weekly": ("00h 00m", "~00h 00m"), "session": ("0h 00m", "~0h 00m")}
 
 LOADING = {
     "primary": "weekly", "weekly": None, "session": None, "today_cost": 0.0,
@@ -87,14 +87,14 @@ def _parse(ts: str | None) -> datetime | None:
 
 
 def _span(td: timedelta) -> str:
-    """Compact countdown: '5d 17h', '2h 30m', '45m', '<1m'."""
+    """Compact countdown: '5d 17h', '2h 30m', '13h', '45m', '<1m'. Ui.span in the app matches it."""
     mins = max(0, int(td.total_seconds() // 60))
     d, mins = divmod(mins, 1440)
     h, m = divmod(mins, 60)
     if d:
         return f"{d}d {h}h"
     if h:
-        return f"{h}h {m}m"
+        return f"{h}h {m}m" if m else f"{h}h"
     return f"{m}m" if m else "<1m"
 
 

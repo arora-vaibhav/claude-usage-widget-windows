@@ -34,7 +34,9 @@ The first start reads all your transcripts. On a large history (tens of GB) that
 
 - The only network requests go to Anthropic, for your plan limits with your Claude Code sign-in, and to GitHub, for this repo's latest release. No telemetry.
 - The store holds counts and metadata, not the text of your prompts or replies.
-- In `~/.claude` the app writes its log and lock file. If the limits request keeps failing to sign in, it runs `claude setup-token` (a few times at most) to make a long-lived token in `~/.claude/claude-usage-token`. Without that token it refreshes Claude Code's sign-in in `~/.claude/.credentials.json` when it is about to expire, as Claude Code does.
+- In `~/.claude` the app writes its log and lock file. The plan limits are read with Claude Code's sign-in (`~/.claude/.credentials.json`) whenever its access token is valid, because only that sign-in sees the Fable limit, extra usage and the split by surface.
+- With a long-lived token (`~/.claude/claude-usage-token`, made by `claude setup-token`), the app never refreshes Claude Code's sign-in: a refresh rotates the tokens, which could sign out a `claude` process that still holds the old ones. When Claude Code's token has expired, the app reads the weekly and 5-hour numbers with the long-lived token until Claude Code renews its own sign-in, and says so on the Overview.
+- Without a long-lived token, the app refreshes Claude Code's access token shortly before it expires (at most once every 5 minutes) and writes the new tokens back atomically (a temporary file renamed over it), as earlier versions did. If the limits request keeps failing to sign in, it runs `claude setup-token` (a few times at most) to make a long-lived token.
 
 ## Requirements
 

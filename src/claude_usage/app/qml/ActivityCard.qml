@@ -15,8 +15,11 @@ Card {
     readonly property bool anyPartial: days.slice(0, -1).some(function (d) { return d.partial })
 
     // A warm ramp (plum to amber); busier days gain contrast against the card
-    // in both modes, so dark runs toward light and light toward deep.
-    readonly property var ramp: Ui.dark ? ["#7f2e72", "#c93d50", "#fa7b3c", "#ffd666"] : ["#f0b85a", "#ef8a3f", "#d2443c", "#8a2a6c"]
+    // in both modes, so dark runs toward light and light toward deep. Every
+    // level is 3:1 or more against the card, so a light day still shows. In
+    // light mode each step is 1.4:1 or more from the next, so L1 and L2 stay
+    // apart for deuteranopes; dark keeps them apart by hue (plum, red).
+    readonly property var ramp: Ui.dark ? ["#a3408f", "#c93d50", "#fa7b3c", "#ffd666"] : ["#c7861a", "#c4501f", "#a8324a", "#6e2160"]
     function heat(level) { return level <= 0 ? Ui.p.track : ramp[Math.min(4, level) - 1] }
 
     Column {

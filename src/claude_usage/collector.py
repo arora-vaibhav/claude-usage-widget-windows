@@ -9,8 +9,6 @@ import sys
 import time
 from datetime import datetime
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
 from claude_usage.logging_setup import get_logger
 
@@ -18,6 +16,8 @@ _log = get_logger()
 
 _LAST_REFRESH_ATTEMPT: float = 0.0
 _REFRESH_COOLDOWN_SECS: float = 300.0
+_OAUTH_PAUSE_SECS: float = 300.0  # after the usage endpoint fails, with a long-lived token to fall back on
+_oauth_paused_until: float = 0.0
 
 
 def _refresh_access_token_if_needed(creds_path: str) -> None:
@@ -53,6 +53,9 @@ def _refresh_access_token_if_needed(creds_path: str) -> None:
         _curl = r"C:\Windows\System32\curl.exe"
         if not os.path.isfile(_curl):
             _curl = "curl"
+        _kw: dict[str, Any] = {}
+        if sys.platform == "win32":
+            _kw["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
         _res = _sp.run(
             [
                 _curl, "-s",
@@ -62,8 +65,7 @@ def _refresh_access_token_if_needed(creds_path: str) -> None:
                 "-d", "@-",  # the body on stdin: a command line is readable by other local processes
             ],
             input=f"grant_type=refresh_token&refresh_token={_refresh_tok}&client_id={_CLIENT_ID}",
-            capture_output=True, text=True, timeout=15,
-            creationflags=0x08000000,  # CREATE_NO_WINDOW on Windows
+            capture_output=True, text=True, timeout=15, **_kw,
         )
         if _res.returncode != 0:
             _log.warning("token refresh: curl exited %s: %s",
@@ -85,10 +87,26 @@ def _refresh_access_token_if_needed(creds_path: str) -> None:
         if _new_refresh:
             _creds["claudeAiOauth"]["refreshToken"] = _new_refresh
         _creds["claudeAiOauth"]["expiresAt"] = int((time.time() + _exp_in) * 1000)
+        _rexp = _tok_data.get("refresh_token_expires_in")
+        if _new_refresh and _rexp:  # the old token's expiry would end the new one's life early
+            _creds["claudeAiOauth"]["refreshTokenExpiresAt"] = int((time.time() + int(_rexp)) * 1000)
         _tmp = creds_path + ".tmp"
-        with open(_tmp, "w", encoding="utf-8") as _f:
-            json.dump(_creds, _f, indent=2)
-        os.replace(_tmp, creds_path)
+        try:  # owner-only, on disk before the rename: the old refresh token is already dead
+            with os.fdopen(os.open(_tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as _f:
+                json.dump(_creds, _f, separators=(",", ":"))  # compact, as Claude Code writes it
+                _f.flush()
+                os.fsync(_f.fileno())
+            for _left in range(9, -1, -1):
+                try:
+                    os.replace(_tmp, creds_path)
+                    break
+                except PermissionError:  # a Claude Code process reading the file holds it for a moment
+                    if not _left:
+                        raise  # the rotated token is lost: Claude Code asks for a sign-in at its next refresh
+                    time.sleep(0.05)
+        finally:
+            if os.path.exists(_tmp):
+                os.remove(_tmp)  # a failed write leaves no copy of the tokens behind
         _LAST_REFRESH_ATTEMPT = 0.0  # reset so next check sees valid token and skips
     except Exception as _exc:
         _log.warning("token refresh failed: %s", _exc)
@@ -121,21 +139,15 @@ def _load_long_lived_token(claude_dir: str) -> str | None:
 
 
 def _load_credentials(claude_dir: str) -> str | None:
-    """Load the OAuth access token from the credentials file or macOS Keychain.
+    """Claude Code's OAuth access token, from the credentials file or the macOS Keychain.
 
-    The file-based path (``~/.claude/.credentials.json``) works on both Linux
-    and macOS.  The Keychain fallback handles macOS installs where Claude Code
-    stores credentials in the system keychain rather than (or in addition to)
-    the flat file.
+    The file (``~/.claude/.credentials.json``, every platform) is refreshed first
+    when its token expires within 5 minutes, as v1 did: see
+    :func:`_refresh_access_token_if_needed`. The Keychain fallback handles macOS
+    installs where Claude Code keeps its credentials there instead.
 
-    Returns the raw access-token string, or ``None`` if no valid token is found.
+    Returns the raw access-token string (maybe expired), or ``None`` if there is none.
     """
-    # 0. Prefer a long-lived token (set up once via `claude setup-token`). It
-    #    doesn't rotate, so Claude Code's in-use refreshes can't invalidate it.
-    long_lived = _load_long_lived_token(claude_dir)
-    if long_lived:
-        return long_lived
-
     # 1. Try the credentials file (Linux + macOS)
     creds_path = os.path.join(claude_dir, ".credentials.json")
     if os.path.isfile(creds_path):
@@ -238,10 +250,13 @@ def fetch_rate_limits(claude_dir: str) -> dict[str, Any]:
     Two credential shapes are supported:
 
     * **Subscription OAuth** (``.credentials.json``): has the ``user:profile``
-      scope, so we use Claude Code's ``/api/oauth/usage`` endpoint directly.
+      scope, so we use Claude Code's ``/api/oauth/usage`` endpoint directly. With a
+      long-lived token it is used only while valid and never refreshed; without one
+      it is refreshed shortly before it expires (written back atomically), as in v1.
     * **Long-lived token** (``claude setup-token``): lacks ``user:profile`` and
-      403s on that endpoint, so we read the identical 5h/7d plan utilization
-      from the ``/v1/messages`` unified rate-limit headers instead.
+      403s on that endpoint, so it reads the same 5h/7d plan utilization from
+      the ``/v1/messages`` unified rate-limit headers. It is the fallback when the
+      OAuth path fails; ``source`` says which one answered.
     """
     return dict(_fetch_limits(claude_dir), plan=_plan(claude_dir))
 
@@ -264,67 +279,30 @@ def _plan(claude_dir: str) -> str | None:
 
 
 def _fetch_limits(claude_dir: str) -> dict[str, Any]:
-    token = _load_credentials(claude_dir)
+    global _oauth_paused_until
+    # Claude Code's own token reads /api/oauth/usage, which carries the scoped limits, the surface
+    # breakdown and extra usage. A long-lived token (sk-ant-oat...) 403s there (no user:profile scope)
+    # and only reads the unified headers, so it is the fallback: when Claude Code's token is expired
+    # and could not be refreshed, or the endpoint failed.
+    long_lived = _load_long_lived_token(claude_dir)
+    if long_lived:
+        # A long-lived token exists so nothing here rotates Claude Code's sign-in (v1 order): a rotation
+        # would strand the refresh token a running claude process holds. Its token is read only while valid.
+        oauth = None if time.time() < _oauth_paused_until else _read_oauth_token(claude_dir)
+    else:
+        oauth = _load_credentials(claude_dir)
+    if oauth:
+        res = _fetch_oauth_usage(oauth)
+        if "error" not in res:
+            return res
+        if long_lived:  # a 429, 401 or 5xx: the headers meanwhile, one call per fetch, not two
+            _oauth_paused_until = time.time() + _OAUTH_PAUSE_SECS
+        elif "Rate limited" in res["error"]:
+            return res  # transient: the worker backs off; the headers call would be rate limited too
+    token = long_lived or oauth
     if not token:
         return {"error": "No credentials found. Run claude to sign in."}
-
-    # Long-lived tokens (sk-ant-oat...) can't use /api/oauth/usage (no
-    # user:profile scope). Claude Code's own access token can, and carries the
-    # scoped limits, surface breakdown and extra usage the headers lack, so use
-    # it while it is unexpired (read-only: never refreshed or rewritten here),
-    # else fall back to the unified headers.
-    if _load_long_lived_token(claude_dir):
-        oauth = _read_oauth_token(claude_dir)
-        if oauth:
-            res = _fetch_oauth_usage(oauth)
-            if "error" not in res:
-                return res
-        return _fetch_unified_headers_via_messages(token)
-
-    # Primary path: the OAuth usage endpoint Claude Code itself uses.
-    primary = _fetch_oauth_usage(token)
-    if "error" not in primary:
-        return primary
-    # A rate limit (429) is transient: surface it directly instead of hitting
-    # the urllib /v1/messages fallback, which Cloudflare rate-limits even harder
-    # and which would mislabel the 429 as "Credentials expired".
-    if "Rate limited" in primary.get("error", ""):
-        return primary
-
-    # Fallback: tiny /v1/messages call to harvest rate-limit headers. These
-    # cover API-key-level limits (not plan limits) but are better than
-    # nothing if the OAuth endpoint is unreachable or 4xxs.
-    body = json.dumps({
-        "model": "claude-haiku-4-5-20251001",
-        "max_tokens": 1,
-        "messages": [{"role": "user", "content": "h"}],
-    }).encode()
-    req = Request(
-        "https://api.anthropic.com/v1/messages",
-        data=body,
-        headers={
-            "x-api-key": token,
-            "anthropic-version": "2023-06-01",
-            "anthropic-beta": "oauth-2025-04-20",
-            "content-type": "application/json",
-        },
-    )
-    try:
-        with urlopen(req, timeout=15) as resp:
-            headers = {k.lower(): v for k, v in resp.getheaders()}
-    except HTTPError as e:
-        if e.code == 401:
-            return {"error": "Credentials expired. Run claude to sign in again."}
-        if e.code == 429:
-            headers = {k.lower(): v for k, v in e.headers.items()}
-            prefix = "anthropic-ratelimit-unified-"
-            if any(k.startswith(prefix) for k in headers):
-                return _parse_rate_limit_headers(headers)
-            return {"error": "Rate limited by the usage API. Retrying shortly."}
-        return {"error": f"The usage API returned error {e.code}."}
-    except (URLError, OSError, TimeoutError):
-        return {"error": "Can't reach the usage API. Check your network."}
-    return _parse_rate_limit_headers(headers)
+    return _fetch_unified_headers_via_messages(token)
 
 
 def _fetch_oauth_usage(token: str) -> dict[str, Any]:
@@ -384,7 +362,7 @@ def _fetch_oauth_usage(token: str) -> dict[str, Any]:
 
 
 def _read_oauth_token(claude_dir: str) -> str | None:
-    """Claude Code's OAuth access token if it has not expired. Never refreshes."""
+    """Claude Code's OAuth access token from the file if it has not expired; this one never refreshes."""
     try:
         with open(os.path.join(claude_dir, ".credentials.json"), encoding="utf-8-sig") as f:
             oauth = json.load(f)["claudeAiOauth"]

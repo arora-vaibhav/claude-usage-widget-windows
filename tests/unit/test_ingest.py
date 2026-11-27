@@ -327,10 +327,10 @@ def test_file_deleted_between_walk_and_read_is_skipped(env, monkeypatch):
     ing = ingest.Ingestor(conn, root)
     walk = ing._walk
 
-    def walk_then_cleanup():
-        found = walk()
+    def walk_then_cleanup(ps, cancel=None):
+        complete = walk(ps, cancel)
         os.remove(gone)  # Claude Code's cleanup can delete old transcripts during the first long index
-        return found
+        return complete
 
     monkeypatch.setattr(ing, "_walk", walk_then_cleanup)
     result = ing.index(cancel=lambda: False)
@@ -445,6 +445,30 @@ def test_a_read_error_does_not_hold_up_later_files(env, monkeypatch):
     monkeypatch.undo()
     ing.index()
     assert [r[0] for r in rows(conn)] == ["m1", "m2", "m3"]
+
+
+def test_a_record_the_store_cannot_hold_does_not_hold_up_the_pass(env, monkeypatch):
+    # A count past 64 bits parses but fails each time its batch is stored; it once stalled the pass on that file.
+    root, conn = env
+    bad = asst("m2", _ts(2), sid="s2").replace('"output_tokens":10', '"output_tokens":100000000000000000000')
+    write(root, "C--work-acme-api/s1.jsonl", [asst("m1", _ts(1))])
+    write(root, "C--work-acme-api/s2.jsonl", [bad])
+    write(root, "C--work-acme-api/s3.jsonl", [asst("m3", _ts(3), sid="s3")])
+    ing = ingest.Ingestor(conn, root)
+    assert not ing.index()["cancelled"]
+    assert [r[0] for r in rows(conn)] == ["m1", "m3"]
+    write(root, "C--work-acme-api/s3.jsonl", [asst("m4", _ts(4), sid="s3")], mode="a")
+    for _ in range(3):  # live tailing goes on; the bad file waits for the next walk
+        assert ing.tail()["full"] is False
+    assert [r[0] for r in rows(conn)] == ["m1", "m3", "m4"]
+
+    def locked(*_a, **_k):
+        raise ingest.sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(ingest.Ingestor, "_read", locked)
+    write(root, "C--work-acme-api/s5.jsonl", [asst("m5", _ts(5), sid="s5")])
+    with pytest.raises(ingest.sqlite3.OperationalError):  # a store fault is not the file's: the caller retries
+        ing.index()
 
 
 def test_absurd_numbers_and_nesting_are_skipped(env):
@@ -616,3 +640,120 @@ def test_a_file_created_in_the_clock_tick_of_the_last_look_is_found(env):
     os.utime(d, ns=(ing._dirs[d], ing._dirs[d]))  # parallel subagents: the directory mtime did not move
     ing.tail()
     assert [r[0] for r in rows(conn)] == ["m1", "m2", "m3"]
+
+
+def _tree(root, sessions=6):
+    """Main transcripts, each with two subagent files in their own folders."""
+    for i in range(sessions):
+        sid = f"s{i}"
+        write(root, f"C--work-acme-api/{sid}.jsonl", [prompt(f"p{i}", _ts(10 * i), sid=sid)]
+              + [asst(f"m{i}-{k}", _ts(10 * i + k), sid=sid, out=100 + k) for k in range(3)])
+        for a in range(2):
+            write(root, f"C--work-acme-api/{sid}/subagents/w{a}/agent-{a}.jsonl",
+                  [asst(f"m{i}-a{a}", _ts(10 * i + 5), sid=sid, agentId=f"a{a}", isSidechain=True)])
+
+
+TOTALS = "SELECT COUNT(*), SUM(input), SUM(output), SUM(cache_read), SUM(is_subagent) FROM calls"
+
+
+def test_a_walk_slower_than_every_deadline_still_finishes(env, tmp_path, monkeypatch):
+    # Under load the walk alone once took longer than each pass's deadline, so every pass
+    # started the walk again and read nothing. Now each call goes on from where the last stopped.
+    root, conn = env
+    _tree(root)
+    ref = store.connect(str(tmp_path / "ref.db"))
+    ingest.Ingestor(ref, root).index()  # the same tree in one go
+    real, listed = os.scandir, []
+
+    def slow_scandir(path):
+        listed.append(path)
+        time.sleep(0.002)  # a disk busy with a virus scan
+        return real(path)
+
+    monkeypatch.setattr(ingest.os, "scandir", slow_scandir)
+    ing, seen, passes = ingest.Ingestor(conn, root), [], 0
+    while True:
+        before = (len(listed), conn.execute("SELECT COUNT(*) FROM files").fetchone()[0])
+        r = ing.index(progress=lambda d, t: seen.append((d, t)), cancel=lambda: True)  # a deadline already gone
+        passes += 1
+        assert (len(listed), conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]) > before, passes
+        if not r["cancelled"]:
+            break
+        assert passes < 100
+    assert sorted(listed) == sorted(set(listed))  # every directory listed once: the walk never started again
+    assert [d for d, _t in seen] == sorted(d for d, _t in seen) and seen[-1] == (18, 18)
+    share = [d / (t or 1) for d, t in seen]
+    assert share == sorted(share)  # the share shown only grows
+    assert conn.execute(TOTALS).fetchone() == ref.execute(TOTALS).fetchone() == (30, 30, 1938, 0, 12)
+    assert rows(conn, "SELECT COUNT(*), SUM(duration_ms) FROM turns") == rows(ref, "SELECT COUNT(*), SUM(duration_ms) FROM turns")
+
+
+def test_a_restart_in_the_middle_of_a_pass_reads_the_rest(env, tmp_path):
+    root, conn = env
+    _tree(root)
+    ref = store.connect(str(tmp_path / "ref.db"))
+    ingest.Ingestor(ref, root).index()
+    ing, before = ingest.Ingestor(conn, root), []
+    files = lambda: conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]  # noqa: E731
+    while files() < 5:  # the walk, then a few files, one per pass
+        assert ing.index(lambda d, t: before.append((d, t)), cancel=lambda: True)["cancelled"]
+    assert before[-1] == (5, 18)
+    # a re-index forgets every read position, so it starts from 0, not from what the cut pass showed
+    kept = conn.execute("SELECT * FROM files").fetchall()
+    with conn:
+        conn.execute("DELETE FROM files")
+    fresh = []
+    ingest.Ingestor(conn, root).index(lambda d, t: fresh.append((d, t)), cancel=lambda: True)
+    assert fresh[0] == (0, 18)
+    with conn:
+        conn.executemany("INSERT INTO files VALUES (?,?,?,?)", kept)
+    again, seen, read = ingest.Ingestor(conn, root), [], []  # a new process: walks again, reads only what is left
+    while True:
+        r = again.index(lambda d, t: seen.append((d, t)), cancel=lambda: True)
+        read.append(r["read"])
+        if not r["cancelled"]:
+            break
+    # the new walk counts from 0 again; the share shown still never goes under what the old process showed
+    share = [d / (t or 1) for d, t in before[-1:] + seen]
+    assert share == sorted(share) and seen[-1] == (18, 18), seen
+    assert sum(read) <= 14  # at most the 13 left and the one stopped inside
+    assert conn.execute(TOTALS).fetchone() == ref.execute(TOTALS).fetchone()
+    assert store.get_meta(conn, "transcripts_done") == 0  # a finished pass leaves no floor for the next one
+
+
+def test_a_transcript_that_grew_after_the_walk_is_read_on_not_again(env, monkeypatch):
+    # A pass keeps the file list of its walk for minutes. A live transcript that grew past a batch since was
+    # taken for a shrunk one when a cut pass went on in it, read again from 0, cut again: the pass never ended
+    # and nothing else was read.
+    root, conn = env
+    monkeypatch.setattr(ingest, "_BATCH", 2)
+    path = write(root, "C--work-acme-api/s1.jsonl", [asst(f"m{i}", _ts(i), out=10 + i) for i in range(5)])
+    ing = ingest.Ingestor(conn, root)
+    while ing._pass is None or ing._pass["todo"] is None:  # the walk, one directory per call
+        ing.index(cancel=lambda: True)
+    write(root, "C--work-acme-api/s1.jsonl", [asst(f"m{i}", _ts(i), out=10 + i) for i in range(5, 9)], mode="a")
+    offsets = []
+    for _ in range(20):  # a deadline gone at every call: one batch each
+        r = ing.index(cancel=lambda: True)
+        offsets.append(conn.execute("SELECT offset FROM files").fetchone()[0])
+        if not r["cancelled"]:
+            break
+    assert not r["cancelled"] and len(offsets) == 5, offsets
+    assert offsets == sorted(offsets) and offsets[-1] == os.path.getsize(path)  # never back to 0
+    assert rows(conn, "SELECT COUNT(*), SUM(output) FROM calls") == [(9, sum(10 + i for i in range(9)))]
+
+
+def test_the_periodic_full_walk_stops_for_quit_and_goes_on_next_tick(env, monkeypatch):
+    root, conn = env
+    _tree(root)
+    clock = [1000.0]
+    ing = ingest.Ingestor(conn, root, clock=lambda: clock[0])
+    ing.index()
+    write(root, "C--work-acme-api/s9.jsonl", [asst("m9", _ts(99), sid="s9")])
+    clock[0] += ingest.FULL_WALK_SECONDS
+    first = ing.tail(cancel=lambda: True)  # Quit or Refresh during the 5-minute walk
+    assert first["full"] and first["cancelled"]
+    second = ing.tail()  # the next tick finishes that walk instead of a quick look
+    assert second["full"] and not second["cancelled"]
+    assert ("m9",) in rows(conn, "SELECT msg_id FROM calls")
+    assert ing.tail()["full"] is False

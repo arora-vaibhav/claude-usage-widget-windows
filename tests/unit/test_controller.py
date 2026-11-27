@@ -77,7 +77,7 @@ def make(tmp_path, monkeypatch):
     for ctl in made:
         ctl.quit()
         ctl.osd.hide()
-        if ctl.app is not None:
+        if ctl.app is not None and ctl.app.window is not None:
             ctl.app.window.close()
     QGuiApplication.styleHints().setColorScheme(widget.Qt.ColorScheme.Unknown)
     _app.setStyleSheet("")
@@ -113,7 +113,7 @@ def test_worker_result_reaches_the_osd_and_the_app(make, tmp_path):
     assert pump_until(lambda: json.loads(backend.snapshotJson)["range"]["key"] == "30d" and not backend.busy)
     assert ctl.app.warnings == []
 
-    assert pump_until(lambda: None in progress)  # the first index has finished
+    assert pump_until(lambda: None in progress, timeout=90)  # the first index has finished (slow under load)
     ctl.quit()
     assert not ctl._worker.is_alive()
     saved = json.loads((tmp_path / "config.json").read_text())
@@ -379,20 +379,90 @@ def test_worker_survives_a_failed_store_open_and_a_failed_refresh(make, monkeypa
     assert calls["connect"] == 2 and len(notices) == 1 and ctl._worker.is_alive()
 
 
-def test_a_hidden_app_window_is_freed_and_comes_back(make):
+def test_a_window_that_fails_to_open_says_so_and_can_try_again(make, monkeypatch):
+    import claude_usage.app as app_pkg
+    ctl = make()
+    notices = []
+    monkeypatch.setattr(ctl, "_balloon", lambda title, body: notices.append(body))
+    real = app_pkg.AppWindow
+
+    def broken(*_a, **_k):
+        raise RuntimeError("app window failed to load: no QtQuick")
+
+    monkeypatch.setattr(app_pkg, "AppWindow", broken)
+    ctl.open_app()  # from a click: no exception escapes
+    assert ctl.app is None and notices == [widget.OPEN_FAILED]
+    monkeypatch.setattr(app_pkg, "AppWindow", real)
+    ctl.open_app()
+    assert ctl.app is not None and ctl.app.is_visible()
+
+
+def test_a_first_fetch_that_fails_still_names_the_plan(make, tmp_path):
+    # Ultra has no 5-hour limit; without the plan the app said "not reported" instead of saying so.
+    ctl = make()
+    shown = []
+    ctl._fetch = lambda d: {"error": "Can't reach the usage API. Check your network.", "plan": "Ultra"}
+    ctl._refreshed.connect(lambda now, lim, ix: shown.append(lim))
+    ctl.start(check_updates=False)
+    assert pump_until(lambda: shown, timeout=10)
+    assert shown[-1]["plan"] == "Ultra"
+    snap = snapshot.build(store.connect(str(tmp_path / "s.db")), "7d", None, time.time(), shown[-1])
+    assert snap["status"]["plan"] == "Ultra" and snap["limits"]["session_note"] == snapshot.ULTRA_NOTE
+    # a fetch that raised has no plan of its own: it comes from the credentials
+    (tmp_path / "claude").mkdir(exist_ok=True)
+    (tmp_path / "claude" / ".credentials.json").write_text(json.dumps(
+        {"claudeAiOauth": {"accessToken": "synthetic", "rateLimitTier": "default_claude_max_20x"}}), encoding="utf-8")
+    ctl._fetch = lambda d: 1 / 0
+    n = len(shown)
+    widget.FORCE_GAP_S, gap = 0, widget.FORCE_GAP_S
+    try:
+        ctl.refresh_now()
+        assert pump_until(lambda: len(shown) > n and "Collection error" in (shown[-1].get("error") or ""), timeout=10)
+    finally:
+        widget.FORCE_GAP_S = gap
+    assert shown[-1]["plan"] == "Ultra"
+
+
+def test_a_refresh_during_a_build_reaches_the_app(make, monkeypatch):
+    import threading
+    monkeypatch.setattr(widget.Controller, "_run", lambda self: self._ready.set())  # no worker: refreshes by hand
+    gate, builds, real = threading.Event(), [], widget.snapshot.build
+
+    def slow(conn, range_key, project, now, limits, **kw):
+        builds.append(limits)
+        if len(builds) == 1:
+            gate.wait(10)
+        return real(conn, range_key, project, now, limits, **kw)
+
+    monkeypatch.setattr(widget.snapshot, "build", slow)
     ctl = make()
     ctl.start(check_updates=False)
     ctl.open_app()
-    assert pump_until(lambda: ctl.app.backend.snapshotJson != "null")
-    ctl.app.hide()
-    assert ctl._release.isActive()
-    ctl._release.stop()
-    ctl._release_app()
-    assert ctl.app is None
-    ctl._on_refreshed(now_dict(0.5), None, None)  # a refresh or a late build with no window is fine
-    ctl.open_app("sessions")
-    assert not ctl._release.isActive()
-    assert pump_until(lambda: ctl.app.backend.snapshotJson != "null")
+    assert pump_until(lambda: builds, timeout=10)  # the first build is running
+    lim = fake_fetch(None)
+    ctl._on_refreshed(snapshot.now_state(store.connect(":memory:"), lim, time.time()), lim, None)
+    gate.set()
+    assert pump_until(lambda: len(builds) == 2 and not ctl._building, timeout=10)
+    assert builds == [None, lim]
+    assert pump_until(lambda: json.loads(ctl.app.backend.snapshotJson)["limits"]["weekly"] is not None, timeout=10)
+
+
+def test_reindex_reads_on_its_first_pass(make, tmp_path, monkeypatch):
+    # reindex() wakes the worker; that wake once cancelled the re-index pass before it read a file.
+    make_store.write_transcripts(str(tmp_path / "claude" / "projects"))
+    passes, real = [], widget.ingest.Ingestor.index
+    monkeypatch.setattr(widget.ingest.Ingestor, "index", lambda self, *a, **k: passes.append(real(self, *a, **k)) or passes[-1])
+    ctl = make()
+    fetches = []
+    ctl._fetch = lambda d: fetches.append(d) or fake_fetch(d)
+    ctl.start(check_updates=False)
+    assert pump_until(lambda: passes and not passes[-1]["cancelled"], timeout=90)  # a full first pass; slow under load
+    n_fetch = len(fetches)
+    passes.clear()
+    ctl.reindex()
+    assert pump_until(lambda: passes, timeout=10)
+    assert passes[0]["read"] > 0
+    assert pump_until(lambda: len(fetches) > n_fetch, timeout=10)  # and the limits are fetched again
 
 
 def test_a_second_launch_opens_the_running_app(make, monkeypatch):

@@ -60,12 +60,13 @@ Card {
         readonly property real xR: width - 34
         readonly property real slot: n ? xR / n : 1
         readonly property real bw: Math.max(6, Math.min(16, slot * 0.56))
+        // every bar, this week included, so this week can never outgrow the card
         readonly property real maxH: {
             var m = 0
-            card.done.forEach(function (w) { m = Math.max(m, w.hours_at_limit) })
+            card.weeks.forEach(function (w) { m = Math.max(m, w.hours_at_limit) })
             return Math.max(10, Math.ceil(m / 10) * 10)
         }
-        readonly property var ticks: { var t = []; for (var g = 10; g <= maxH; g += maxH > 40 ? 20 : 10) t.push(g); return t }
+        readonly property var ticks: { var t = []; for (var g = 10; g <= maxH; g += maxH > 80 ? 40 : maxH > 40 ? 20 : 10) t.push(g); return t }
         function py(v) { return base - v / maxH * (base - yTop) }
         function cx(i) { return slot * (i + 0.5) }
         readonly property var months: {

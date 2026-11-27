@@ -21,6 +21,9 @@ Page {
     readonly property bool storeErr: !!snap && snap.now.error_kind === "store"
     // a binding 5-hour limit leads in the plan limits' header (the layout stays weekly-first)
     readonly property var hot: snap && snap.limits.session && (snap.limits.session.level === "critical" || snap.limits.session.level === "limited") ? snap.limits.session : null
+    // the 5-hour forecast, when it runs out before the reset (as the menu and tray say it)
+    readonly property var hotEta: hot && hot.level !== "limited" && snap.now.session && snap.now.session.eta
+                                  && (!hot.resets_at || Ui.date(snap.now.session.eta) < Ui.date(hot.resets_at)) ? Ui.date(snap.now.session.eta) : null
     readonly property var ix: st ? st.indexing : null
     readonly property var limitsAsOf: st && st.limits_as_of ? Ui.date(st.limits_as_of) : null
     readonly property string plan: st && st.plan ? st.plan : ""
@@ -139,8 +142,9 @@ Page {
                    + (page.snap && page.snap.project ? ". Limits are not split by project." : ".")
             pill: page.stale ? "Not refreshed since " + (page.limitsAsOf ? Ui.whenShort(page.limitsAsOf) : "a while")
                   : page.st && page.st.state === "error" && !page.failed ? "Could not refresh"
-                  : page.hot ? (page.hot.level === "limited" ? "5-hour limit reached" : "5-hour limit at " + Ui.pct(page.hot.pct))
-                               + (page.hot.resets_at ? ", resets " + Ui.clock(Ui.date(page.hot.resets_at)) : "") : ""
+                  : page.hot ? (page.hot.level === "limited" ? "5-hour limit reached" : "5-hour " + Ui.pct(page.hot.pct))  // as the menu says it
+                               + (page.hotEta ? (page.hotEta - page.nowMs < 60000 ? ", limit any minute" : ", limit in ~" + Ui.span(page.hotEta - page.nowMs))
+                                  : page.hot.resets_at ? ", resets " + Ui.clock(Ui.date(page.hot.resets_at)) : "") : ""
             pillKind: page.stale || page.st && page.st.state === "error" ? "warn" : "bad"
             note: pill !== "" && page.st && page.st.message ? Ui.sentence(page.st.message) : ""
         }

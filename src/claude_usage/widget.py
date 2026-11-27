@@ -37,7 +37,7 @@ NEWER_STORE = "Your usage store is from a newer version of Claude Usage. Update 
 ON_TOP_MS = 2000
 SAVE_DELAY_MS = 400  # one write per burst of changes (a slider drag sends dozens)
 SAVE_RETRY_MS = 60_000  # after a failed write; a locked file or a full disk can clear
-RELEASE_MS = 5 * 60_000  # an app window hidden this long is freed (about 70 MB); the next open makes a new one
+OPEN_FAILED = "Couldn't open the Claude Usage window. Restart Claude Usage."
 ICON = os.path.join(os.path.dirname(__file__), "icons", "claude-tray.svg")
 
 
@@ -169,6 +169,7 @@ class Controller(QObject):
         self._updated_at: Optional[float] = None
         self._want: Optional[tuple] = None
         self._building = False
+        self._dirty = False  # a refresh or a new choice came in while a build ran: build once more after it
         self._repairing = False
         self._newer = False  # the store is from a newer version: never read or written
         self._stop, self._wake, self._reindex, self._ready = (threading.Event() for _ in range(4))
@@ -178,10 +179,6 @@ class Controller(QObject):
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(SAVE_DELAY_MS)
         self._save_timer.timeout.connect(self._save)
-        self._release = QTimer(self)
-        self._release.setSingleShot(True)
-        self._release.setInterval(RELEASE_MS)
-        self._release.timeout.connect(self._release_app)
 
         self.notifier = UsageNotifier(self._thresholds(), self._balloon, bool(config.get("notifications_enabled", True)))
         self.watchdog = AuthWatchdog(self.claude_dir, on_repair_attempt=lambda m: self._notice.emit("Claude Usage", m))
@@ -261,17 +258,15 @@ class Controller(QObject):
         self._wake.set()
 
     def open_app(self, page: Optional[str] = None) -> None:
-        if self.app is None:
-            # Imported here so the QML engine and its libraries load only when the window is first opened.
-            from claude_usage.app import AppWindow
-            self.app = AppWindow(self._provider, self._app_settings(), self._on_setting, self._on_action)
-            self.app.window.visibleChanged.connect(lambda shown: self._release.stop() if shown else self._release.start())
-        self.app.show(page)
-
-    def _release_app(self) -> None:
-        if self.app is not None and not self.app.is_visible():
-            app, self.app = self.app, None
-            app.release()
+        try:
+            if self.app is None:
+                # Imported here so the QML engine and its libraries load only when the window is first opened.
+                from claude_usage.app import AppWindow
+                self.app = AppWindow(self._provider, self._app_settings(), self._on_setting, self._on_action)
+            self.app.show(page)
+        except Exception:  # called from clicks and menus: say so instead of failing silently
+            log.exception("could not open the app window")
+            self._balloon("Claude Usage", OPEN_FAILED)
 
     # ----------------------------------------------------------- worker thread
 
@@ -328,9 +323,10 @@ class Controller(QObject):
                 interval = max(5, int(self.config.get("refresh_seconds") or 30))
                 if self._reindex.is_set():
                     self._reindex.clear()
+                    self._wake.clear()  # reindex() woke us; left set, it would cancel the pass below at once
                     with conn:  # forget every read offset; re-reading is safe, calls are upserted
                         conn.execute("DELETE FROM files")
-                    ing, full = ingest.Ingestor(conn, os.path.join(self.claude_dir, "projects")), True
+                    ing, full, force = ingest.Ingestor(conn, os.path.join(self.claude_dir, "projects")), True, True
                 try:
                     if full:
                         # A short first pass gets the OSD its first numbers within seconds on a first run;
@@ -340,7 +336,7 @@ class Controller(QObject):
                                                                 or time.monotonic() > deadline))
                         full = r["cancelled"]
                     else:
-                        ing.tail()
+                        ing.tail(cancel=lambda: self._stop.is_set() or self._wake.is_set())
                 except Exception:
                     log.exception("ingest failed")
                     full = False  # tail() retries the full walk; never spin on a broken pass
@@ -359,7 +355,8 @@ class Controller(QObject):
                     error = lim.get("error")
                     if error:
                         errors += 1
-                        shown = dict(last_good or {}, error=error)
+                        # The plan is in the credentials, not the reply: a first fetch that fails still names it.
+                        shown = dict(last_good or {}, error=error, plan=lim.get("plan") or collector._plan(self.claude_dir))
                         next_fetch = time.monotonic() + BACKOFF_S[min(errors, len(BACKOFF_S)) - 1]
                     else:
                         errors = 0
@@ -417,9 +414,12 @@ class Controller(QObject):
         return None
 
     def _kick_build(self) -> None:
-        if self._building or self._want is None or self._stop.is_set():
+        if self._want is None or self._stop.is_set():
             return
-        self._building = True
+        if self._building:
+            self._dirty = True
+            return
+        self._building, self._dirty = True, False
         self._builder.submit(self._build_job, self._want, self._shown, self._indexing, self._updated_at,
                              self._thresholds())
 
@@ -443,10 +443,10 @@ class Controller(QObject):
 
     def _on_built(self, want: tuple, snap: Optional[dict]) -> None:
         self._building = False
-        if want != self._want:
-            self._kick_build()  # the range or project changed while this one was building
-        elif snap is not None and self.app is not None:
+        if want == self._want and snap is not None and self.app is not None:
             self.app.update_snapshot(snap)
+        if self._dirty or want != self._want:
+            self._kick_build()  # newer limits, or another range or project, came in while this one built
 
     # ----------------------------------------------------------- settings
 

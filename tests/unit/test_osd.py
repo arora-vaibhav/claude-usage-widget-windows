@@ -431,6 +431,14 @@ def test_far_dates_keep_their_time():
     assert any(it.text.endswith(_clock(far)) for it in make("limited_far").items() if it.role == "sub")
 
 
+def test_countdowns_floor_and_drop_a_zero_minute():
+    # Ui.span in the app follows the same rule, so the pill, the menu and the app read the same minute
+    spans = [osd._span(timedelta(**kw)) for kw in (
+        {"hours": 13}, {"hours": 13, "minutes": 49, "seconds": 59}, {"minutes": 9, "seconds": 40},
+        {"seconds": 40}, {"days": 2, "hours": 3, "minutes": 5})]
+    assert spans == ["13h", "13h 49m", "9m", "<1m", "2d 3h"]
+
+
 def test_pill_shows_the_time_to_the_limit_when_it_comes_first():
     def subs(state):
         return [it for it in make(state, "pill").items() if it.role == "sub"]
@@ -494,7 +502,9 @@ def test_pill_width_holds_while_countdowns_tick():
     # Nor a forecast coming and going on a weekly-only pill.
     wk = states(now)["no_5h"]
     widths = set()
-    for eta in (None, timedelta(days=1, hours=10, minutes=30), timedelta(days=1, hours=9, minutes=30)):
+    for eta in (None, timedelta(days=1, hours=10, minutes=30), timedelta(days=1, hours=9, minutes=30),
+                timedelta(hours=13, minutes=49, seconds=30), timedelta(hours=13, seconds=30),
+                timedelta(hours=23, minutes=58, seconds=30), timedelta(minutes=8, seconds=30)):
         w.set_now({**wk, "weekly": {**wk["weekly"], "eta": eta and (now + eta).isoformat()}})
         widths.add(w.width())
     assert len(widths) == 1, widths

@@ -201,13 +201,15 @@ class Backend(QObject):
             self.update_snapshot(snap)
 
     def update_snapshot(self, snap: dict) -> None:
+        key = (snap.get("range") or {}).get("key", self._range)
+        if self._busy and (key, snap.get("project") or "") != (self._range, self._project):
+            return  # a build for the previous choice landed after a new one was picked; that one is on its way
         status = snap.get("status") or {}
         if status.get("updated_at") != (self._updated or None):
             self._updated = status.get("updated_at") or ""
             self.updatedChanged.emit()
         # A refresh where only the clock moved skips the QML rebuild.
         same = dict(snap, generated_at=None, status=dict(status, updated_at=None))
-        key = (snap.get("range") or {}).get("key", self._range)
         if same == self._last and key == self._range and (snap.get("project") or "") == self._project:
             self._set_busy(False)
             return
@@ -264,7 +266,7 @@ class AppWindow(QObject):
                  on_action: Optional[OnAction] = None,
                  parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
-        if QQuickStyle.name() != "FluentWinUI3":  # set once per process; a window made again after a release keeps it
+        if QQuickStyle.name() != "FluentWinUI3":  # set once per process
             QQuickStyle.setStyle("FluentWinUI3")
         self.warnings: list[str] = []
         # Children are deleted in creation order: the engine (and every
@@ -276,7 +278,7 @@ class AppWindow(QObject):
         self.engine.load(QUrl.fromLocalFile(str(QML_MAIN)))
         roots = self.engine.rootObjects()
         if not roots:
-            raise RuntimeError("app window failed to load: " + "; ".join(self.warnings))
+            raise RuntimeError("app window failed to load: " + "; ".join(self.warnings[:5]))
         self.window = roots[0]
         self._restore_geometry((settings or {}).get("app_geometry"))
         self.window.visibleChanged.connect(self._on_visible)
@@ -322,13 +324,6 @@ class AppWindow(QObject):
     def prepare_quit(self) -> None:
         """Let the next close really close (call before QApplication.quit())."""
         self.backend._quitting = True
-
-    def release(self) -> None:
-        """Close for good and free the engine, its scene and the last snapshot; the controller makes a new window."""
-        QGuiApplication.styleHints().colorSchemeChanged.disconnect(self._resolve_dark)
-        self.prepare_quit()
-        self.window.close()
-        self.deleteLater()
 
     # -- internals ----------------------------------------------------------
     def _resolve_dark(self) -> None:

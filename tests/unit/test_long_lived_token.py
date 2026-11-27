@@ -23,11 +23,15 @@ def test_blank_file_is_none(tmp_path, monkeypatch):
     assert collector._load_long_lived_token(str(tmp_path)) is None
 
 
-def test_load_credentials_prefers_long_lived(tmp_path, monkeypatch):
-    # With a long-lived token present, _load_credentials returns it without
-    # ever touching the rotating .credentials.json path.
+def test_load_credentials_reads_claude_codes_token_not_the_long_lived_one(tmp_path, monkeypatch):
+    # The long-lived token is only the headers fallback; the OAuth path needs Claude Code's own token.
     monkeypatch.setenv("CLAUDE_USAGE_TOKEN", "ll-token")
-    assert collector._load_credentials(str(tmp_path)) == "ll-token"
+    monkeypatch.setattr(collector, "_refresh_access_token_if_needed", lambda _p: None)
+    assert collector._load_credentials(str(tmp_path)) is None
+    import json as _json
+    (tmp_path / ".credentials.json").write_text(_json.dumps({"claudeAiOauth": {"accessToken": "cc-token"}}),
+                                                encoding="utf-8")
+    assert collector._load_credentials(str(tmp_path)) == "cc-token"
 
 
 def test_long_lived_token_routes_to_unified_headers(tmp_path, monkeypatch):

@@ -1,6 +1,8 @@
 """Limits parsing on captured-shape payloads (values are synthetic). No network."""
 
 import json
+import os
+import stat
 import subprocess
 import time
 
@@ -200,3 +202,163 @@ def test_long_lived_token_falls_back_to_headers_when_oauth_expired(tmp_path, mon
     monkeypatch.setattr(collector, "_fetch_unified_headers_via_messages",
                         lambda t: collector._parse_rate_limit_headers(HEADERS) if t == "synthetic-long-lived" else {})
     assert collector.fetch_rate_limits(d)["source"] == "headers"
+
+
+# ---- which path answers: Claude Code's OAuth token first, the long-lived token's headers as the fallback
+
+class _Log(list):
+    replies: dict
+
+
+class _Done:
+    def __init__(self, stdout, returncode=0):
+        self.stdout, self.stderr, self.returncode = stdout, "", returncode
+
+
+@pytest.fixture
+def paths(monkeypatch):
+    """Fake endpoints and token refresh; the calls made, in order."""
+    monkeypatch.delenv("CLAUDE_USAGE_TOKEN", raising=False)
+    monkeypatch.setattr(collector, "_LAST_REFRESH_ATTEMPT", 0.0)
+    monkeypatch.setattr(collector, "_oauth_paused_until", 0.0)
+    calls = _Log()
+    calls.replies = {"oauth": PAYLOAD, "refresh": None}
+
+    def oauth(t):
+        calls.append(("oauth", t))
+        r = calls.replies["oauth"]
+        return dict(r) if "error" in r else collector._parse_oauth_usage(r)
+
+    def refresh(args, **kw):
+        calls.append(("refresh", "synthetic-refresh" in kw.get("input", "")))
+        return _Done(json.dumps(calls.replies["refresh"] or {"error": "invalid_grant"}))
+
+    monkeypatch.setattr(collector, "_fetch_oauth_usage", oauth)
+    monkeypatch.setattr(collector, "_fetch_unified_headers_via_messages",
+                        lambda t: calls.append(("headers", t)) or collector._parse_rate_limit_headers(HEADERS))
+    monkeypatch.setattr(subprocess, "run", refresh)
+    return calls
+
+
+def _creds(tmp_path, expires_s, long_lived=True):
+    if long_lived:
+        (tmp_path / "claude-usage-token").write_text("synthetic-long-lived", encoding="utf-8")
+    path = tmp_path / ".credentials.json"
+    path.write_text(json.dumps({"claudeAiOauth": {"accessToken": "synthetic-oauth", "refreshToken": "synthetic-refresh",
+                                                  "expiresAt": int((time.time() + expires_s) * 1000),
+                                                  "rateLimitTier": "default_claude_max_20x"}}), encoding="utf-8")
+    return path
+
+
+def test_valid_oauth_token_reads_the_full_payload_even_with_a_long_lived_token(tmp_path, paths):
+    _creds(tmp_path, 3600)
+    r = collector.fetch_rate_limits(str(tmp_path))
+    assert paths == [("oauth", "synthetic-oauth")]  # no refresh, no headers call
+    assert r["source"] == "oauth" and r["limits"] and r["surfaces"] and r["extra_usage"] and r["plan"] == "Ultra"
+
+
+def test_expired_oauth_token_is_refreshed_and_written_back_without_a_long_lived_token(tmp_path, paths):
+    path = _creds(tmp_path, -60, long_lived=False)
+    paths.replies["refresh"] = {"access_token": "synthetic-new", "refresh_token": "synthetic-rotated", "expires_in": 28800,
+                                "refresh_token_expires_in": 30 * 86400}
+    r = collector.fetch_rate_limits(str(tmp_path))
+    assert paths == [("refresh", True), ("oauth", "synthetic-new")] and r["source"] == "oauth"
+    text = path.read_text(encoding="utf-8")
+    saved = json.loads(text)["claudeAiOauth"]
+    assert saved["accessToken"] == "synthetic-new" and saved["refreshToken"] == "synthetic-rotated"
+    assert saved["expiresAt"] > (time.time() + 28000) * 1000 and saved["rateLimitTier"] == "default_claude_max_20x"
+    assert saved["refreshTokenExpiresAt"] > (time.time() + 29 * 86400) * 1000  # the new token's, not the old one's
+    assert "\n" not in text and ": " not in text  # compact, as Claude Code writes it
+    assert sorted(p.name for p in tmp_path.iterdir()) == [".credentials.json"]  # no .tmp left
+    if os.name != "nt":  # the tokens stay readable by the owner only
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_a_refresh_whose_write_fails_leaves_the_file_and_no_copy_of_the_tokens(tmp_path, paths, monkeypatch):
+    path = _creds(tmp_path, -60, long_lived=False)
+    before = path.read_text(encoding="utf-8")
+    paths.replies["refresh"] = {"access_token": "synthetic-new", "refresh_token": "synthetic-rotated", "expires_in": 28800}
+
+    def locked(*_a):
+        raise PermissionError("the file is in use")
+
+    monkeypatch.setattr(collector.os, "replace", locked)
+    collector.fetch_rate_limits(str(tmp_path))
+    assert paths[0] == ("refresh", True)
+    assert path.read_text(encoding="utf-8") == before
+    assert sorted(p.name for p in tmp_path.iterdir()) == [".credentials.json"]
+
+
+def test_a_refresh_write_waits_out_a_reader_holding_the_file(tmp_path, paths, monkeypatch):
+    # losing the rotated refresh token would sign Claude Code out, so a brief lock is retried
+    path = _creds(tmp_path, -60, long_lived=False)
+    paths.replies["refresh"] = {"access_token": "synthetic-new", "refresh_token": "synthetic-rotated", "expires_in": 28800}
+    real, tries = collector.os.replace, []
+
+    def busy_twice(*a):
+        tries.append(1)
+        if len(tries) <= 2:
+            raise PermissionError("the file is in use")
+        return real(*a)
+
+    monkeypatch.setattr(collector.os, "replace", busy_twice)
+    r = collector.fetch_rate_limits(str(tmp_path))
+    assert len(tries) == 3 and r["source"] == "oauth"
+    assert json.loads(path.read_text(encoding="utf-8"))["claudeAiOauth"]["refreshToken"] == "synthetic-rotated"
+    assert sorted(p.name for p in tmp_path.iterdir()) == [".credentials.json"]
+
+
+def test_with_a_long_lived_token_an_expired_sign_in_is_never_refreshed(tmp_path, paths):
+    # rotating Claude Code's refresh token would strand the one a running claude process holds
+    path = _creds(tmp_path, -60)
+    before = path.read_text(encoding="utf-8")
+    for _ in range(3):
+        r = collector.fetch_rate_limits(str(tmp_path))
+        assert r["source"] == "headers" and r["limits"] == [] and r["plan"] == "Ultra"
+    assert paths == [("headers", "synthetic-long-lived")] * 3  # no refresh, no OAuth call with a dead token
+    assert path.read_text(encoding="utf-8") == before
+
+
+def test_with_a_long_lived_token_a_sign_in_renewed_by_claude_code_is_used_again(tmp_path, paths):
+    _creds(tmp_path, -60)
+    assert collector.fetch_rate_limits(str(tmp_path))["source"] == "headers"
+    _creds(tmp_path, 3600)  # Claude Code refreshed its own sign-in meanwhile
+    assert collector.fetch_rate_limits(str(tmp_path))["source"] == "oauth"
+    assert paths == [("headers", "synthetic-long-lived"), ("oauth", "synthetic-oauth")]
+
+
+def test_no_credentials_file_uses_the_headers(tmp_path, paths):
+    (tmp_path / "claude-usage-token").write_text("synthetic-long-lived", encoding="utf-8")
+    r = collector.fetch_rate_limits(str(tmp_path))
+    assert paths == [("headers", "synthetic-long-lived")] and r["source"] == "headers"
+
+
+def test_a_429_on_oauth_pauses_it_instead_of_a_storm(tmp_path, paths):
+    _creds(tmp_path, 3600)
+    paths.replies["oauth"] = {"error": "Rate limited by the usage API. Retrying shortly."}
+    assert collector.fetch_rate_limits(str(tmp_path))["source"] == "headers"
+    for _ in range(3):  # the fetches inside the pause go straight to the headers
+        collector.fetch_rate_limits(str(tmp_path))
+    assert paths == [("oauth", "synthetic-oauth")] + [("headers", "synthetic-long-lived")] * 4
+    collector._oauth_paused_until = 0.0
+    paths.replies["oauth"] = PAYLOAD
+    assert collector.fetch_rate_limits(str(tmp_path))["source"] == "oauth"
+
+
+def test_any_oauth_failure_pauses_it_while_the_headers_can_stand_in(tmp_path, paths):
+    _creds(tmp_path, 3600)
+    paths.replies["oauth"] = {"error": "The usage API returned error 500."}
+    for _ in range(3):  # not an OAuth call and a headers call on every fetch
+        assert collector.fetch_rate_limits(str(tmp_path))["source"] == "headers"
+    assert paths == [("oauth", "synthetic-oauth")] + [("headers", "synthetic-long-lived")] * 3
+
+
+def test_without_a_long_lived_token_a_429_is_reported_and_other_errors_try_the_headers(tmp_path, paths):
+    _creds(tmp_path, 3600, long_lived=False)
+    paths.replies["oauth"] = {"error": "Rate limited by the usage API. Retrying shortly."}
+    assert collector.fetch_rate_limits(str(tmp_path))["error"].startswith("Rate limited")
+    assert paths == [("oauth", "synthetic-oauth")]
+    paths.clear()
+    paths.replies["oauth"] = {"error": "The usage API returned error 500."}
+    assert collector.fetch_rate_limits(str(tmp_path))["source"] == "headers"
+    assert paths == [("oauth", "synthetic-oauth"), ("headers", "synthetic-oauth")]  # Bearer via curl, not x-api-key

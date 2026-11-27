@@ -30,7 +30,9 @@ the prompt to the last main-thread reply before the next prompt, capped at
 Use one :class:`Ingestor` per worker thread: :meth:`Ingestor.index` for the
 first full pass (progress and cancel), then :meth:`Ingestor.tail` every
 refresh. ``tail`` only stats recently active files and directories and does a
-full walk every few minutes, so an idle tick costs a few milliseconds.
+full walk every few minutes, so an idle tick costs a few milliseconds. A
+cancelled pass is resumed by the next call, walk and file list included, and
+every call moves it on, so a pass slower than its deadline still finishes.
 """
 
 from __future__ import annotations
@@ -44,12 +46,16 @@ from datetime import datetime
 from typing import Callable, Optional
 
 from claude_usage import pricing, store
+from claude_usage.logging_setup import get_logger
 
 MAX_LINE = 8 << 20  # lines longer than this are skipped (huge pasted payloads)
 SPAN_CAP_MS = 30 * 60 * 1000
 HOT_SECONDS = 6 * 3600
 FULL_WALK_SECONDS = 300
 _BATCH = 5000
+# What a malformed record raises (a JSON object where an id goes, a count past 64 bits); a store fault does not.
+_BAD_FILE = (ValueError, TypeError, KeyError, OverflowError, sqlite3.IntegrityError, sqlite3.ProgrammingError,
+             sqlite3.DataError)
 
 HOME = os.path.expanduser("~")
 TEMP = tempfile.gettempdir()
@@ -181,6 +187,11 @@ class Ingestor:
         self._hot_dirs = set()
         self._hot_files = set()
         self._last_full = None
+        self._pass = None  # an index pass a cancel stopped: its walk stack, the files found, what is left to read
+        self._total = store.get_meta(conn, "transcripts_found", 0)  # the last full walk's count, for progress
+        # What a pass a restart cut short last showed, for the walk that resumes it; never more than the
+        # files read so far (a re-index forgets them all).
+        self._done = min(store.get_meta(conn, "transcripts_done", 0), len(self._files))
         self._known_sessions = set()
         self._open_turn = {}  # main transcript -> its open turn, so a turn read over two ticks stays one turn
         self._looked_ns = 0  # wall clock of the last directory look
@@ -192,40 +203,83 @@ class Ingestor:
 
     def index(self, progress: Optional[Callable[[int, int], None]] = None,
               cancel: Optional[Callable[[], bool]] = None) -> dict:
-        """Walk the whole tree and read every new or changed transcript."""
+        """Walk the whole tree and read every new or changed transcript.
+
+        A cancelled pass is kept: the next call goes on with the walk where it stopped, then with the
+        files it found, in order. Each call gets through at least one directory or one batch of a file
+        before it looks at ``cancel``, so a tree whose walk alone outlasts the deadline still gets read.
+        """
         t0 = time.perf_counter()
-        self._looked_ns = time.time_ns()
-        found = self._walk()
-        todo = sorted((p for p, st in found.items() if self._changed(p, st[:2])), key=lambda p: _order(p, found[p][2]))
+        ps = self._pass
+        if ps is None:
+            self._looked_ns = time.time_ns()
+            self._dirs.clear()
+            try:
+                self._dirs[self.root] = os.stat(self.root).st_mtime_ns
+                stack = [self.root]
+            except OSError:
+                stack = []
+            ps = self._pass = {"stack": stack, "found": {}, "known": 0, "todo": None, "next": 0}
+        found = ps["found"]
         calls = done = 0
-        cancelled = False
-        # Progress counts every transcript found, so a pass resumed after a restart goes on from where it was.
-        current = len(found) - len(todo)
+        walked = ps["todo"] is None  # this call does walking, which is progress of its own
+        cancelled = walked and not self._walk(ps, cancel)
+        if walked and not cancelled:
+            ps["todo"] = sorted((p for p, st in found.items() if self._changed(p, st[:2])),
+                                key=lambda p: _order(p, found[p][2]))
+            self._pick_hot(found)
+            if len(found) != self._total:
+                self._total = len(found)
+                store.set_meta(self.conn, "transcripts_found", self._total)
+        todo = ps["todo"]
+
+        def shown() -> tuple:
+            # Every transcript found counts, so a pass resumed after a restart goes on from where it was. While
+            # the walk runs it is the ones found unchanged so far, never under what the cut pass last showed,
+            # out of the last walk's total (the store keeps rows of transcripts Claude Code has since deleted).
+            if todo is not None:
+                return len(found) - len(todo) + ps["next"], len(found)
+            return max(ps["known"], self._done), max(len(found), self._total or len(self._files))
+
         if progress:
-            progress(current, len(found))
-        for rel in todo:
-            if cancel and cancel():
+            progress(*shown())
+        while todo is not None and ps["next"] < len(todo) and not cancelled:
+            if (walked or done) and cancel and cancel():
                 cancelled = True
                 break
-            calls += self._read(rel, *found[rel][:2], cancel=cancel)
-            done += 1
+            rel = todo[ps["next"]]
+            try:  # the walk can be minutes old: a live transcript grew since, maybe past where a cut left it
+                st = os.stat(os.path.join(self.root, rel))
+            except OSError:
+                st = None  # deleted by cleanup since the walk: nothing to read
+            if st is not None:
+                found[rel] = (st.st_size, st.st_mtime_ns, found[rel][2])
+                n = self._try_read(rel, *found[rel][:2], cancel=cancel)
+                done += 1
+                # A file that could not be opened (locked) is not recorded; the next walk retries it.
+                if n is not None and self._files.get(rel, found[rel])[0] != found[rel][0] and cancel and cancel():
+                    cancelled = True  # stopped inside this file: the next call goes on in it
+                    break
+                calls += n or 0
+            ps["next"] += 1
             if progress:
-                progress(current + done, len(found))
-            # A file that could not be opened (deleted by cleanup, locked) is not recorded; retried next pass.
-            if self._files.get(rel, found[rel])[0] != found[rel][0] and cancel and cancel():
-                cancelled = True  # stopped inside this file
-                break
-        self._last_full = self.clock()
-        self._pick_hot(found)
+                progress(*shown())
+        mark = shown()[0] if cancelled else 0
+        if mark != self._done:
+            self._done = mark
+            store.set_meta(self.conn, "transcripts_done", mark)
+        if not cancelled:
+            self._pass, self._last_full = None, self.clock()
         if store.rollup(self.conn):
             store.update_coverage(self.conn)
-        return {"files": len(found), "read": done, "todo": len(todo), "calls": calls,
+        return {"files": len(found), "read": done, "todo": len(todo or ()), "calls": calls,
                 "cancelled": cancelled, "ms": round((time.perf_counter() - t0) * 1000, 1), "full": True}
 
-    def tail(self) -> dict:
-        """Read what changed since the last call; cheap when nothing did."""
-        if self._last_full is None or self.clock() - self._last_full >= FULL_WALK_SECONDS:
-            return self.index()
+    def tail(self, cancel: Optional[Callable[[], bool]] = None) -> dict:
+        """Read what changed since the last call; cheap when nothing did. The full walk it does every few
+        minutes stops at ``cancel`` and goes on at the next call."""
+        if self._pass is not None or self._last_full is None or self.clock() - self._last_full >= FULL_WALK_SECONDS:
+            return self.index(cancel=cancel)
         t0 = time.perf_counter()
         # Directory mtimes move in clock ticks, so a file created just after our last look can leave the mtime
         # unchanged: a directory that changed shortly before (or since) that look is scanned again.
@@ -251,22 +305,19 @@ class Ingestor:
                 changed.append((_order(rel, _born(st)), rel, st.st_size, st.st_mtime_ns))
         calls = 0
         for _o, rel, size, mtime in sorted(changed):
-            calls += self._read(rel, size, mtime)
+            n = self._try_read(rel, size, mtime)
+            if n is None:
+                self._hot_files.discard(rel)  # left to the full walk, not retried every tick
+            calls += n or 0
         store.rollup(self.conn)
         return {"files": len(self._files), "read": len(changed), "calls": calls,
                 "ms": round((time.perf_counter() - t0) * 1000, 2), "full": False}
 
     # ------------------------------------------------------------ walking
 
-    def _walk(self) -> dict:
-        found = {}
-        self._dirs.clear()
-        cut = len(self.root) + 1
-        try:
-            self._dirs[self.root] = os.stat(self.root).st_mtime_ns
-        except OSError:
-            return found
-        stack = [self.root]
+    def _walk(self, ps: dict, cancel: Optional[Callable[[], bool]] = None) -> bool:
+        """Go on with the pass's walk; True once every directory has been listed."""
+        stack, found, cut = ps["stack"], ps["found"], len(self.root) + 1
         while stack:
             try:
                 it = os.scandir(stack.pop())
@@ -282,9 +333,12 @@ class Ingestor:
                         elif e.name.endswith(".jsonl"):
                             st = e.stat(follow_symlinks=False)
                             found[e.path[cut:]] = (st.st_size, st.st_mtime_ns, _born(st))
+                            ps["known"] += not self._changed(e.path[cut:], (st.st_size, st.st_mtime_ns))
                     except OSError:
                         continue
-        return found
+            if stack and cancel and cancel():  # after a directory, so every call lists one
+                return False
+        return True
 
     def _pick_hot(self, found: dict) -> None:
         cutoff = (self.clock() - HOT_SECONDS) * 1e9
@@ -322,6 +376,15 @@ class Ingestor:
         return old is None or (old[0], old[1]) != st
 
     # ------------------------------------------------------------ reading
+
+    def _try_read(self, rel: str, size: int, mtime: int, cancel: Optional[Callable[[], bool]] = None) -> Optional[int]:
+        """_read(), or None for a file that raised on a malformed record: it is logged and left for the next walk,
+        so it cannot hold up every file behind it. A store fault (locked, full, corrupt) still raises."""
+        try:
+            return self._read(rel, size, mtime, cancel)
+        except _BAD_FILE:
+            get_logger().exception("skipped %s until the next walk: a record the store cannot hold", rel)
+            return None
 
     def _read(self, rel: str, size: int, mtime: int, cancel: Optional[Callable[[], bool]] = None) -> int:
         old = self._files.get(rel)
