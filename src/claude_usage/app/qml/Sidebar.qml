@@ -12,34 +12,15 @@ Rectangle {
 
     color: Ui.p.sidebar
 
-    // A scoped snapshot only knows the selected project, so the list comes
-    // from the last unscoped snapshot of the same range, with the selected
-    // project's own row kept current.
-    property var lists: ({})
-    readonly property var projects: {
-        if (!snap) return []
-        var keep = snap.project ? lists[snap.range.key] : null
-        if (!keep) return snap.projects
-        var cur = snap.projects.filter(function (p) { return p.name === snap.project })[0]
-        return cur ? keep.map(function (p) { return p.name === cur.name ? Object.assign({}, cur, { color: p.color }) : p }) : keep
-    }
+    // The data layer lists every project for the range whatever the filter.
+    readonly property var projects: snap ? snap.projects : []
     readonly property var active: projects.filter(function (p) { return !p.idle }).sort(function (a, b) { return b.cost - a.cost || b.sessions - a.sessions })
     readonly property var idle: projects.filter(function (p) { return p.idle }).sort(function (a, b) { return b.cost - a.cost })
     readonly property string current: snap && snap.project ? snap.project : ""
-    // A session that moved between folders counts once per project, so the
-    // unfiltered snapshot's own total is the true "All projects" figure. A
-    // scoped snapshot lacks it, so remember it per range and leave it blank
-    // for a range not yet seen unscoped.
-    property var totals: ({})
-    onSnapChanged: if (snap && !snap.project) {
-        var t = totals, l = lists
-        t[snap.range.key] = snap.sessions_total
-        l[snap.range.key] = snap.projects
-        totals = t
-        lists = l
-    }
-    readonly property string total: !snap ? "" : snap.sessions_total_all != null ? Ui.int(snap.sessions_total_all)
-        : snap.range.key in totals ? Ui.int(totals[snap.range.key]) : ""
+    // counts are unknown, not 0, for a store from a newer version and before the first index reaches a session
+    readonly property bool noCounts: !!snap && (snap.now.error_kind === "store" || !!snap.status.indexing && !snap.sessions_total_all)
+    // a session that moved between folders counts once per project, so this is not their sum
+    readonly property string total: snap && !noCounts ? Ui.int(snap.sessions_total_all) : ""
     readonly property var status: snap ? snap.status : null
     // A busy month can touch a hundred folders; list the biggest and fold the rest.
     readonly property int topN: 8
@@ -83,7 +64,7 @@ Rectangle {
         NavItem { width: parent.width; text: "Overview"; glyph: ""; selected: side.page === "overview"; onClicked: side.navigate("overview") }
         NavItem {
             width: parent.width; text: "Sessions"; glyph: ""; selected: side.page === "sessions"
-            count: snap ? Ui.int(snap.sessions_total) : ""
+            count: snap && !side.noCounts ? Ui.int(snap.sessions_total) : ""
             onClicked: side.navigate("sessions")
         }
         NavItem { width: parent.width; text: "Settings"; glyph: ""; selected: side.page === "settings"; onClicked: side.navigate("settings") }
@@ -91,7 +72,7 @@ Rectangle {
         Item {
             width: parent.width; height: 24
             Txt { x: 12; height: parent.height; text: "PROJECTS"; font.pixelSize: 11; font.weight: 600; font.letterSpacing: 0.9; color: Ui.p.text_faint }
-            Txt { anchors.right: parent.right; anchors.rightMargin: 10; height: parent.height; text: side.snap ? side.active.length + " active" : ""; font.pixelSize: 12; color: Ui.p.text_faint }
+            Txt { anchors.right: parent.right; anchors.rightMargin: 10; height: parent.height; text: side.snap && !side.noCounts ? side.active.length + " active" : ""; font.pixelSize: 12; color: Ui.p.text_faint }
         }
     }
 
@@ -196,7 +177,8 @@ Rectangle {
         }
         Txt {
             x: 8; width: parent.width - 16
-            visible: !!side.status && !side.status.indexing
+            // nothing while the count is moving, or when the store could not be read
+            visible: !!side.status && !side.status.indexing && side.snap.now.error_kind !== "store"
             text: side.status ? "From " + Ui.int(side.status.transcripts) + " local transcripts" : ""
             font.pixelSize: 12; color: Ui.p.text_faint
         }

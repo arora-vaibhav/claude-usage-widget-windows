@@ -109,6 +109,28 @@ def test_fetch_oauth_usage_parses_curl_output(monkeypatch):
     assert r["weekly"]["pct"] == 0.44 and r["five_hour"] is None
 
 
+def test_tokens_go_to_curl_on_stdin_not_the_command_line(monkeypatch, tmp_path):
+    # Another local process can read a command line while curl runs.
+    seen = []
+
+    def run(args, **kw):
+        seen.append((args, kw.get("input") or ""))
+        return _Run(json.dumps(PAYLOAD), "200")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    collector._fetch_oauth_usage("synthetic-secret")
+    collector._fetch_unified_headers_via_messages("synthetic-secret")
+    creds = tmp_path / ".credentials.json"
+    creds.write_text(json.dumps({"claudeAiOauth": {"accessToken": "a", "refreshToken": "synthetic-refresh", "expiresAt": 0}}),
+                     encoding="utf-8")
+    monkeypatch.setattr(collector, "_LAST_REFRESH_ATTEMPT", 0.0)
+    collector._refresh_access_token_if_needed(str(creds))
+    assert len(seen) == 3
+    for args, stdin in seen:
+        assert not any("synthetic" in a for a in args) and "synthetic-" in stdin
+    assert [s.startswith("Authorization: Bearer ") for _a, s in seen] == [True, True, False]
+
+
 def test_fetch_errors_are_short_sentences(monkeypatch, tmp_path):
     # They reach the tray tooltip, the OSD and the app verbatim; the watchdog and the snapshot read them too.
     seen = []

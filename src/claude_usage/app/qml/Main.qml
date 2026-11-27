@@ -7,7 +7,8 @@ ApplicationWindow {
     width: 1280
     height: 820
     minimumWidth: 960
-    minimumHeight: 640
+    // under the screen's height at high scaling (1366x768 at 125% is 614 px)
+    minimumHeight: Math.min(640, Screen.desktopAvailableHeight - 40)
     visible: false
     title: snap && snap.project ? snap.project + " - Claude Usage" : "Claude Usage"
     color: Ui.p.bg
@@ -20,7 +21,7 @@ ApplicationWindow {
     // Height a page needs to show all of its content (full-page renders).
     readonly property real pageHeight: [overview.contentHeight, sessions.contentHeight, settings.contentHeight][pages.currentIndex]
 
-    function load() { root.snap = Ui.fixColors(JSON.parse(backend.snapshotJson)) }
+    function load() { root.snap = JSON.parse(backend.snapshotJson) }
     // a page opened from a shortcut or the menu takes the keys, so it scrolls
     function go(p) { root.page = p; pages.children[pages.currentIndex].forceActiveFocus() }
     Component.onCompleted: { load(); go(root.page) }

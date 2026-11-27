@@ -4,11 +4,9 @@ composited colours over any backdrop), never overlaps text and stays on the
 
 from __future__ import annotations
 
-import inspect
 import itertools
 import math
 import os
-import re
 import sys
 from datetime import datetime, timedelta
 from functools import lru_cache
@@ -24,7 +22,7 @@ from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, Qt, QVariantAnimatio
 from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from claude_usage import collector, osd, snapshot, tokens  # noqa: E402
+from claude_usage import osd, tokens  # noqa: E402
 from claude_usage.osd import EDGE_MARGIN, MIN_OPACITY, MIN_OPACITY_LIGHT, Osd, _clock, _pct, _when  # noqa: E402
 from claude_usage.widget import NEWER_STORE as NEWER  # noqa: E402  (the one error today that is not a fetch's)
 
@@ -53,7 +51,7 @@ def states(now: datetime | None = None) -> dict[str, dict]:
         "primary": "weekly", "weekly": week, "session": five, "today_cost": 82.4,
         "today_tokens": 1_234_567, "tokens_per_min": 0.0, "active_sessions": 1,
         "active_subagents": 0, "live": False, "state": "ok",
-        "as_of": iso(timedelta(seconds=-30)), "message": None,
+        "as_of": iso(timedelta(seconds=-30)), "message": None, "error_kind": None,
     }
     none = {"weekly": None, "session": None}
     return {
@@ -73,11 +71,12 @@ def states(now: datetime | None = None) -> dict[str, dict]:
         "no_5h": {**base, "session": None},
         "not_started": {**base, "session": meter(0.0, None)},
         "stale": {**base, "state": "stale", "as_of": iso(timedelta(minutes=-47)),
-                  "message": "Rate limited by the usage API"},
-        "signed_out": {**base, **none, "state": "signed_out", "as_of": None, "message": "No credentials found"},
-        "error": {**base, **none, "state": "error", "as_of": None, "message": "Network unreachable"},
+                  "message": "Rate limited by the usage API", "error_kind": "fetch"},
+        "signed_out": {**base, **none, "state": "signed_out", "as_of": None, "message": "No credentials found",
+                       "error_kind": "fetch"},
+        "error": {**base, **none, "state": "error", "as_of": None, "message": "Network unreachable", "error_kind": "fetch"},
         "error_with_data": {**base, "state": "error", "as_of": iso(timedelta(minutes=-47)),
-                            "message": "Network unreachable"},
+                            "message": "Network unreachable", "error_kind": "fetch"},
         "normal_eta_fast": {**base, "weekly": meter(0.46, timedelta(days=5, hours=17), timedelta(days=2, hours=3))},
         "wk_only_critical": {**base, "session": None,
                              "weekly": meter(0.93, timedelta(days=2, hours=4), timedelta(hours=9))},
@@ -94,11 +93,12 @@ def states(now: datetime | None = None) -> dict[str, dict]:
                              "session": meter(0.55, timedelta(hours=-1))},
         "stale_caution": {**base, "state": "stale", "as_of": iso(timedelta(minutes=-47)), "message": None,
                           "weekly": meter(0.78, timedelta(days=2, hours=4), timedelta(days=1, hours=2))},
-        "long_error": {**base, **none, "state": "error", "as_of": None,
+        "long_error": {**base, **none, "state": "error", "as_of": None, "error_kind": "fetch",
                        "message": "OAuth token expired; run claude login in a terminal, then wait for the next refresh"},
         "wk_only_limited": {**base, "session": None, "weekly": meter(1.0, timedelta(days=6, hours=23, minutes=50))},
         # Not a fetch failure: nothing retries, and the empty stand-in store's $0 is not today's cost.
-        "newer_store": {**base, **none, "state": "error", "as_of": None, "today_cost": 0.0, "message": NEWER},
+        "newer_store": {**base, **none, "state": "error", "as_of": None, "today_cost": 0.0, "message": NEWER,
+                        "error_kind": "store"},
     }
 
 
@@ -388,12 +388,17 @@ def test_only_fetch_errors_say_they_retry():
     assert not [t for t in newer if "reach" in t or "Retrying" in t or "$" in t], newer
     assert " ".join(it.text for it in make("newer_store").items() if it.role == "body") == NEWER
     assert make("newer_store").toolTip() == NEWER
-    assert "Limits unavailable" in texts("newer_store", "pill")
-    # Every fetch error the collector can return, however it is worded, is a sign-out or says it retries.
-    msgs = re.findall(r'\{"error": f?"([^"]+)"\}', inspect.getsource(collector))
-    assert len(msgs) >= 5, msgs
-    for msg in msgs + ["Collection error: TimeoutError"]:  # the last is the worker's own
-        assert snapshot._state({"error": msg}, 0)[0] == "signed_out" or osd._retries({"message": msg}), msg
+    assert "Update Claude Usage" in texts("newer_store", "pill") and "Limits unavailable" in texts("error", "pill")
+
+
+def test_while_indexing_the_card_does_not_show_a_partial_cost_as_today(monkeypatch):
+    w = Osd(style="card")
+    w.set_now(states()["normal"], {"done": 2371, "total": 12571})
+    texts = [it.text for it in w.items() if it.kind == "text"]
+    assert "Indexing 18%" in texts and not [t for t in texts if t.startswith("Today $")], texts
+    assert "Today $82.40 so far, indexing 2,371 of 12,571 transcripts" in w.toolTip()
+    w.set_now(states()["normal"])
+    assert "Today $82.40" in [it.text for it in w.items() if it.kind == "text"]
 
 
 def test_long_error_wraps_and_keeps_its_end():

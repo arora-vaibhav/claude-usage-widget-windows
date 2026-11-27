@@ -229,7 +229,9 @@ def test_index_reports_progress_and_can_be_cancelled(env):
     seen = []
     result = ingest.Ingestor(conn, root).index(progress=lambda d, t: seen.append((d, t)), cancel=lambda: len(seen) > 2)
     assert seen[0] == (0, 3) and result["cancelled"] and result["read"] == 2
-    assert ingest.Ingestor(conn, root).index()["read"] == 1  # picks up where it stopped
+    seen.clear()  # a restart picks up where it stopped, and so does the progress bar
+    assert ingest.Ingestor(conn, root).index(progress=lambda d, t: seen.append((d, t)))["read"] == 1
+    assert seen == [(2, 3), (3, 3)]
 
 
 @pytest.mark.parametrize("cwd,name", [

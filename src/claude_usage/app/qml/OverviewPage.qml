@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Templates as T
 
 // How am I doing right now, and over this range.
 Page {
@@ -16,6 +17,10 @@ Page {
     // the first limits fetch has not answered yet: placeholders, not "not reported"
     readonly property bool pending: !!st && st.state === "loading" && !(snap.limits && snap.limits.weekly)
     readonly property bool empty: !!snap && snap.sessions_total === 0
+    // a store from a newer version: nothing is read, and neither refreshing nor waiting helps
+    readonly property bool storeErr: !!snap && snap.now.error_kind === "store"
+    // a binding 5-hour limit leads in the plan limits' header (the layout stays weekly-first)
+    readonly property var hot: snap && snap.limits.session && (snap.limits.session.level === "critical" || snap.limits.session.level === "limited") ? snap.limits.session : null
     readonly property var ix: st ? st.indexing : null
     readonly property var limitsAsOf: st && st.limits_as_of ? Ui.date(st.limits_as_of) : null
     readonly property string plan: st && st.plan ? st.plan : ""
@@ -27,7 +32,8 @@ Page {
         else if (!ixStart || ix.done < ixStart.done) ixStart = { done: ix.done, t: Date.now() }
     }
     readonly property string ixLeft: {
-        if (!ix || !ixStart || ix.done <= ixStart.done || nowMs - ixStart.t < 10000) return ""
+        // early transcripts vary too much in size for a fair rate: wait for 5% and 30 s of progress
+        if (!ix || !ixStart || ix.done - ixStart.done < ix.total * 0.05 || nowMs - ixStart.t < 30000) return ""
         var left = (ix.total - ix.done) / (ix.done - ixStart.done) * (nowMs - ixStart.t)
         return left < 60000 ? "Under a minute left" : "About " + Ui.span(left) + " left"
     }
@@ -35,7 +41,9 @@ Page {
     title: snap && snap.project ? snap.project : "All projects"
     subtitle: {
         if (!snap) return "Loading your usage"
-        var r = snap.range, txt = Ui.plural(snap.sessions_total, "session")
+        if (storeErr) return ""
+        // no count while the first index has not reached a session yet
+        var r = snap.range, txt = ix && !snap.sessions_total ? "Counting sessions" : Ui.plural(snap.sessions_total, "session")
         if (r.key === "all") return txt + " since " + Ui.md(Ui.date(r.from)) + ", " + Ui.date(r.from).getFullYear()
         var f = Ui.date(r.from), t = Ui.date(r.to)
         return txt + " in the " + r.label + (r.key === "24h" ? "" : ", " + Ui.md(f) + " to " + Ui.md(t))
@@ -63,6 +71,7 @@ Page {
         property string glyph: ""
         property string head: ""
         property string body: ""
+        property bool canRefresh: true
         height: Math.max(112, txt.implicitHeight + 2 * padding)
         Rectangle {
             anchors.verticalCenter: parent.verticalCenter
@@ -72,12 +81,12 @@ Page {
         Column {
             id: txt
             x: 68; anchors.verticalCenter: parent.verticalCenter
-            width: parent.width - 68 - refresh.width - 24
+            width: parent.width - 68 - (refresh.visible ? refresh.width + 24 : 0)
             spacing: 6
             Txt { width: parent.width; text: nc.head; font.pixelSize: 15; font.weight: 600 }
             Txt { width: parent.width; text: nc.body; wrapMode: Text.WordWrap; elide: Text.ElideNone; color: Ui.p.text_muted }
         }
-        Btn { id: refresh; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; text: "Refresh"; glyph: "\ue72c"; primary: true; onClicked: backend.refresh() }
+        Btn { id: refresh; visible: nc.canRefresh; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; text: "Refresh"; glyph: "\ue72c"; primary: true; onClicked: backend.refresh() }
     }
 
     // ---- first run: building the history
@@ -99,7 +108,7 @@ Page {
                 text: "Reading your Claude Code transcripts once, so your usage stays after Claude Code cleans them up."
             }
         }
-        Txt { id: pctBig; anchors.right: parent.right; height: 40; text: Ui.pct(indexing.frac); display: true; font.pixelSize: 28; font.weight: 600 }
+        Txt { id: pctBig; anchors.right: parent.right; height: 40; text: Math.floor(indexing.frac * 100) + "%"; display: true; font.pixelSize: 28; font.weight: 600 }  // floored, as the OSD and menu say it
         Rectangle {
             y: 56; width: parent.width; height: 6; radius: 3; color: Ui.p.track
             Rectangle {
@@ -129,8 +138,10 @@ Page {
                    + (page.limitsAsOf && !page.stale ? ", as of " + Ui.clock(page.limitsAsOf) : "")
                    + (page.snap && page.snap.project ? ". Limits are not split by project." : ".")
             pill: page.stale ? "Not refreshed since " + (page.limitsAsOf ? Ui.whenShort(page.limitsAsOf) : "a while")
-                  : page.st && page.st.state === "error" && !page.failed ? "Could not refresh" : ""
-            pillKind: "warn"
+                  : page.st && page.st.state === "error" && !page.failed ? "Could not refresh"
+                  : page.hot ? (page.hot.level === "limited" ? "5-hour limit reached" : "5-hour limit at " + Ui.pct(page.hot.pct))
+                               + (page.hot.resets_at ? ", resets " + Ui.clock(Ui.date(page.hot.resets_at)) : "") : ""
+            pillKind: page.stale || page.st && page.st.state === "error" ? "warn" : "bad"
             note: pill !== "" && page.st && page.st.message ? Ui.sentence(page.st.message) : ""
         }
         Notice {
@@ -145,7 +156,8 @@ Page {
             width: page.cw
             kind: "bad"; glyph: "\ue783"
             head: "Couldn't load your plan limits"
-            body: (page.st && page.st.message ? Ui.sentence(page.st.message) : "The usage service did not answer.") + " Your usage history below still works."
+            body: (page.st && page.st.message ? Ui.sentence(page.st.message) : "The usage service did not answer.") + (page.storeErr ? "" : " Your usage history below still works.")
+            canRefresh: !page.storeErr
         }
         Item {
             id: limitsRow
@@ -175,6 +187,8 @@ Page {
                 id: other
                 limits: page.snap ? page.snap.limits : null
                 plan: page.plan
+                session: page.snap ? page.snap.now.session : null
+                nowMs: page.nowMs
                 x: past.x + past.width + Ui.gap
                 y: past.y
                 width: limitsRow.wide ? page.cw - week.width - past.width - 2 * Ui.gap : (page.cw - Ui.gap) / 2
@@ -212,18 +226,19 @@ Page {
                 // nothing yet because the first index is still running, not because nothing ran
                 Txt {
                     anchors.horizontalCenter: parent.horizontalCenter
-                    text: page.ix ? "Still reading your transcripts" : "No activity " + Ui.inRange(page.range)
+                    text: page.storeErr ? "Usage history unavailable" : page.ix ? "Still reading your transcripts" : "No activity " + Ui.inRange(page.range)
                     font.pixelSize: 15; font.weight: 600
                 }
                 Txt {
                     anchors.horizontalCenter: parent.horizontalCenter
                     color: Ui.p.text_muted
-                    text: page.ix ? Ui.int(page.ix.done) + " of " + Ui.int(page.ix.total) + " so far. Usage shows up here as they are indexed."
+                    text: page.storeErr ? "Usage shows again after you update Claude Usage."
+                        : page.ix ? Ui.int(page.ix.done) + " of " + Ui.int(page.ix.total) + " so far. Usage shows up here as they are indexed."
                         : page.snap && page.snap.project ? page.snap.project + " has no sessions in this range." : "No Claude Code sessions in this range."
                 }
                 Item { width: 1; height: 6 }
                 Btn {
-                    visible: !page.ix && !!page.range && page.range.key !== "all"
+                    visible: !page.ix && !page.storeErr && !!page.range && page.range.key !== "all"
                     anchors.horizontalCenter: parent.horizontalCenter
                     text: "Show all time"
                     onClicked: backend.setRange("all")
@@ -321,6 +336,7 @@ Page {
         ActivityCard {
             id: act
             act: page.snap ? page.snap.activity : null
+            range: page.range
             x: lower.wide ? sessCard.width + Ui.gap : 0
             y: lower.wide ? 0 : sessCard.height + Ui.gap
             width: lower.wide ? page.cw - sessCard.width - Ui.gap : page.cw
@@ -335,19 +351,51 @@ Page {
         split: page.snap ? page.snap.cost_split : null
         range: page.range
     }
+    // One line on what cost means; the rest of the note and the coverage behind "About this data".
     Column {
-        visible: !!page.snap
+        id: foot
+        visible: !!page.snap && !page.storeErr
         width: page.cw
         spacing: 4
         topPadding: 4
+        property bool open: false
+        readonly property string note: backend.costNote
+        readonly property int cut: note.indexOf("It is not a bill.") >= 0 ? note.indexOf("It is not a bill.") + 17 : note.length
         Txt {
             width: parent.width
             wrapMode: Text.WordWrap; elide: Text.ElideNone
             font.pixelSize: 12; color: Ui.p.text_faint
-            text: backend.costNote
+            text: foot.note.slice(0, foot.cut)
+        }
+        T.AbstractButton {
+            id: about
+            x: -6
+            width: aboutRow.implicitWidth + 12; height: 28
+            hoverEnabled: true
+            text: "About this data"
+            onClicked: foot.open = !foot.open
+            Accessible.role: Accessible.Button
+            Accessible.name: text + (foot.open ? ", expanded" : ", collapsed")
+            contentItem: Item {
+                Row {
+                    id: aboutRow
+                    x: 6; height: parent.height
+                    spacing: 6
+                    Txt { height: parent.height; text: about.text; font.pixelSize: 12; color: about.hovered ? Ui.p.text : Ui.p.text_muted }
+                    Icon { height: parent.height; glyph: foot.open ? "" : ""; font.pixelSize: 10; color: about.hovered ? Ui.p.text : Ui.p.text_muted }
+                }
+            }
+            background: Rectangle { radius: 6; color: about.hovered ? Ui.alpha(Ui.p.text, 0.05) : "transparent"; Focus { show: about.visualFocus; r: 6 } }
         }
         Txt {
-            visible: !!(page.st && (page.st.coverage_from || page.st.legacy_before))
+            visible: foot.open && text !== ""
+            width: parent.width
+            wrapMode: Text.WordWrap; elide: Text.ElideNone
+            font.pixelSize: 12; color: Ui.p.text_faint
+            text: foot.note.slice(foot.cut).trim()
+        }
+        Txt {
+            visible: foot.open && !!(page.st && (page.st.coverage_from || page.st.legacy_before))
             width: parent.width
             wrapMode: Text.WordWrap; elide: Text.ElideNone
             font.pixelSize: 12; color: Ui.p.text_faint
@@ -355,7 +403,7 @@ Page {
                 if (!page.st) return ""
                 var s = [], c = page.st.coverage_from ? Ui.date(page.st.coverage_from + "T12:00:00") : null
                 if (c) s.push("Full detail from " + Ui.md(c) + ", " + c.getFullYear() + ".")
-                if (page.st.legacy_before) s.push((c ? "Earlier days" : "Some days") + " come from the old widget's daily totals, with cost and tokens only, and usually read lower.")
+                if (page.st.legacy_before) s.push((c ? "Earlier days" : "Some days") + " are old daily totals, with cost and tokens only, and usually read lower.")
                 return s.join(" ")
             }
         }

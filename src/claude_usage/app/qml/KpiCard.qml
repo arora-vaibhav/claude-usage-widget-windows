@@ -13,35 +13,45 @@ Card {
     implicitHeight: 156
 
     // the headline counts to a new value when the range or project changes
-    property real shown: k ? k.value : 0
+    // (a null value is a cache hit rate with no prompt tokens: undefined, shown as n/a)
+    property real shown: k && k.value != null ? k.value : 0
     Behavior on shown { id: countUp; NumberAnimation { duration: Ui.ms(300); easing.type: Easing.OutCubic } }
     property string shownKey: ""
     onKChanged: {
         if (!k) return
         countUp.enabled = shownKey === k.key
-        shown = k.value
+        shown = k.value != null ? k.value : 0
         countUp.enabled = true
         shownKey = k.key
     }
 
     readonly property var delta: {
         if (!k || k.delta == null || k.prev == null) return null
-        var d, txt
+        var d, num, unit
         if (k.delta_unit === "pts") {
             d = (k.value - k.prev) * 100
-            txt = (Math.abs(d) < 0.05 ? "" : d > 0 ? "↑" : "↓") + Math.abs(d).toFixed(1) + "pt"
+            num = Math.abs(d).toFixed(1); unit = ["pt", " points"]
         } else {
             if (!k.prev) return null
             d = (k.value - k.prev) / k.prev * 100
-            var m = Math.abs(d)
-            txt = (m < 0.05 ? "" : d > 0 ? "↑" : "↓") + (m < 10 ? m.toFixed(1) : Ui.int(m)) + "%"
+            var m = Math.abs(d), times = k.value / k.prev
+            // a five-digit percentage reads as a glitch; past ten times, say how many times
+            if (times > 10) { num = Ui.int(times); unit = ["x", " times"] }
+            else { num = m < 10 ? m.toFixed(1) : Ui.int(m); unit = ["%", "%"] }
         }
+        var flat = Math.abs(d) < 0.05
+        // the chip shows an arrow; a screen reader says the word
+        var txt = (flat ? "" : d > 0 ? "↑" : "↓") + num + unit[0]
+        var spoken = (flat ? "" : d > 0 ? "up " : "down ") + num + unit[1]
         // colour only where the direction is good or bad: spend up is a caution
         var kind = "none"
         if (k.key === "cost" && Math.abs(d) >= 1) kind = d > 0 ? "warn" : "ok"
         if (k.key === "cache_hit" && Math.abs(d) >= 0.05) kind = d > 0 ? "ok" : "warn"
-        return { text: txt, kind: kind }
+        return { text: txt, spoken: spoken, kind: kind }
     }
+    // nothing in the previous stretch to compare with: say so rather than a bare "vs prior 7 days"
+    // (a null prev here is a cache hit rate over a stretch with no prompts; other notes do not start "vs prior")
+    readonly property string note: !k ? "" : !k.prev && k.delta == null ? k.note.replace(/^vs prior/, "none in the prior") : k.note
     readonly property var values: {
         if (!k) return []
         var v = k.series.slice(0, dropLast && k.series.length > 2 ? k.series.length - 1 : k.series.length)
@@ -92,7 +102,7 @@ Card {
         Txt {
             width: parent.width
             height: 38
-            text: card.k ? Ui.fmt(card.k.format, card.shown) : ""
+            text: card.k ? Ui.fmt(card.k.format, card.k.value == null ? null : card.shown) : ""
             display: true
             fontSizeMode: Text.HorizontalFit
             minimumPixelSize: 18
@@ -119,9 +129,9 @@ Card {
                 visible: card.width >= 150
                 height: 20
                 width: Math.min(implicitWidth, card.width - 40 - (card.delta ? dl.implicitWidth + 18 : 0))
-                text: card.k ? card.k.note : ""
+                text: card.note
                 font.pixelSize: 12
-                color: Ui.p.text_faint
+                color: Ui.p.text_muted  // faint reads under 4.5:1 on the tinted card
             }
         }
     }
@@ -197,5 +207,5 @@ Card {
     Focus { show: card.activeFocus; r: Ui.radius }
     ChartTip { id: tip }
     Accessible.role: Accessible.StaticText
-    Accessible.name: k ? k.label + " " + Ui.fmt(k.format, k.value) + (delta ? ", " + delta.text + " " + k.note : "") : ""
+    Accessible.name: k ? k.label + " " + Ui.fmt(k.format, k.value) + (delta ? ", " + delta.spoken + " " + k.note : note !== k.note ? ", " + note : "") : ""
 }

@@ -132,15 +132,15 @@ Item {
     Rectangle { x: xL; width: xR - xL; y: Math.round(py(0.5)); height: 1; color: Ui.p.line; visible: c.ok }
     Rectangle { x: xL; width: xR - xL; y: Math.round(py(1)); height: 1; color: Ui.p.line_strong; visible: c.ok }
     Rectangle { x: xL; width: xR - xL; y: Math.round(base); height: 1; color: Ui.p.line_strong; visible: c.ok }
-    Txt { visible: c.ok; x: xR + 8; y: py(1) - 8; height: 16; text: "100%"; font.pixelSize: 11; color: Ui.p.text_faint }
-    Txt { visible: c.ok; x: xR + 8; y: py(0.5) - 8; height: 16; text: "50%"; font.pixelSize: 11; color: Ui.p.text_faint }
+    Txt { visible: c.ok; x: xR + 8; y: py(1) - 8; height: 16; text: "100%"; font.pixelSize: 12; color: Ui.p.text_faint }
+    Txt { visible: c.ok; x: xR + 8; y: py(0.5) - 8; height: 16; text: "50%"; font.pixelSize: 12; color: Ui.p.text_faint }
     Repeater {
         objectName: "weekDays"
         model: c.days.length
         Item {
             readonly property var d: c.days[index] || { x: 0, cx: 0, label: "" }
             Rectangle { x: parent.d.x; y: c.base; width: 1; height: 4; color: Ui.p.line_strong }
-            Txt { x: parent.d.cx - width / 2; y: c.base + 8; height: 16; text: parent.d.label; font.pixelSize: 11; color: Ui.p.text_faint }
+            Txt { x: parent.d.cx - width / 2; y: c.base + 8; height: 16; text: parent.d.label; font.pixelSize: 12; color: Ui.p.text_faint }
         }
     }
 

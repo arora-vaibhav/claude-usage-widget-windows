@@ -51,7 +51,7 @@ Card {
             Item {
                 id: mrow
                 readonly property var m: card.models[index] || { name: "", id: "", color: -1, priced: "exact", cost: 0, share: 0, output: 0, cache_hit: null, calls: 0 }
-                // the old daily rollup has cost and tokens only, so its output and cache hit are unknown
+                // the old daily totals have cost and tokens only, so their output, cache hit and calls are unknown
                 readonly property bool legacy: m.id === "legacy"
                 width: tbl.width; height: 42
                 Rectangle { width: parent.width; height: 1; color: Ui.p.line }
@@ -60,7 +60,7 @@ Card {
                     spacing: 10
                     Rectangle { anchors.verticalCenter: parent.verticalCenter; width: 10; height: 10; radius: 3; color: Ui.seriesColor(mrow.m.color) }
                     Txt { height: parent.height; text: mrow.m.name; width: Math.min(implicitWidth, tbl.width - 390 - 80) }
-                    Tag { visible: mrow.m.priced !== "exact"; anchors.verticalCenter: parent.verticalCenter; text: mrow.legacy ? "old rollup" : mrow.m.priced === "family" ? "estimated" : "no price" }
+                    Tag { visible: mrow.m.priced !== "exact" && !mrow.legacy; anchors.verticalCenter: parent.verticalCenter; text: mrow.m.priced === "family" ? "estimated" : "no price" }
                 }
                 Row {
                     anchors.right: parent.right
@@ -71,7 +71,7 @@ Card {
                             width: card.cols[index][1]; height: 42
                             horizontalAlignment: Text.AlignRight
                             text: [Ui.cents(mrow.m.cost), Ui.share(mrow.m.share || (mrow.m.cost > 0 ? 1e-6 : 0)), mrow.legacy ? "-" : Ui.tok(mrow.m.output),
-                                   mrow.legacy ? "-" : Ui.pct(mrow.m.cache_hit, 1), Ui.int(mrow.m.calls)][index]
+                                   mrow.legacy ? "-" : Ui.pct(mrow.m.cache_hit, 1), mrow.legacy ? "-" : Ui.int(mrow.m.calls)][index]
                             font.weight: index === 0 ? 600 : 400
                             color: text === "n/a" || text === "-" ? Ui.p.text_faint : Ui.p.text
                         }
@@ -88,7 +88,7 @@ Card {
             font.pixelSize: 12; color: Ui.p.text_faint
             text: [kinds.indexOf("family") >= 0 ? "Estimated: priced at its model family's published rate." : "",
                    kinds.indexOf("unpriced") >= 0 ? "No price: the model is not in the price table yet." : "",
-                   kinds.indexOf("legacy") >= 0 ? "Old rollup: days from the old daily rollup, with cost and tokens only." : ""]
+                   kinds.indexOf("legacy") >= 0 ? "Old daily totals: days before transcript detail, with cost and tokens only." : ""]
                   .filter(function (x) { return x }).join(" ")
         }
     }
@@ -129,6 +129,14 @@ Card {
                     }
                 }
             }
+        }
+        Txt {
+            // the old daily totals have no token split, so the tiles and the saving leave those days out
+            visible: card.models.some(function (m) { return m.id === "legacy" })
+            width: parent.width
+            wrapMode: Text.WordWrap; elide: Text.ElideNone
+            font.pixelSize: 12; color: Ui.p.text_faint
+            text: "Split and savings cover transcript days only; old daily totals have cost and tokens only."
         }
         Rectangle {
             visible: !!card.split && card.split.caching_saved > 0

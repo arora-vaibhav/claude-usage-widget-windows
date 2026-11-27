@@ -238,7 +238,23 @@ def test_five_hour_projected_to_run_out_first_is_primary(built):
     lim = dict(limits, five_hour={"pct": 0.8, "resets_at": NOW + 2 * 3600, "severity": None})
     now = snapshot.now_state(conn, lim, NOW)
     assert now["primary"] == "session" and now["session"]["pct"] == 0.8
-    assert now["session"]["forecast"].startswith("Limit ")
+    assert now["session"]["forecast"].startswith("At this pace the limit is reached ")
+
+
+def test_limits_say_how_they_were_fetched(built):
+    conn, limits = built
+    assert snapshot.build(conn, "7d", None, NOW, limits)["limits"]["source"] == "oauth"
+    headers = dict(limits, source="headers", limits=[], surfaces=[], extra_usage=None)
+    assert snapshot.build(conn, "7d", None, NOW, headers)["limits"]["source"] == "headers"
+    assert snapshot.build(conn, "7d", None, NOW, None)["limits"]["source"] is None
+
+
+def test_a_range_without_calls_has_no_cache_hit_rate(built):
+    conn, limits = built
+    snap = snapshot.build(conn, "24h", None, NOW + 400 * 86400, limits)
+    kpi = {k["key"]: k for k in snap["kpis"]}
+    assert kpi["tokens"]["value"] == 0 and kpi["cache_hit"]["value"] is None  # undefined, not 0%
+    snapshot_contract.check(snap)
 
 
 def test_pace_engine(built):
@@ -368,3 +384,37 @@ def test_without_a_reset_time_the_week_in_progress_is_not_a_past_week(tmp_path):
     snap = snapshot.build(conn, "7d", None, NOW, lim)
     snapshot_contract.check(snap)
     assert [(round(w["peak"], 2), w["current"]) for w in snap["limits"]["past_weeks"]] == [(0.66, False)]
+
+
+@pytest.mark.parametrize("rng", list(snapshot.RANGES))
+def test_the_project_list_is_the_same_whatever_the_filter(built, rng):
+    # The sidebar lists every project active in the range; a project's view once marked the rest idle.
+    conn, limits = built
+    full = snapshot.build(conn, rng, None, NOW, limits)
+    active = [p for p in full["projects"] if not p["idle"]]
+    assert len(active) > 1
+    scoped = snapshot.build(conn, rng, active[-1]["name"], NOW, limits)
+    assert scoped["projects"] == full["projects"]
+    assert scoped["sessions_total_all"] == full["sessions_total_all"] == full["sessions_total"]
+    assert scoped["sessions_total"] < full["sessions_total"]
+
+
+def test_only_a_store_error_is_not_a_fetch_error(built):
+    conn, limits = built
+    assert snapshot.now_state(conn, limits, NOW)["error_kind"] is None
+    assert snapshot.now_state(conn, dict(limits, error="Network unreachable"), NOW)["error_kind"] == "fetch"
+    assert snapshot.now_state(conn, {"error": "Newer store", "error_kind": "store"}, NOW)["error_kind"] == "store"
+
+
+def test_the_longest_session_says_when_it_began_before_the_range(tmp_path):
+    root = str(tmp_path / "projects")
+    write(root, "C--work-x/s1.jsonl", [asst("m1", _iso(datetime(2026, 11, 10, 9, 0))),
+                                       prompt("p1", _iso(datetime(2026, 11, 20, 13, 50))),
+                                       asst("m2", _iso(datetime(2026, 11, 20, 14, 0)))])
+    conn = store.connect(str(tmp_path / "usage.db"))
+    now = datetime(2026, 11, 20, 15, 0).timestamp()
+    ingest.Ingestor(conn, root, clock=lambda: now).index()
+    facts = {f["label"]: f for f in snapshot.build(conn, "7d", None, now, None)["activity"]["facts"]}
+    assert facts["Longest session"]["detail"] == "acme-api, started Nov 10"  # its 10 minutes are the part in range
+    facts = {f["label"]: f for f in snapshot.build(conn, "all", None, now, None)["activity"]["facts"]}
+    assert facts["Longest session"]["detail"] == "acme-api, Nov 10"

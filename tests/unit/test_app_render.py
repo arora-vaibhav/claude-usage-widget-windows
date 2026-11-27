@@ -113,6 +113,16 @@ STATES = {
     "empty": lambda s: (s.update(sessions=[], sessions_total=0, project="nothing-here"),
                         [g["values"][m].__setitem__(i, [0] * len(g["values"][m][i]))
                          for g in s["timeline"]["by"].values() for m in g["values"] for i in range(len(g["values"][m]))]),
+    "5h_critical": lambda s: (s["limits"].update(session={"pct": 0.93, "resets_at": s["range"]["to"], "level": "critical"}),
+                              s["now"].update(session={"pct": 0.93, "resets_at": s["range"]["to"], "level": "critical",
+                                                       "forecast": "Limit 3:27 AM", "eta": s["range"]["to"]})),
+    # a store from a newer version: the widget builds from an empty stand-in store
+    "newer_store": lambda s: (STATES["limits_failed"](s), STATES["empty"](s), s.update(project=None),
+                              s["status"].update(message="Your usage store is from a newer version of Claude Usage. "
+                                                         "Update to see your usage.", transcripts=0),
+                              s["now"].update(state="error", error_kind="store")),
+    "first_week": lambda s: s["limits"].update(past_weeks=[dict(s["limits"]["past_weeks"][-1], current=True)],
+                                               weeks_hit=0, weeks_counted=0),
 }
 
 
@@ -264,19 +274,18 @@ def test_top_sessions_come_from_the_whole_range(h):
     assert h.win.warnings[seen:] == []
 
 
-def test_all_projects_count_is_not_carried_across_ranges(h):
+def test_all_projects_count_comes_from_the_snapshot(h):
     side = find(h.win, "Sidebar")[0]
-    h.win.update_snapshot(h.snap)
-    pump(30)
-    assert side.property("total") == f"{h.snap['sessions_total']:,}"
     scoped = copy.deepcopy(h.snap)
     scoped.update(project="some-project", sessions_total=3)
-    scoped["range"]["key"] = "all"
     h.win.update_snapshot(scoped)
     pump(30)
-    assert side.property("total") == ""  # all time never seen unscoped
-    h.win.update_snapshot(h.snap)
-    pump(30)
+    try:
+        # every project's sessions, not the selected project's
+        assert side.property("total") == f"{h.snap['sessions_total_all']:,}"
+    finally:
+        h.win.update_snapshot(h.snap)
+        pump(30)
 
 
 def test_headline_numbers_fit_at_the_minimum_size(h):
@@ -497,28 +506,44 @@ def test_keys_scroll_the_page_and_keep_focus_in_view(h):
         pump(60)
 
 
-def test_selecting_a_project_keeps_the_project_list(h):
-    side = find(h.win, "Sidebar")[0]
-    h.win.update_snapshot(h.snap)
-    pump(30)
-    before = [p["name"] for p in js(side.property("listed"))]
-    # Lists colour only what the chart draws; the rest are in "Other".
+def test_lists_colour_only_what_the_chart_draws(h):
     shown = js(h.win.window.property("snap"))
     g = shown["timeline"]["by"]["project"]
     drawn = dict(zip(g["keys"], g["colors"]))
     assert all(p["color"] == drawn.get(p["name"], -1) for p in shown["projects"])
-    # a scoped snapshot only knows its own project
-    scoped = copy.deepcopy(h.snap)
-    name = before[1]
-    scoped["project"] = name
-    scoped["projects"] = [dict(p, idle=p["name"] != name) for p in scoped["projects"]]
-    h.win.update_snapshot(scoped)
-    pump(30)
+    assert all(x["color"] == drawn.get(x["project"], -1) for x in shown["sessions"] + shown["top_sessions"])
+
+
+def test_a_range_switch_with_a_project_selected_keeps_every_active_project(tmp_path):
+    # A project's snapshot once listed only that project; the sidebar then kept a list
+    # from the same range unfiltered, so another range showed everything else as idle.
+    sys.path.insert(0, str(FIXTURES))
+    import make_store
+    from claude_usage import snapshot
+    conn, limits = make_store.build_store(str(tmp_path))
+    win = AppWindow(lambda r, p: snapshot.build(conn, r, p, make_store.NOW, limits), settings={"appearance": "light"})
     try:
-        assert [p["name"] for p in js(side.property("listed"))] == before
+        win.window.resize(1280, 820)
+        win.show()
+        win.update_snapshot(snapshot.build(conn, "7d", None, make_store.NOW, limits))
+        pump(60)
+        side = find(win, "Sidebar")[0]
+        name = js(side.property("active"))[-1]["name"]
+        win.backend.setProject(name)
+        pump(120)
+        for rng in ("90d", "24h", "all"):
+            win.backend.setRange(rng)
+            pump(120)
+            want = snapshot.build(conn, rng, None, make_store.NOW, limits)
+            assert js(win.window.property("snap"))["project"] == name
+            active = sorted(p["name"] for p in want["projects"] if not p["idle"])
+            assert len(active) > 1 and sorted(p["name"] for p in js(side.property("active"))) == active, rng
+            assert side.property("total") == f"{want['sessions_total']:,}"
+        assert win.warnings == []
     finally:
-        h.win.update_snapshot(h.snap)
-        pump(30)
+        win.prepare_quit()
+        win.window.close()
+        conn.close()
 
 
 def test_close_hides_and_remembers_geometry(h):
@@ -639,6 +664,141 @@ def test_ultra_has_no_5_hour_limit_and_weekly_leads(h):
     finally:
         h.win.update_snapshot(h.snap)
         pump(30)
+
+
+def test_a_store_from_a_newer_version_does_not_promise_history(h):
+    try:
+        texts = show_state(h, "newer_store")
+        assert "Usage shows again after you update Claude Usage." in texts, texts
+        assert not any("still works" in t or t.startswith("No activity") or "sessions in the" in t for t in texts), texts
+        page = find(h.win, "OverviewPage")[0]
+        shown = [b.property("text") for b in find_in(page, "Btn") if b.isVisible()]
+        assert "Refresh" not in shown and "Show all time" not in shown, shown
+        assert not [t for t in visible_texts(h.win, "Sidebar") if "local transcripts" in t]
+        assert not [t for t in texts if "It is not a bill." in t], texts  # no cost note over no usage
+        # its counts are unknown, not 0
+        assert not [t for t in visible_texts(h.win, "Sidebar") if t == "0" or t.endswith(" active")]
+        h.win.backend.pageRequested.emit("sessions")
+        pump(60)
+        assert "Session history unavailable. It shows again after you update Claude Usage." in visible_texts(h.win, "SessionsPage")
+        assert find(h.win, "SessionsPage")[0].property("subtitle") == ""
+    finally:
+        h.win.update_snapshot(h.snap)
+        pump(30)
+
+
+def test_the_sessions_page_says_the_first_index_is_still_reading(h):
+    snap = copy.deepcopy(h.snap)
+    STATES["empty"](snap)
+    snap["project"] = None
+    snap["status"]["indexing"] = {"done": 412, "total": 12512}
+    try:
+        h.win.update_snapshot(snap)
+        h.win.backend.pageRequested.emit("sessions")
+        pump(60)
+        texts = visible_texts(h.win, "SessionsPage")
+        assert find(h.win, "SessionsPage")[0].property("subtitle").startswith("Counting sessions in the last 7 days")
+        assert any(t.startswith("Still reading your transcripts (412 of 12,512).") for t in texts), texts
+        assert not [t for t in texts if t.startswith(("Showing ", "No sessions"))], texts
+    finally:
+        h.win.update_snapshot(h.snap)
+        h.win.backend.pageRequested.emit("overview")
+        pump(60)
+
+
+def test_kpis_read_plainly_at_the_edges(h):
+    # no use in the prior stretch, a many-fold jump, and a cache hit rate with nothing to rate
+    snap = copy.deepcopy(h.snap)
+    k = {x["key"]: x for x in snap["kpis"]}
+    assert k["tokens"]["note"].startswith("vs prior ")
+    k["tokens"].update(prev=0, delta=None)
+    k["sessions"].update(value=87, prev=1, delta=86.0)
+    k["cache_hit"].update(value=None, delta=None)
+    try:
+        h.win.update_snapshot(snap)
+        h.win.backend.pageRequested.emit("overview")
+        pump(400)  # past the count-up
+        cards = {js(c.property("k"))["key"]: c for c in find(h.win, "KpiCard") if c.property("k")}
+        assert cards["tokens"].property("note") == k["tokens"]["note"].replace("vs prior", "none in the prior")
+        d = js(cards["sessions"].property("delta"))
+        assert (d["text"], d["spoken"]) == ("↑87x", "up 87 times"), d
+        assert "n/a" in [t.property("text") for t in find_in(cards["cache_hit"], "Txt") if t.isVisible()]
+    finally:
+        h.win.update_snapshot(h.snap)
+        pump(60)
+
+
+def test_header_limits_say_what_they_leave_out(h):
+    snap = copy.deepcopy(h.snap)
+    snap["limits"].update(source="headers", scoped=[], surfaces=[], extra_usage=None)
+    try:
+        h.win.update_snapshot(snap)
+        h.win.backend.pageRequested.emit("overview")
+        pump(60)
+        assert [t for t in visible_texts(h.win) if t.startswith("Read from response headers, so Fable")]
+    finally:
+        h.win.update_snapshot(h.snap)
+        pump(60)
+    assert not [t for t in visible_texts(h.win) if t.startswith("Read from response headers")]
+
+
+def test_the_cost_note_folds_behind_about_this_data(h):
+    h.win.backend.pageRequested.emit("overview")
+    pump(60)
+    page = find(h.win, "OverviewPage")[0]
+    foot = [c for c in find_in(page) if c.property("cut") is not None][0]
+    texts = visible_texts(h.win)
+    assert [t for t in texts if t.startswith("Cost is API-equivalent") and t.endswith("It is not a bill.")], texts
+    assert "About this data" in texts and not [t for t in texts if "cleanup period" in t]
+    foot.setProperty("open", True)
+    pump(30)
+    try:
+        assert [t for t in visible_texts(h.win) if "cleanup period" in t]
+    finally:
+        foot.setProperty("open", False)
+
+
+def test_a_5_hour_limit_close_to_binding_leads_the_plan_limits(h):
+    try:
+        texts = show_state(h, "5h_critical")
+        assert any(t.startswith("5-hour limit at 93%, resets ") for t in texts), texts
+        rows = js(find(h.win, "OtherLimitsCard")[0].property("rows"))
+        assert rows[0]["sub"].startswith("At this pace you reach 100% at "), rows[0]
+    finally:
+        h.win.update_snapshot(h.snap)
+        pump(30)
+
+
+def test_first_week_has_no_empty_past_weeks_chart(h):
+    try:
+        texts = show_state(h, "first_week")
+        assert "Weeks appear here once a weekly window has ended." in texts
+        card = find(h.win, "PastWeeksCard")[0]
+        assert not [c for c in find_in(card) if c.property("ticks") is not None and c.isVisible()]
+    finally:
+        h.win.update_snapshot(h.snap)
+        pump(30)
+
+
+def test_the_first_index_counts_no_sessions_yet_and_activity_says_its_scope(h):
+    snap = copy.deepcopy(h.snap)
+    STATES["empty"](snap)
+    snap["status"]["indexing"] = {"done": 412, "total": 12512}
+    h.win.update_snapshot(snap)
+    pump(60)
+    try:
+        assert find(h.win, "OverviewPage")[0].property("subtitle").startswith("Counting sessions in the last 7 days")
+    finally:
+        h.win.update_snapshot(h.snap)
+        pump(60)
+    assert "In the last 7 days" in visible_texts(h.win)  # above the facts that follow the range
+
+
+def test_kpi_changes_are_spoken_as_words(h):
+    deltas = [js(k.property("delta")) for k in find(h.win, "KpiCard") if k.property("delta") is not None]
+    deltas = [d for d in deltas if d]
+    assert deltas and all(d["spoken"].startswith(("up ", "down ")) and "↑" not in d["spoken"] and "↓" not in d["spoken"]
+                          for d in deltas if d["text"][0] in "↑↓"), deltas
 
 
 def test_messages_read_as_sentences(h):
@@ -822,8 +982,8 @@ rc = QQuickRenderControl() if gpu else None
 win = QQuickWindow(rc) if gpu else QQuickWindow()
 eng = QQmlEngine(); eng.rootContext().setContextProperty("backend", be)
 comp = QQmlComponent(eng)
-comp.setData(b'import QtQuick\nItem { property var snap: Ui.fixColors(JSON.parse(backend.snapshotJson))\n'
-             b'Connections { target: backend; function onSnapshotChanged() { snap = Ui.fixColors(JSON.parse(backend.snapshotJson)) } }\n'
+comp.setData(b'import QtQuick\nItem { property var snap: JSON.parse(backend.snapshotJson)\n'
+             b'Connections { target: backend; function onSnapshotChanged() { snap = JSON.parse(backend.snapshotJson) } }\n'
              b'Rectangle { anchors.fill: parent; color: Ui.p.bg }\n'
              b'OverviewPage { anchors.fill: parent; snap: parent.snap; viewH: 820 } }',
              QUrl.fromLocalFile(str(QML_MAIN.with_name("GpuHost.qml"))))

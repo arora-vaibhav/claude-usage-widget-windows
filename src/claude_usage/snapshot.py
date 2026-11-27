@@ -555,8 +555,9 @@ def _limits(conn, limits: Optional[dict], now: float, thresholds: tuple) -> tupl
         cur_hit = next((t for t, w in cur_pts if w >= HIT), None)
         weeks.append({"start": weekly["window_start"], "peak": round(max([w for _t, w in cur_pts] + [weekly["pct"]]), 4),
                       "hours_at_limit": round((now - cur_hit) / 3600, 1) if cur_hit else 0.0, "current": True})
+    source = lim.get("source") if lim.get("source") in ("oauth", "headers") else None
     section = {"weekly": weekly, "session": session, "session_note": note, "scoped": scoped, "surfaces": surfaces,
-               "extra_usage": extra, "past_weeks": weeks, "weeks_hit": hit, "weeks_counted": counted}
+               "extra_usage": extra, "past_weeks": weeks, "weeks_hit": hit, "weeks_counted": counted, "source": source}
     return section, proj
 
 
@@ -566,7 +567,7 @@ def _forecast(p: Optional[dict], now: float) -> tuple:
     if p["eta"] is not None:
         if p["pct"] >= HIT:
             return f"Limited until {_clock(p['reset'], now)}", _iso(p["eta"])
-        return f"Limit {_clock(p['eta'], now)}", _iso(p["eta"])
+        return f"At this pace the limit is reached {_clock(p['eta'], now)}", _iso(p["eta"])
     return f"About {round(min(p['at_reset'], 1.0) * 100)}% at reset", None
 
 
@@ -642,6 +643,8 @@ def _now(conn, limits, now, thresholds, proj) -> dict:
         "state": state,
         "as_of": _iso(lim.get("fetched_at")),
         "message": message,
+        # the worker retries a failed fetch by itself; a store it can't use ("store") needs the user
+        "error_kind": (lim.get("error_kind") or "fetch") if lim.get("error") else None,
     }
 
 
@@ -673,7 +676,8 @@ class _Tot:
 def build(conn: sqlite3.Connection, range_key: str = "7d", project: Optional[str] = None,
           now: Optional[float] = None, limits: Optional[dict] = None, *, indexing: Optional[dict] = None,
           updated_at: Optional[float] = None, thresholds: Optional[tuple] = None) -> dict:
-    """The whole app view. ``project`` filters everything except ``limits`` and ``now``.
+    """The whole app view. ``project`` filters everything except ``limits``, ``now``, ``projects`` and
+    ``sessions_total_all``.
 
     Takes 50-300 ms on a large store: call it off the GUI thread, on a connection of that thread.
     Its one write is the colour slots in meta when an entity is first drawn (see :func:`_slots`).
@@ -685,7 +689,8 @@ def build(conn: sqlite3.Connection, range_key: str = "7d", project: Optional[str
     today = datetime.fromtimestamp(now).date()
     cov = store.get_meta(conn, "coverage_from")
     cov_ts = _midnight(date.fromisoformat(cov)) if cov else None
-    legacy = _legacy(conn, cov) if project is None else {}
+    legacy_all = _legacy(conn, cov)
+    legacy = legacy_all if project is None else {}
     first = conn.execute("SELECT MIN(day) FROM rollup_day").fetchone()[0]
     first_day = min(([date.fromisoformat(first)] if first else [today])
                     + ([date.fromisoformat(min(legacy))] if legacy else []))
@@ -694,7 +699,8 @@ def build(conn: sqlite3.Connection, range_key: str = "7d", project: Optional[str
     t0 = starts[0].timestamp()
     t0_ms = int(t0 * 1000)
     hourly = kind in ("hour", "6h")
-    rows = _rollup_rows(conn, starts[0].date().isoformat(), today.isoformat(), project, hourly)
+    # Every project's rows: the sidebar lists all of them whatever the filter; the rest uses the filtered ones.
+    rows = _rollup_rows(conn, starts[0].date().isoformat(), today.isoformat(), None, hourly)
     turns = _turn_rows(conn, t0_ms, now_ms + 1, project, hourly)
     pc_all, mc_all = _alltime(conn)
 
@@ -706,7 +712,9 @@ def build(conn: sqlite3.Connection, range_key: str = "7d", project: Optional[str
         priced.append((row, parts))
         if cov and row[0] < cov:
             day_cost[row[0]] = day_cost.get(row[0], 0.0) + sum(parts[:4])
-    legacy_used = {d: v for d, v in legacy.items() if v[0] > day_cost.get(d, 0.0)} if range_key == "all" else {}
+    # Legacy days have no per-project split: the unfiltered view skips their ledger rows, a project's view keeps them.
+    skip = {d for d, v in legacy_all.items() if v[0] > day_cost.get(d, 0.0)} if range_key == "all" else set()
+    legacy_used = {d: legacy_all[d] for d in skip} if project is None else {}
 
     total = _Tot()
     buckets = [_Tot() for _ in range(nb)]
@@ -714,7 +722,8 @@ def build(conn: sqlite3.Connection, range_key: str = "7d", project: Optional[str
     ent_cost = {"project": {}, "model": {}}
     models: dict = {}
     sessions: dict = {}
-    proj_range: dict = {}
+    proj_range: dict = {}  # project -> [cost, sessions] in range, over every project
+    all_sids: set = set()
     split = [[0.0, 0] for _ in range(4)]
     saved = 0.0
     day_tot: dict = {}
@@ -727,12 +736,17 @@ def build(conn: sqlite3.Connection, range_key: str = "7d", project: Optional[str
 
     for row, parts in priced:
         day, hour, sid, is_sub, proj, model, speed, long, n, i, o, r, w5, w1, ws, f_ms, l_ms = row
-        if day in legacy_used:
-            continue
         b = bucket_of(day, hour)
         if b is None:
             continue
         cost = parts[0] + parts[1] + parts[2] + parts[3]
+        if day not in skip:
+            pr = proj_range.setdefault(proj, [0.0, set()])
+            pr[0] += cost
+            pr[1].add(sid)
+            all_sids.add(sid)
+        if day in legacy_used or project and proj != project:
+            continue
         tk = i + o + r + w5 + w1
         cid, prc = _rate(model, speed, long)[:2]
         total.add(sid, n, i, o, r, w5, w1, cost, is_sub)
@@ -762,9 +776,6 @@ def build(conn: sqlite3.Connection, range_key: str = "7d", project: Optional[str
         s["models"][cid] = s["models"].get(cid, 0.0) + cost
         s["projects"][proj] = s["projects"].get(proj, 0.0) + cost
         s["first"], s["last"] = min(s["first"], f_ms), max(s["last"], l_ms)
-        pr = proj_range.setdefault(proj, [0.0, set()])
-        pr[0] += cost
-        pr[1].add(sid)
         dk = (day, hour) if range_key == "24h" else (day, None)
         day_tot[dk] = day_tot.get(dk, 0.0) + cost
 
@@ -861,7 +872,7 @@ def build(conn: sqlite3.Connection, range_key: str = "7d", project: Optional[str
                 delta = round(value - pval, 4)
             elif pval:
                 delta = round((value - pval) / pval, 4)
-        return {"key": key, "label": label, "format": fmt, "value": value if value is not None else 0.0,
+        return {"key": key, "label": label, "format": fmt, "value": value,
                 "prev": pval, "delta": delta, "delta_unit": unit, "series": ser, "note": note, "hint": hint}
 
     hit_now = total.hit()
@@ -880,12 +891,18 @@ def build(conn: sqlite3.Connection, range_key: str = "7d", project: Optional[str
             [round(b.hit() or 0.0, 4) for b in buckets]),
     ]
 
-    # ---- sidebar projects: every project ever seen, active ones first
+    # ---- sidebar projects: every project ever seen, active ones first, the same whatever the filter;
+    # coloured as the unfiltered chart of this range draws them
+    pcol = colour["project"]
+    if project is not None:
+        ptop = _top({k: v[0] for k, v in proj_range.items()})
+        pslots = _slots(conn, now, {"project": ptop, "model": tops["model"]}, {"project": pc_all, "model": mc_all})
+        pcol = {k: pslots["project"][k] for k in ptop}
     projects = []
     for name in sorted(pc_all, key=lambda k: (k not in proj_range, -(proj_range.get(k, [0.0])[0]), -pc_all[k], k)):
         pr = proj_range.get(name)
         projects.append({"name": name, "sessions": len(pr[1]) if pr else 0, "cost": round(pr[0], 2) if pr else 0.0,
-                         "color": colour["project"].get(name, OTHER), "idle": pr is None})
+                         "color": pcol.get(name, OTHER), "idle": pr is None})
 
     # ---- sessions, ranked by cost over the whole range before the cap
     sids = sorted(sessions, key=lambda k: (-sessions[k]["cost"], -sessions[k]["last"]))
@@ -931,7 +948,7 @@ def build(conn: sqlite3.Connection, range_key: str = "7d", project: Optional[str
     if leg_cost:
         models["legacy"] = {"cost": leg_cost, "output": 0, "calls": leg_msgs, "cr": 0, "prompt": 0, "priced": "family"}
     all_cost = sum(x["cost"] for x in models.values())
-    model_out = [{"name": "Legacy" if cid == "legacy" else model_name(cid), "id": cid, "cost": round(m["cost"], 4),
+    model_out = [{"name": "Old daily totals" if cid == "legacy" else model_name(cid), "id": cid, "cost": round(m["cost"], 4),
                   "share": round(m["cost"] / all_cost, 4) if all_cost else 0.0,
                   "output": int(m["output"]), "cache_hit": round(m["cr"] / m["prompt"], 4) if m["prompt"] else None,
                   "calls": int(m["calls"]), "color": LEGACY if cid == "legacy" else colour["model"].get(cid, OTHER),
@@ -942,7 +959,7 @@ def build(conn: sqlite3.Connection, range_key: str = "7d", project: Optional[str
     cost_split["caching_saved"] = round(saved, 2)
 
     section, proj_now = _limits(conn, limits, now, thresholds)
-    activity = _activity(conn, project, now, cov, legacy, sess_out, first_of, day_tot, range_key, section)
+    activity = _activity(conn, project, now, cov, legacy, sess_out, first_of, day_tot, range_key, section, t0)
     state, message = _state(limits, now)
     if state == "ok" and indexing and indexing.get("done", 0) < indexing.get("total", 0) and not total.calls:
         state = "loading"
@@ -970,6 +987,7 @@ def build(conn: sqlite3.Connection, range_key: str = "7d", project: Optional[str
         "sessions": sess_out[:SESSION_CAP],
         "top_sessions": sess_out[:TOP_SESSIONS],
         "sessions_total": len(sess_out),
+        "sessions_total_all": len(all_sids),
         "activity": activity,
         "models": model_out,
         "cost_split": cost_split,
@@ -983,7 +1001,7 @@ def cost_note() -> str:
 
 # ---------------------------------------------------------------- activity
 
-def _activity(conn, project, now, cov, legacy, sessions, first_of, day_tot, range_key, section) -> dict:
+def _activity(conn, project, now, cov, legacy, sessions, first_of, day_tot, range_key, section, t0) -> dict:
     today = datetime.fromtimestamp(now).date()
     days = [today - timedelta(days=ACTIVITY_DAYS - 1 - i) for i in range(ACTIVITY_DAYS)]
     d0 = days[0].isoformat()
@@ -1036,8 +1054,9 @@ def _activity(conn, project, now, cov, legacy, sessions, first_of, day_tot, rang
     if sessions:
         longest_s = max(sessions, key=lambda s: s["agent_ms"])
         if longest_s["agent_ms"]:
+            first = first_of[longest_s["id"]] / 1000  # its agent time counts only in range, so say it began before
             facts.append({"label": "Longest session", "value": _dur(longest_s["agent_ms"]),
-                          "detail": f"{longest_s['project']}, {_md(first_of[longest_s['id']] / 1000)}"})
+                          "detail": f"{longest_s['project']}, {'started ' if first < t0 else ''}{_md(first)}"})
         n = len(sessions)
         facts.append({"label": "Average per session",
                       "value": f"{_dur(sum(s['agent_ms'] for s in sessions) / n)}, {_money(sum(s['cost'] for s in sessions) / n)}",

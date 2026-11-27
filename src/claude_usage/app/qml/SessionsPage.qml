@@ -33,9 +33,15 @@ Page {
     onKindChanged: shown = 50
     onSnapChanged: shown = 50
 
+    // the first index has not reached a session yet, or the store is one this version can't read
+    readonly property var ix: snap && snap.status.indexing && !snap.sessions_total ? snap.status.indexing : null
+    readonly property bool storeErr: !!snap && snap.now.error_kind === "store"
+
     title: "Sessions"
-    subtitle: snap ? Ui.plural(snap.sessions_total, "session") + " " + Ui.inRange(snap.range) + (snap.project ? ", " + snap.project : "")
-                     + (snap.sessions.length < snap.sessions_total ? ". Showing the " + Ui.int(snap.sessions.length) + " costliest." : "") : ""
+    subtitle: !snap || storeErr ? ""
+              : ix ? "Counting sessions " + Ui.inRange(snap.range)
+              : Ui.plural(snap.sessions_total, "session") + " " + Ui.inRange(snap.range) + (snap.project ? ", " + snap.project : "")
+                + (snap.sessions.length < snap.sessions_total ? ". Showing the " + Ui.int(snap.sessions.length) + " costliest." : "")
     tools: [
         Seg {
             name: "Range"
@@ -68,6 +74,7 @@ Page {
                 }
             }
             Txt {
+                visible: page.all.length > 0
                 anchors.right: parent.right; height: 34
                 text: "Showing " + Ui.int(Math.min(page.shown, page.rows.length)) + " of " + Ui.int(page.rows.length)
                 font.pixelSize: 12; color: Ui.p.text_faint
@@ -90,7 +97,12 @@ Page {
             visible: page.rows.length === 0
             x: Ui.pad; y: table.y + table.height + 8
             height: 48
-            text: page.all.length ? "No sessions match." : "No sessions in this range."
+            width: parent.width - 2 * Ui.pad
+            wrapMode: Text.WordWrap; elide: Text.ElideNone
+            text: !page.snap ? "Loading sessions."
+                : page.storeErr ? "Session history unavailable. It shows again after you update Claude Usage."
+                : page.ix ? "Still reading your transcripts (" + Ui.int(page.ix.done) + " of " + Ui.int(page.ix.total) + "). Sessions show up here as they are indexed."
+                : page.all.length ? "No sessions match." : "No sessions in this range."
             color: Ui.p.text_muted
         }
         Btn {

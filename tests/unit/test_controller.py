@@ -195,8 +195,8 @@ def test_menu_and_tray_show_only_the_limits_the_plan_reports(make, tmp_path):
         ctl._on_menu_show()
         return ctl._act_head.text().split("  ·  "), widget._tray_tip(now, lim).splitlines()
 
-    head, tip = show(plan_limits(0.67))  # Ultra: weekly only, Fable not in use
-    assert len(head) == 1 and head[0].startswith("Weekly 67%, resets ") and not ctl._act_head.isEnabled()
+    head, tip = show(plan_limits(0.67))  # Ultra: weekly only, Fable not in use; on pace to hit it before the reset
+    assert len(head) == 1 and head[0].startswith("Weekly 67%, limit in ~1d ") and not ctl._act_head.isEnabled()
     assert tip == ["Claude Usage", head[0]]
     head, tip = show(plan_limits(0.67, fable=0.12))
     assert head[1:] == ["Fable 12%"] and tip[1:] == head
@@ -205,10 +205,47 @@ def test_menu_and_tray_show_only_the_limits_the_plan_reports(make, tmp_path):
     for line in head + tip:
         assert "Session" not in line and " 0%" not in line
     head, tip = show(plan_limits(0.5, five=0.96))  # the binding 5-hour limit leads, as on the OSD
-    assert head[0].startswith("5-hour 96%, ") and head[1].startswith("Weekly 50%, ")
+    assert head[0].startswith("5-hour 96%, limit in ~") and head[1].startswith("Weekly 50%, resets ")
     head, tip = show(dict(plan_limits(0.67), error="Rate limited"))  # stale: the tooltip says why
     assert head[0].startswith("Weekly 67%, ") and head[1].startswith("as of ") and "Rate limited" not in head
     assert tip[1:] == head + ["Rate limited"]
+    head, tip = show({"error": "No credentials found. Run claude to sign in."})  # signed out: why, and what to do
+    assert head == ["Signed out"] and tip == ["Claude Usage", "Signed out", "No credentials found. Run claude to sign in."]
+
+
+def test_the_tray_tip_keeps_whole_lines_within_its_limit(make, tmp_path):
+    conn = store.connect(str(tmp_path / "s.db"))
+    why = "Can't reach the usage API. Check your network."
+    ix = {"done": 2300, "total": 12571}
+    for five in (None, 0.2):  # Ultra during an outage while Fable is in use, then with a 5-hour limit too
+        lim = dict(plan_limits(0.67, five=five, fable=0.2), error=why)
+        now = dict(snapshot.now_state(conn, lim, time.time()), live=True, tokens_per_min=12300.0)
+        tip = widget._tray_tip(now, lim, ix)
+        full = ["Claude Usage", *widget._summary(now, lim, ix)]
+        lines = tip.splitlines()
+        r = next(i for i, line in enumerate(lines) if line.startswith("Can't reach"))
+        assert len(tip) <= 127 and set(lines[:r] + lines[r + 1:]) <= set(full), tip  # whole lines but the reason
+        # the indexing progress and the live rate give way to the reason, which is cut short only when it must be
+        assert not [x for x in lines[:r] if x.startswith(("Indexing", "Live"))] and why.startswith(lines[r].rstrip(".")), tip
+        assert five or lines[r] == why, tip
+    assert "Live" not in tip  # the 5-hour plan's tip has no room left for it
+    assert widget._tray_tip(dict(now, state="ok", message=None), lim).endswith("Live 12.3k tok/min")
+
+
+def test_the_first_index_says_today_is_partial(make, tmp_path):
+    ctl = make()
+    conn = store.connect(str(tmp_path / "s.db"))
+    lim = plan_limits(0.67)
+    now = snapshot.now_state(conn, lim, time.time())
+    ctl._on_refreshed(now, lim, {"done": 2371, "total": 12571})
+    ctl._on_menu_show()
+    assert ctl._act_head.text().endswith("Indexing 18%")
+    assert "Indexing 18%" in widget._tray_tip(now, lim, {"done": 2371, "total": 12571})
+    # floored like the app's progress card, and no "0%" that reads as stuck
+    assert [widget._indexing({"done": d, "total": 12582}) for d in (105, 12581)] == ["Indexing", "Indexing 99%"]
+    assert "so far, indexing 2,371 of 12,571 transcripts" in ctl.osd.toolTip()
+    ctl._on_refreshed(now, lim, None)  # done: today's cost is final again
+    assert "Today $0.00 (API-equivalent)" in ctl.osd.toolTip()
 
 
 def test_a_failed_legacy_import_still_opens_the_store(make, monkeypatch):
@@ -233,7 +270,7 @@ def test_a_store_from_a_newer_version_is_left_alone(make, tmp_path):
     assert len(notices) == 1 and "newer version" in notices[0]
     assert pump_until(lambda: "newer version" in ctl.osd.toolTip(), timeout=5)  # not stuck on "Loading usage"
     ctl._on_menu_show()
-    assert "newer version" in ctl._act_head.text()
+    assert "newer version" in ctl._act_head.text() and not ctl._act_refresh.isVisible()
     ctl.open_app()  # the app says why too, built from an empty store, never from the newer one
     assert pump_until(lambda: ctl.app.backend.snapshotJson != "null")
     status = json.loads(ctl.app.backend.snapshotJson)["status"]
@@ -340,6 +377,22 @@ def test_worker_survives_a_failed_store_open_and_a_failed_refresh(make, monkeypa
     ctl.refresh_now()  # the thread is still alive and answers
     assert pump_until(lambda: "Weekly 42%" in ctl.osd.toolTip(), timeout=10)
     assert calls["connect"] == 2 and len(notices) == 1 and ctl._worker.is_alive()
+
+
+def test_a_hidden_app_window_is_freed_and_comes_back(make):
+    ctl = make()
+    ctl.start(check_updates=False)
+    ctl.open_app()
+    assert pump_until(lambda: ctl.app.backend.snapshotJson != "null")
+    ctl.app.hide()
+    assert ctl._release.isActive()
+    ctl._release.stop()
+    ctl._release_app()
+    assert ctl.app is None
+    ctl._on_refreshed(now_dict(0.5), None, None)  # a refresh or a late build with no window is fine
+    ctl.open_app("sessions")
+    assert not ctl._release.isActive()
+    assert pump_until(lambda: ctl.app.backend.snapshotJson != "null")
 
 
 def test_a_second_launch_opens_the_running_app(make, monkeypatch):

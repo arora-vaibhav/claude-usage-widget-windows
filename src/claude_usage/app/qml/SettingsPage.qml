@@ -147,11 +147,12 @@ Page {
             first: true
             label: "Transcripts indexed"
             hint: "Claude Code transcripts read from your .claude folder. Kept after Claude Code cleans them up."
-            Txt { height: 24; text: page.st ? Ui.int(page.st.transcripts) : "n/a"; font.weight: 600 }
+            // a re-index forgets every read position, so show its progress, not the count that restarts
+            Txt { height: 24; text: !page.st ? "n/a" : page.st.indexing ? Ui.int(page.st.indexing.done) + " of " + Ui.int(page.st.indexing.total) : Ui.int(page.st.transcripts); font.weight: 600 }
         }
         SettingRow {
             label: "Coverage"
-            hint: page.st && page.st.legacy_before ? "Earlier days come from the old daily rollup, with cost and tokens only." : "Every day comes from your transcripts."
+            hint: page.st && page.st.legacy_before ? "Earlier days are old daily totals, with cost and tokens only." : "Every day comes from your transcripts."
             Txt {
                 height: 24
                 text: page.st && page.st.coverage_from ? "Full detail from " + Ui.md(Ui.date(page.st.coverage_from + "T12:00:00")) + ", " + Ui.date(page.st.coverage_from + "T12:00:00").getFullYear() : "n/a"

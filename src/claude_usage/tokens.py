@@ -40,7 +40,7 @@ DARK: dict[str, str] = {
     "sidebar": "#111110",
     "surface": "#1A1A19",
     "surface_alt": "#242422",
-    "osd_bg": "#161615",
+    "osd_bg": "#202020",  # the Windows 11 dark taskbar, so a pill parked on it does not read as a hole
     "line": "#2C2C2A",
     "line_strong": "#3A3A37",
     "track": "#2A2A28",

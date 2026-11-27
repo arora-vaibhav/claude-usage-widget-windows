@@ -38,7 +38,8 @@
   "live": false,
   "state": "ok",
   "as_of": "2026-11-26T14:19:20-05:00",
-  "message": null
+  "message": null,
+  "error_kind": null
  },
  "limits": {
   "weekly": {
@@ -658,7 +659,8 @@
    }
   ],
   "weeks_hit": 2,
-  "weeks_counted": 12
+  "weeks_counted": 12,
+  "source": "oauth"
  },
  "kpis": [
   {
@@ -2941,6 +2943,7 @@
   }
  ],
  "sessions_total": 25,
+ "sessions_total_all": 25,
  "activity": {
   "days": [
    {

@@ -43,11 +43,14 @@ Card {
         elide: Text.ElideNone
         font.pixelSize: 12
         color: Ui.p.text_muted
-        text: card.done.length ? "Hours spent at 100% each week." + (card.worst ? " Longest: " + Math.round(card.worst.hours_at_limit) + "h, week of " + Ui.md(Ui.date(card.worst.start)) + "." : "") : ""
+        text: card.done.length ? "Hours spent at 100% each week." + (card.worst ? " Longest: " + Math.round(card.worst.hours_at_limit) + "h, week of " + Ui.md(Ui.date(card.worst.start)) + "." : "")
+            : "Weeks appear here once a weekly window has ended."
     }
 
     Item {
         id: chart
+        // no axis to draw before a week has ended; the weekly card has this week
+        visible: card.done.length > 0
         y: note.y + note.height + 8
         width: parent.width
         height: parent.height - y
@@ -121,7 +124,7 @@ Card {
             Item {
                 readonly property real v: chart.ticks[index] || 0
                 Rectangle { x: 0; width: chart.xR; y: Math.round(chart.py(parent.v)); height: 1; color: Ui.p.line }
-                Txt { x: chart.xR + 6; y: chart.py(parent.v) - 8; height: 16; text: parent.v + "h"; font.pixelSize: 11; color: Ui.p.text_faint }
+                Txt { x: chart.xR + 6; y: chart.py(parent.v) - 8; height: 16; text: parent.v + "h"; font.pixelSize: 12; color: Ui.p.text_faint }
             }
         }
         Rectangle { width: chart.xR; y: Math.round(chart.base); height: 1; color: Ui.p.line_strong }
@@ -130,7 +133,7 @@ Card {
             Item {
                 readonly property var m: chart.months[index] || { x: 0, label: "" }
                 Rectangle { x: parent.m.x; y: chart.base; width: 1; height: 4; color: Ui.p.line_strong }
-                Txt { x: parent.m.x + 3; y: chart.base + 6; height: 16; text: parent.m.label; font.pixelSize: 11; color: Ui.p.text_faint }
+                Txt { x: parent.m.x + 3; y: chart.base + 6; height: 16; text: parent.m.label; font.pixelSize: 12; color: Ui.p.text_faint }
             }
         }
         Repeater {

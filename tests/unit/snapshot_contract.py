@@ -52,6 +52,7 @@ NOW = {
     "state": STATE,
     "as_of": Opt(str),
     "message": Opt(str),
+    "error_kind": Opt(OneOf("fetch", "store")),  # what the last error came from; None without one
 }
 
 LIMITS = {
@@ -91,13 +92,15 @@ LIMITS = {
     "past_weeks": [{"start": str, "peak": NUM, "hours_at_limit": NUM, "current": bool}],
     "weeks_hit": int,
     "weeks_counted": int,
+    # how the limits were fetched: "headers" leaves out scoped limits, surfaces and extra usage
+    "source": Opt(OneOf("oauth", "headers")),
 }
 
 KPI = {
     "key": OneOf("cost", "tokens", "sessions", "agent_time", "cache_hit"),
     "label": str,
     "format": OneOf("usd", "tokens", "int", "duration", "pct"),
-    "value": NUM,
+    "value": Opt(NUM),  # None only for a cache hit rate with no prompt tokens in range
     "prev": Opt(NUM),
     "delta": Opt(NUM),
     "delta_unit": OneOf("pct", "pts"),
@@ -194,6 +197,7 @@ SNAPSHOT = {
     "sessions": [SESSION],
     "top_sessions": [SESSION],  # the ten costliest of every session in range
     "sessions_total": int,
+    "sessions_total_all": int,  # sessions in range over every project, whatever the filter
     "activity": ACTIVITY,
     "models": [MODEL],
     "cost_split": {

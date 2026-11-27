@@ -12,7 +12,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable, Optional
 
 from PySide6.QtCore import QObject, QRect, Qt, QTimer, Signal
@@ -25,7 +25,7 @@ from claude_usage.auth_watchdog import AuthWatchdog, is_auth_error
 from claude_usage.config import drop_bad_values, save_config, user_config_path
 from claude_usage.logging_setup import get_logger
 from claude_usage.notifier import UsageNotifier
-from claude_usage.osd import NO_LIMITS, Osd, _clock, _font, _parse, _pct, _rate, _resets, _when
+from claude_usage.osd import NO_LIMITS, Osd, _clock, _font, _indexing, _parse, _pct, _rate, _resets, _span, _when
 from claude_usage.winchrome import apply_win11_chrome
 
 log = get_logger()
@@ -37,6 +37,7 @@ NEWER_STORE = "Your usage store is from a newer version of Claude Usage. Update 
 ON_TOP_MS = 2000
 SAVE_DELAY_MS = 400  # one write per burst of changes (a slider drag sends dozens)
 SAVE_RETRY_MS = 60_000  # after a failed write; a locked file or a full disk can clear
+RELEASE_MS = 5 * 60_000  # an app window hidden this long is freed (about 70 MB); the next open makes a new one
 ICON = os.path.join(os.path.dirname(__file__), "icons", "claude-tray.svg")
 
 
@@ -88,10 +89,10 @@ def _active_scoped(shown: Optional[dict]) -> list[dict]:
             if x.get("kind") != "weekly_all" and x.get("active") and x.get("pct") is not None]
 
 
-def _summary(now: Optional[dict], shown: Optional[dict]) -> list[str]:
+def _summary(now: Optional[dict], shown: Optional[dict], indexing: Optional[dict] = None) -> list[str]:
     """What the menu header and the tray tooltip say: each limit the API reported, the binding
-    one first as on the OSD, then the state and the live rate. A limit it did not report (the
-    5-hour limit on Ultra) gets no part, never a 0%."""
+    one first as on the OSD, then the state, indexing progress and the live rate (always last).
+    A limit it did not report (the 5-hour limit on Ultra) gets no part, never a 0%."""
     if now is None or now["state"] == "loading":
         return ["Loading usage"]
     if now["state"] == "signed_out":
@@ -107,25 +108,41 @@ def _summary(now: Optional[dict], shown: Optional[dict]) -> list[str]:
             parts.append(f"{name} not started")
             continue
         part, reset = f"{name} {_pct(m)}%", with_reset and _parse(m["resets_at"])
+        eta = reset and _parse(m["eta"])
         if reset and reset > t:
-            part += (f", limited until {_when(reset, t)}" if m["level"] == "limited"
-                     else ", " + _resets(reset, t)[0].replace("Resets", "resets"))
+            if m["level"] == "limited":
+                part += f", limited until {_when(reset, t)}"
+            elif eta and eta < reset:  # the time to the limit, as the pill shows it, says more than the reset
+                part += f", limit in ~{_span(eta - t)}" if eta - t >= timedelta(minutes=1) else ", limit any minute"
+            else:
+                part += ", " + _resets(reset, t)[0].replace("Resets", "resets")
         parts.append(part)
     if now["state"] in ("stale", "error"):
         as_of = _parse(now["as_of"])
         parts.append(f"as of {_clock(as_of)}" if parts and as_of else now["message"] or "Can't reach Claude")
     elif not parts:
         parts.append(NO_LIMITS)
+    if indexing:  # today's numbers are still partial
+        parts.append(_indexing(indexing))
     if now["live"]:
         parts.append("Live " + _rate(now["tokens_per_min"]))
     return parts
 
 
-def _tray_tip(now: dict, shown: Optional[dict]) -> str:
-    lines = ["Claude Usage", *_summary(now, shown)]
-    if now["state"] in ("stale", "error") and now["message"] and now["message"] not in lines:
-        lines.append(now["message"])  # why it is stale; the menu header stays one short line
-    return "\n".join(lines)[:127]  # the Windows tray tooltip limit
+def _tray_tip(now: dict, shown: Optional[dict], indexing: Optional[dict] = None) -> str:
+    lines = ["Claude Usage", *_summary(now, shown, indexing)]
+    # _summary ends with the indexing progress and the live rate: they give way first
+    n = bool(indexing) + bool(now["live"]) if now["state"] not in ("loading", "signed_out") else 0
+    lines, extra = lines[:len(lines) - n], lines[len(lines) - n:]
+    why = now["message"] if now["state"] in ("stale", "error", "signed_out") and now["message"] not in lines else None
+    out: list[str] = []
+    for line in lines + [why] * bool(why) + extra:  # within the 127 characters of a Windows tray tip
+        room = 127 - len("\n".join(out + [""]))
+        if len(line) <= room:
+            out.append(line)
+        elif line == why and room >= 24:  # the reason is cut short rather than left out
+            out.append(line[:room - 3].rstrip() + "...")
+    return "\n".join(out)
 
 
 class Controller(QObject):
@@ -161,6 +178,10 @@ class Controller(QObject):
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(SAVE_DELAY_MS)
         self._save_timer.timeout.connect(self._save)
+        self._release = QTimer(self)
+        self._release.setSingleShot(True)
+        self._release.setInterval(RELEASE_MS)
+        self._release.timeout.connect(self._release_app)
 
         self.notifier = UsageNotifier(self._thresholds(), self._balloon, bool(config.get("notifications_enabled", True)))
         self.watchdog = AuthWatchdog(self.claude_dir, on_repair_attempt=lambda m: self._notice.emit("Claude Usage", m))
@@ -244,7 +265,13 @@ class Controller(QObject):
             # Imported here so the QML engine and its libraries load only when the window is first opened.
             from claude_usage.app import AppWindow
             self.app = AppWindow(self._provider, self._app_settings(), self._on_setting, self._on_action)
+            self.app.window.visibleChanged.connect(lambda shown: self._release.stop() if shown else self._release.start())
         self.app.show(page)
+
+    def _release_app(self) -> None:
+        if self.app is not None and not self.app.is_visible():
+            app, self.app = self.app, None
+            app.release()
 
     # ----------------------------------------------------------- worker thread
 
@@ -283,21 +310,17 @@ class Controller(QObject):
         self._ready.set()
         if conn is None:
             if self._newer:  # say why on the OSD, tray, menu and app, from an empty in-memory store
-                lim, mem = {"error": NEWER_STORE}, store.connect(":memory:")
+                lim, mem = {"error": NEWER_STORE, "error_kind": "store"}, store.connect(":memory:")
                 self._refreshed.emit(snapshot.now_state(mem, lim, time.time(), self._thresholds()), lim, None)
                 mem.close()
             return
         last_good: Optional[dict] = None
         shown: Optional[dict] = None
-        errors, next_fetch, last_fetch, full, total0 = 0, 0.0, float("-inf"), True, None
+        errors, next_fetch, last_fetch, full = 0, 0.0, float("-inf"), True
         ix: dict = {}
 
-        def progress(done: int, todo: int) -> None:
-            nonlocal total0
-            if total0 is None:
-                total0 = todo
-            # Each pass reports only its own todo; this keeps one bar across passes.
-            ix.update(done=max(0, total0 - (todo - done)), total=total0)
+        def progress(done: int, total: int) -> None:
+            ix.update(done=done, total=total)
 
         force, interval = True, 30  # the first pass always fetches
         while not self._stop.is_set():
@@ -307,7 +330,7 @@ class Controller(QObject):
                     self._reindex.clear()
                     with conn:  # forget every read offset; re-reading is safe, calls are upserted
                         conn.execute("DELETE FROM files")
-                    ing, full, total0 = ingest.Ingestor(conn, os.path.join(self.claude_dir, "projects")), True, None
+                    ing, full = ingest.Ingestor(conn, os.path.join(self.claude_dir, "projects")), True
                 try:
                     if full:
                         # A short first pass gets the OSD its first numbers within seconds on a first run;
@@ -380,9 +403,9 @@ class Controller(QObject):
 
     def _on_refreshed(self, now: dict, shown: Optional[dict], indexing: Optional[dict]) -> None:
         self._now, self._shown, self._indexing, self._updated_at = now, shown, indexing, time.time()
-        self.osd.set_now(now)
+        self.osd.set_now(now, indexing)
         if self.tray is not None:
-            self.tray.setToolTip(_tray_tip(now, shown))
+            self.tray.setToolTip(_tray_tip(now, shown, indexing))
         self.notifier.check_now(now, _active_scoped(shown))
         if self.app is not None and self.app.is_visible() and not self.app.window.windowState() & Qt.WindowMinimized:
             self._kick_build()
@@ -537,8 +560,9 @@ class Controller(QObject):
         self._act_head = menu.addAction("Loading usage")
         self._act_head.setEnabled(False)
         menu.addSeparator()
-        for text, slot in (("Open Claude Usage", lambda: self.open_app()), ("Refresh now", self.refresh_now)):
-            menu.addAction(text).triggered.connect(slot)
+        menu.addAction("Open Claude Usage").triggered.connect(lambda: self.open_app())
+        self._act_refresh = menu.addAction("Refresh now")
+        self._act_refresh.triggered.connect(self.refresh_now)
         self._act_style = menu.addAction("")
         self._act_style.triggered.connect(lambda: self.osd.toggle_style())
         menu.addAction("Settings...").triggered.connect(lambda: self.open_app("settings"))
@@ -548,7 +572,8 @@ class Controller(QObject):
         return menu
 
     def _on_menu_show(self) -> None:
-        self._act_head.setText("  ·  ".join(_summary(self._now, self._shown)))
+        self._act_head.setText("  ·  ".join(_summary(self._now, self._shown, self._indexing)))
+        self._act_refresh.setVisible(not self._newer)  # a store from a newer version: refreshing can't help
         self._act_style.setText("Show as card" if self.osd.osd_style() == "pill" else "Show as pill")
         apply_win11_chrome(self.menu, self._dark())
 

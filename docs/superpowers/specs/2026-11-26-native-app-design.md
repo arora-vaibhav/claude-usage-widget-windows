@@ -55,7 +55,7 @@ The November 2026 audit measured the problems:
 
 ## Architecture
 
-One process, as today. The GUI thread owns the OSD (QWidget), tray, menus and the app window (QQmlApplicationEngine, created on first open, hidden on close). One worker thread does all collection.
+One process, as today. The GUI thread owns the OSD (QWidget), tray, menus and the app window (QQmlApplicationEngine, created on first open, hidden on close, and freed after 5 minutes hidden). One worker thread does all collection.
 
 ```
 worker (every refresh_seconds):
@@ -117,7 +117,7 @@ Import `~/.claude/usage-daily.jsonl` read-only into `legacy_days`. A row whose c
 
 ### Limits
 
-`fetch_rate_limits` keeps today's two paths (OAuth `/api/oauth/usage` via curl, unified headers for long-lived tokens) and its error strings, and returns in addition: weekly `{pct, resets_at, severity}`, five-hour (`None` when the payload has `null`), `limits[]` scoped entries joined with `weekly_scoped_shares`, `seven_day_breakdown.rows`, `seven_day_breakdown.window_started_at`, and `extra_usage`. Missing values stay `None`, never `0.0`.
+`fetch_rate_limits` keeps today's two paths (OAuth `/api/oauth/usage` via curl, unified headers for long-lived tokens) and its error strings, and returns in addition: weekly `{pct, resets_at, severity}`, five-hour (`None` when the payload has `null`), `limits[]` scoped entries joined with `weekly_scoped_shares`, `seven_day_breakdown.rows`, `seven_day_breakdown.window_started_at`, and `extra_usage`. Missing values stay `None`, never `0.0`. Tokens reach curl on stdin, never on its command line.
 
 ### Snapshot
 
@@ -126,10 +126,13 @@ Import `~/.claude/usage-daily.jsonl` read-only into `legacy_days`. A row whose c
 - `now`: range-independent; drives the OSD. `primary` is the limit projected to run out first (weekly when the 5h limit is absent).
 - `limits.weekly`: pace engine. `elapsed` = share of the window gone; `pace` = pct / elapsed; `eta` = when 100% is reached at the faster of the 24 h rate and the window-average rate; `usual` and `usual_series` = median of past complete windows at the same elapsed share; `locked_hours` = time between eta and reset; `daily_budget` = what per day keeps you under 100%.
 - `kpis`: cost, tokens, sessions, agent time, cache hit rate, each with the previous equal-length window (to the same hour) and a sparkline. Deltas are `null` when the previous window reaches past `coverage_from` or for `all`.
-- `timeline`: buckets are hour (24h), 6h (7d), day (30d, 90d), week (all). The in-progress bucket is flagged by `partial_last` and drawn as "so far". Series by project and by model, top 5 plus Other. Colour index = a palette slot (0-7) that each project and model keeps across ranges and days, saved in the store's `meta` as `colors`: an entity takes the lowest free slot when a range first draws it, a slot is shared only with entities no range draws now, and a chart never draws one colour twice. Other is `-1`, legacy days `-2`.
+- `timeline`: buckets are hour (24h), 6h (7d), day (30d, 90d), week (all). The in-progress bucket is flagged by `partial_last` and drawn as "so far". Series by project and by model, top 5 plus Other. Colour index = a palette slot (0-7) that each project and model keeps across ranges and days, saved in the store's `meta` as `colors`: an entity takes the lowest free slot when a range first draws it, two entities share a slot only if no single range draws both, and a chart never draws one colour twice. Other is `-1`, legacy days `-2`.
 - `sessions`: the sessions with a call in range, ranked by cost and capped at 2,000, with title when Claude Code stored one. `top_sessions` holds the ten costliest of all of them, and `sessions_total` counts them.
 - `activity`: last 84 days, heatmap levels 0-4, streaks and pre-formatted facts.
-- Range keys: `24h`, `7d` (default), `30d`, `90d`, `all`. Project filter applies to everything except `limits` and `now`.
+- `projects`: every project with its sessions and cost in the range, the same whatever the project filter, coloured as the unfiltered chart draws them; `sessions_total_all` counts the range's sessions over every project for the sidebar's "All projects".
+- `limits.source`: `oauth` or `headers`. The headers fallback (a long-lived token while Claude Code's own sign-in has expired) carries no scoped limits, surfaces or extra usage, and the app says so.
+- `now.error_kind`: `fetch` when the last limits fetch failed (the worker retries it), `store` when the store can't be used (a newer version's), else null.
+- Range keys: `24h`, `7d` (default), `30d`, `90d`, `all`. Project filter applies to everything except `limits`, `now`, `projects` and `sessions_total_all`.
 
 Performance target: `build` under 200 ms on the real store.
 

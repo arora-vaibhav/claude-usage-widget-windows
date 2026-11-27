@@ -48,10 +48,6 @@ FAMILIES = ["Segoe UI Variable", "Segoe UI"]
 RANK = {"none": 0, "normal": 1, "caution": 2, "critical": 3, "limited": 4}
 NAMES = {"weekly": ("7d", "Weekly"), "session": ("5h", "5-hour")}  # pill tag, and the name the menu, tray and alerts use
 NO_LIMITS = "Claude didn't report a weekly or 5-hour limit."
-# Words of the limits-fetch errors (collector.fetch_rate_limits and the worker's own). The worker
-# retries those by itself; any other error (a store from a newer version) needs the user, so the
-# OSD shows its message alone, without "Can't reach Claude" or "Retrying automatically".
-FETCH_WORDS = ("network", "request", "rate limit", "api", "oauth", "collection")
 # Each pill countdown keeps the room of the widest string its limit shows in normal use
 # (weekly '6d 23h', '23h 59m', forecast '~6d 23h'; 5h '4h 59m', forecast '~4h 59m'), so the
 # pill keeps its width and nothing in it moves as the numbers tick. Forecasts ('~') are semibold.
@@ -61,7 +57,7 @@ LOADING = {
     "primary": "weekly", "weekly": None, "session": None, "today_cost": 0.0,
     "today_tokens": 0, "tokens_per_min": 0.0, "active_sessions": 0,
     "active_subagents": 0, "live": False, "state": "loading", "as_of": None,
-    "message": None,
+    "message": None, "error_kind": None,
 }
 
 
@@ -139,9 +135,17 @@ def _rate(tpm: float) -> str:
 
 
 def _retries(now: dict) -> bool:
-    """True while the problem is a failed limits fetch, which the worker keeps retrying."""
-    msg = (now["message"] or "").lower()
-    return not msg or any(w in msg for w in FETCH_WORDS)
+    """True unless the store is the problem (one from a newer version): the worker keeps retrying a
+    failed fetch by itself, but a store error needs the user, so the OSD shows its message alone,
+    without "Can't reach Claude", "Retrying automatically" or the empty stand-in store's $0."""
+    return now.get("error_kind") != "store"
+
+
+def _indexing(ix: dict) -> str:
+    """'Indexing 19%' for a first index or a re-index in progress (``{done, total}`` transcripts),
+    floored as in the app; plain 'Indexing' below 1%, where '0%' reads as stuck."""
+    pct = 100 * ix["done"] // ix["total"] if ix["total"] else 0
+    return f"Indexing {pct}%" if pct else "Indexing"
 
 
 def _not_started(m: dict) -> bool:
@@ -240,6 +244,7 @@ class Osd(QWidget):
         self._opacity = 1.0
         self._scale = 1.0
         self._now: dict = dict(LOADING)
+        self._ix: dict | None = None
         # Layout and paint both read this clock, so a countdown cannot change
         # width between them; it advances only on set_now.
         self._t = datetime.now().astimezone()
@@ -285,8 +290,11 @@ class Osd(QWidget):
 
     # ------------------------------------------------------------------ API
 
-    def set_now(self, now: dict) -> None:
+    def set_now(self, now: dict, indexing: dict | None = None) -> None:
+        """``indexing`` is the first index's (or a re-index's) ``{done, total}`` while it runs: today's
+        cost is then partial, so the card and tooltip say so instead of showing it as final."""
         old = self._now
+        self._ix = indexing
         self._from = {k: self._frac(k, old[k]["pct"]) for k in ("weekly", "session") if old[k]}
         self._now = dict(now)
         self._t = datetime.now().astimezone()
@@ -493,8 +501,8 @@ class Osd(QWidget):
         # An error outside the fetch is the local store failing, so its $0 is not today's cost.
         if n["state"] != "loading" and (n["state"] != "error" or _retries(n)):
             cost = _money(n["today_cost"])
-            o.text(W - P, hb, _fit([f"Today {cost}", cost], f12, W - P - x - 12), f12, pal["text_muted"],
-                   "cost", right=True)
+            options = [_indexing(self._ix), "Indexing"] if self._ix else [f"Today {cost}", cost]
+            o.text(W - P, hb, _fit(options, f12, W - P - x - 12), f12, pal["text_muted"], "cost", right=True)
 
         meters = self._meters()
         if n["state"] == "signed_out" or (not meters and n["state"] != "loading"):
@@ -598,7 +606,8 @@ class Osd(QWidget):
             x += o.text(x, base, "Claude", f11, pal["text_muted"], "tag") + 4
             x += o.text(x, base, "Sign in", f14b, pal["accent_text"], "action")
         elif not meters and n["state"] != "loading":
-            msg = "No limits reported" if n["state"] == "ok" else "Limits unavailable"
+            msg = ("No limits reported" if n["state"] == "ok" else "Limits unavailable" if _retries(n)
+                   else "Update Claude Usage")  # a store from a newer version
             x += o.text(x, base, msg, f12, pal["text_muted"], "status")
         else:
             for i, (key, m) in enumerate(meters or [("weekly", None)]):
@@ -883,7 +892,9 @@ class Osd(QWidget):
             elif eta:
                 lines.append("At this pace the limit is reached " + (_when(eta, now) if eta > now else "any minute"))
         if n["state"] != "loading" and (n["state"] != "error" or _retries(n)):
-            lines.append(f"Today {_money(n['today_cost'])} (API-equivalent)")
+            ix = self._ix
+            lines.append(f"Today {_money(n['today_cost'])} so far, indexing {ix['done']:,} of {ix['total']:,} transcripts"
+                         if ix else f"Today {_money(n['today_cost'])} (API-equivalent)")
         if n["live"]:
             k, subs = n["active_sessions"], n["active_subagents"]
             lines.append(f"Live {_rate(n['tokens_per_min'])}, {k} active session{'s' if k != 1 else ''}"

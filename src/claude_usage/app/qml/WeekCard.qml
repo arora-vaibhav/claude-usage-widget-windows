@@ -91,10 +91,10 @@ Card {
         columns: cols
         rowSpacing: 6
         readonly property var items: card.ok ? [
-            ["Pace vs even", card.w.pace != null ? card.w.pace.toFixed(1) + "x" : "n/a", "Speed against an even spread over the week"],
-            ["Usual by now", Ui.pct(card.w.usual), "Median of past weeks at this point"],
-            ["Daily budget", card.w.pct < 1 && card.w.daily_budget != null ? Ui.pct(card.w.daily_budget, 1) : "n/a", "Use per day that stays under 100%"],
-            ["Burn per hour", card.w.hourly_rate != null ? Ui.pct(card.w.hourly_rate, 1) : "n/a", "Share of the weekly limit used per hour"]
+            ["Pace vs even", card.w.pace != null ? card.w.pace.toFixed(1) + "x" : "-", "Speed against an even spread over the week"],
+            ["Usual by now", card.w.usual != null ? Ui.pct(card.w.usual) : "-", "Median of past weeks at this point"],
+            ["Daily budget", card.w.pct >= 1 ? "None left" : card.w.daily_budget != null ? Ui.pct(card.w.daily_budget, 1) : "-", "Use per day that stays under 100%"],
+            ["Burn per hour", card.w.hourly_rate != null ? Ui.pct(card.w.hourly_rate, 1) : "-", "Share of the weekly limit used per hour"]
         ] : []
         Repeater {
             model: facts.items

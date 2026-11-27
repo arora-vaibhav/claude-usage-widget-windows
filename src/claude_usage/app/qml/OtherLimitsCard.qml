@@ -6,6 +6,11 @@ Card {
     id: card
     property var limits: null
     property string plan: ""         // status.plan, when the data layer knows it
+    property var session: null       // now.session, for the forecast of a 5-hour limit that binds
+    property real nowMs: Date.now()
+    readonly property real minute: Math.floor(nowMs / 60000) * 60000  // the rows rebuild once a minute, not every second
+    // the headers fallback carries the weekly and 5-hour numbers only
+    readonly property bool partial: !!limits && limits.source === "headers"
     readonly property real natural: col.implicitHeight + 30 + 2 * padding
 
     // The API sends codes like "out_of_credits"; show them as a short sentence.
@@ -22,7 +27,16 @@ Card {
         // never a 0% meter for a window that has not started or does not exist
         if (L.session && (L.session.resets_at || L.session.pct > 0)) {
             var r = Ui.date(L.session.resets_at)
-            out.push({ label: "5-hour session", value: Ui.pct(L.session.pct), meter: L.session.pct, sub: r ? "Resets " + Ui.when(r) : "" })
+            // a 5-hour limit close to binding says when it runs out, as the weekly card does
+            var lvl = L.session.level, s5 = card.session
+            var fc = lvl === "critical" && s5 ? (s5.eta ? "At this pace you reach 100% at " + Ui.clock(Ui.date(s5.eta)) + "."
+                                                        : s5.forecast ? Ui.sentence(s5.forecast) : "") : ""
+            // a 5-hour window is read as time left, as the weekly card's countdown is
+            var left = r ? r.getTime() - card.minute : 0
+            var at = !r ? "" : left <= 0 ? "Reset at " + Ui.clock(r) + "."
+                   : (lvl === "limited" ? "Limited for " : "Resets in ") + Ui.span(left) + ", " + Ui.clock(r) + "."
+            out.push({ label: "5-hour session", value: Ui.pct(L.session.pct), meter: L.session.pct,
+                       sub: [fc, at].filter(function (x) { return x }).join(" ") })
         } else if (L.session) {
             out.push({ label: "5-hour session", pill: "Not started", sub: "Starts on your next prompt." })
         } else {
@@ -94,6 +108,19 @@ Card {
                         lineHeight: 1.1
                     }
                 }
+            }
+        }
+        Item {
+            visible: card.partial
+            width: parent.width; height: note.y + note.implicitHeight
+            Rectangle { width: parent.width; height: 1; color: Ui.p.line }
+            Txt {
+                id: note
+                y: 10; width: parent.width
+                wrapMode: Text.WordWrap; elide: Text.ElideNone
+                font.pixelSize: 12; color: Ui.p.text_muted
+                lineHeight: 1.1
+                text: "Read from response headers, so Fable and other scoped limits, extra usage and the split by surface are missing. They show while Claude Code's saved sign-in is unexpired."
             }
         }
     }

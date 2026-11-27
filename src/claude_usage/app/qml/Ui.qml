@@ -33,22 +33,6 @@ QtObject {
 
     // -1 is "Other", -2 the days that only have the old daily totals.
     function seriesColor(i) { return i >= 0 && i < s.length ? s[i] : i === -2 ? mix(other, p.surface || "#888", 0.45) : other }
-    // Slots come from the data layer and stay with an entity across ranges.
-    // Lists (sidebar, sessions, models) colour only what the chart draws and
-    // everything else in the colour of "Other", so a colour always means one band.
-    function fixColors(snap) {
-        if (!snap || !snap.timeline) return snap
-        var inChart = {}
-        function mark(g, pre) { g.keys.forEach(function (k, i) { inChart[pre + k] = g.colors[i] }) }
-        mark(snap.timeline.by.project, "p:")
-        mark(snap.timeline.by.model, "m:")
-        function carry(list, field, pre) {
-            (list || []).forEach(function (o) { var c = inChart[pre + o[field]]; o.color = c === undefined ? -1 : c })
-        }
-        carry(snap.projects, "name", "p:"); carry(snap.sessions, "project", "p:"); carry(snap.top_sessions, "project", "p:")
-        carry(snap.models, "name", "m:")
-        return snap
-    }
     function alpha(c, a) { var q = Qt.darker(c, 1.0); return Qt.rgba(q.r, q.g, q.b, a) }
     function mix(a, b, t) { var x = Qt.darker(a, 1.0), y = Qt.darker(b, 1.0); return Qt.rgba(x.r + (y.r - x.r) * t, x.g + (y.g - x.g) * t, x.b + (y.b - x.b) * t, 1) }
 

@@ -59,13 +59,9 @@ def _refresh_access_token_if_needed(creds_path: str) -> None:
                 "-X", "POST", _TOKEN_URL,
                 "-H", "Content-Type: application/x-www-form-urlencoded",
                 "-H", "User-Agent: claude-code/1.0",
-                "-d",
-                (
-                    "grant_type=refresh_token"
-                    f"&refresh_token={_refresh_tok}"
-                    f"&client_id={_CLIENT_ID}"
-                ),
+                "-d", "@-",  # the body on stdin: a command line is readable by other local processes
             ],
+            input=f"grant_type=refresh_token&refresh_token={_refresh_tok}&client_id={_CLIENT_ID}",
             capture_output=True, text=True, timeout=15,
             creationflags=0x08000000,  # CREATE_NO_WINDOW on Windows
         )
@@ -205,12 +201,13 @@ def _fetch_unified_headers_via_messages(token: str) -> dict[str, Any]:
             [
                 _curl, "-s", "-D", "-", "-o", os.devnull, "-w", "\n%{http_code}",
                 "https://api.anthropic.com/v1/messages",
-                "-H", f"Authorization: Bearer {token}",
+                "-H", "@-",  # the Authorization header on stdin, never on the command line
                 "-H", "anthropic-version: 2023-06-01",
                 "-H", "anthropic-beta: oauth-2025-04-20",
                 "-H", "content-type: application/json",
                 "-d", body,
             ],
+            input=f"Authorization: Bearer {token}\n",
             capture_output=True, text=True, timeout=15, **_kw,
         )
     except (OSError, _sp.SubprocessError):
@@ -355,10 +352,11 @@ def _fetch_oauth_usage(token: str) -> dict[str, Any]:
             [
                 _curl, "-s", "-w", "\n%{http_code}",
                 "https://api.anthropic.com/api/oauth/usage",
-                "-H", f"Authorization: Bearer {token}",
+                "-H", "@-",  # the Authorization header on stdin, never on the command line
                 "-H", "anthropic-beta: oauth-2025-04-20",
                 "-H", "User-Agent: claude-code/1.0",
             ],
+            input=f"Authorization: Bearer {token}\n",
             capture_output=True, text=True, timeout=15, **_run_kwargs,
         )
     except (OSError, _sp.SubprocessError):

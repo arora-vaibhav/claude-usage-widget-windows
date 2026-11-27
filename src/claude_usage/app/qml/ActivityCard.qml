@@ -6,6 +6,7 @@ import QtQuick.Shapes
 Card {
     id: card
     property var act: null           // snapshot.activity
+    property var range: null         // the facts follow the range; the honeycomb and streaks are 12 weeks
     readonly property bool wide: width >= 700
     implicitHeight: 2 * padding + (wide ? Math.max(lcol.height, rcol.height) : lcol.height + 24 + rcol.height)
 
@@ -172,6 +173,13 @@ Card {
             }
         }
         Item { width: 1; height: 16 }
+        Txt {
+            visible: !!card.act && card.act.facts.length > 0
+            height: 24
+            readonly property string scope: Ui.inRange(card.range)
+            text: scope.charAt(0).toUpperCase() + scope.slice(1)
+            font.pixelSize: 12; font.weight: 600; color: Ui.p.text_muted
+        }
         Repeater {
             model: card.act ? card.act.facts.length : 0
             Item {

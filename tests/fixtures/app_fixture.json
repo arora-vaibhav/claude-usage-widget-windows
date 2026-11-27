@@ -26,7 +26,7 @@
    "pct": 0.46,
    "resets_at": "2026-12-01T20:00:00-05:00",
    "level": "normal",
-   "forecast": "Limit Sat 3:20 AM",
+   "forecast": "At this pace the limit is reached Sat 3:20 AM",
    "eta": "2026-11-28T13:17:23-05:00"
   },
   "session": null,
@@ -38,7 +38,8 @@
   "live": true,
   "state": "ok",
   "as_of": "2026-11-26T14:18:00-05:00",
-  "message": null
+  "message": null,
+  "error_kind": null
  },
  "limits": {
   "weekly": {
@@ -574,7 +575,8 @@
    }
   ],
   "weeks_hit": 8,
-  "weeks_counted": 12
+  "weeks_counted": 12,
+  "source": "oauth"
  },
  "kpis": [
   {
@@ -2117,21 +2119,21 @@
    "name": "design-system",
    "sessions": 13,
    "cost": 130.52,
-   "color": 5,
+   "color": -1,
    "idle": false
   },
   {
    "name": "data-pipeline",
    "sessions": 0,
    "cost": 0.0,
-   "color": 6,
+   "color": -1,
    "idle": true
   },
   {
    "name": "research-notes",
    "sessions": 0,
    "cost": 0.0,
-   "color": 7,
+   "color": -1,
    "idle": true
   },
   {
@@ -2181,7 +2183,7 @@
    "id": "6bbf4273-a18f",
    "title": null,
    "project": "design-system",
-   "color": 5,
+   "color": -1,
    "model": "Opus 5.5",
    "entrypoint": "cli",
    "started": "2026-11-21T23:27:04-05:00",
@@ -2351,7 +2353,7 @@
    "id": "88122e14-0675",
    "title": "Add CSV export to reports",
    "project": "design-system",
-   "color": 5,
+   "color": -1,
    "model": "Opus 5.5",
    "entrypoint": "sdk-cli",
    "started": "2026-11-21T16:28:11-05:00",
@@ -2368,7 +2370,7 @@
    "id": "c8020ffd-1724",
    "title": "Update dependency pins",
    "project": "design-system",
-   "color": 5,
+   "color": -1,
    "model": "Opus 5.5",
    "entrypoint": "desktop",
    "started": "2026-11-21T07:09:55-05:00",
@@ -2419,7 +2421,7 @@
    "id": "23c77e7a-c73f",
    "title": "Tidy up lint warnings",
    "project": "design-system",
-   "color": 5,
+   "color": -1,
    "model": "Opus 5.5",
    "entrypoint": "cli",
    "started": "2026-11-25T02:32:41-05:00",
@@ -2640,7 +2642,7 @@
    "id": "0db5a939-532b",
    "title": "Add CSV export to reports",
    "project": "design-system",
-   "color": 5,
+   "color": -1,
    "model": "Opus 5.5",
    "entrypoint": "desktop",
    "started": "2026-11-21T05:07:58-05:00",
@@ -3014,7 +3016,7 @@
    "id": "dc97b77e-a8b5",
    "title": "Add dark mode tokens",
    "project": "design-system",
-   "color": 5,
+   "color": -1,
    "model": "Opus 5.5",
    "entrypoint": "cli",
    "started": "2026-11-26T08:24:35-05:00",
@@ -3048,7 +3050,7 @@
    "id": "5e63af16-570b",
    "title": "Fix flaky upload test",
    "project": "design-system",
-   "color": 5,
+   "color": -1,
    "model": "Opus 5.5",
    "entrypoint": "sdk-cli",
    "started": "2026-11-25T20:54:30-05:00",
@@ -3150,7 +3152,7 @@
    "id": "c7790c37-47a2",
    "title": "Add dark mode tokens",
    "project": "design-system",
-   "color": 5,
+   "color": -1,
    "model": "Opus 5.5",
    "entrypoint": "sdk-cli",
    "started": "2026-11-20T19:15:36-05:00",
@@ -3371,7 +3373,7 @@
    "id": "a352b6b5-e951",
    "title": "Add CSV export to reports",
    "project": "design-system",
-   "color": 5,
+   "color": -1,
    "model": "Opus 5.5",
    "entrypoint": "sdk-cli",
    "started": "2026-11-21T06:39:04-05:00",
@@ -3694,7 +3696,7 @@
    "id": "e35c18a0-3f01",
    "title": "Retry logic for webhooks",
    "project": "design-system",
-   "color": 5,
+   "color": -1,
    "model": "Opus 5.5",
    "entrypoint": "desktop",
    "started": "2026-11-21T00:49:37-05:00",
@@ -3898,7 +3900,7 @@
    "id": "7deb30ad-49b2",
    "title": "Retry logic for webhooks",
    "project": "design-system",
-   "color": 5,
+   "color": -1,
    "model": "Sonnet 5.5",
    "entrypoint": "desktop",
    "started": "2026-11-21T16:41:59-05:00",
@@ -4323,7 +4325,7 @@
    "id": "5a1d6349-0f2c",
    "title": "Refactor auth middleware",
    "project": "design-system",
-   "color": 5,
+   "color": -1,
    "model": "Sonnet 5.5",
    "entrypoint": "sdk-cli",
    "started": "2026-11-19T23:09:31-05:00",
@@ -4340,7 +4342,7 @@
    "id": "3c71a896-d77b",
    "title": "Tidy up lint warnings",
    "project": "design-system",
-   "color": 5,
+   "color": -1,
    "model": "Sonnet 5.5",
    "entrypoint": "sdk-cli",
    "started": "2026-11-25T03:06:50-05:00",
@@ -4427,7 +4429,7 @@
    "id": "6bbf4273-a18f",
    "title": null,
    "project": "design-system",
-   "color": 5,
+   "color": -1,
    "model": "Opus 5.5",
    "entrypoint": "cli",
    "started": "2026-11-21T23:27:04-05:00",
@@ -4561,6 +4563,7 @@
   }
  ],
  "sessions_total": 132,
+ "sessions_total_all": 132,
  "activity": {
   "days": [
    {

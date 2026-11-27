@@ -199,8 +199,10 @@ class Ingestor:
         todo = sorted((p for p, st in found.items() if self._changed(p, st[:2])), key=lambda p: _order(p, found[p][2]))
         calls = done = 0
         cancelled = False
+        # Progress counts every transcript found, so a pass resumed after a restart goes on from where it was.
+        current = len(found) - len(todo)
         if progress:
-            progress(0, len(todo))
+            progress(current, len(found))
         for rel in todo:
             if cancel and cancel():
                 cancelled = True
@@ -208,7 +210,7 @@ class Ingestor:
             calls += self._read(rel, *found[rel][:2], cancel=cancel)
             done += 1
             if progress:
-                progress(done, len(todo))
+                progress(current + done, len(found))
             # A file that could not be opened (deleted by cleanup, locked) is not recorded; retried next pass.
             if self._files.get(rel, found[rel])[0] != found[rel][0] and cancel and cancel():
                 cancelled = True  # stopped inside this file

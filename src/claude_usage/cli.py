@@ -57,8 +57,11 @@ def run_cli(argv: Sequence[str]) -> int:
     config = load_config(user_config_path())
     conn, ing = _open_store(config, reindex=args.reindex)
 
+    start: dict = {}
+
     def progress(done: int, total: int) -> None:
-        if total >= 100 and (done % 100 == 0 or done == total):  # only a long pass, like the first one
+        start.setdefault("done", done)  # the first call counts the transcripts that were already current
+        if total - start["done"] >= 100 and (done % 100 == 0 or done == total):  # only a long pass, like the first one
             print(f"\rIndexed {done} of {total} transcripts", end="", file=sys.stderr, flush=True)
 
     result = ing.index(progress)
