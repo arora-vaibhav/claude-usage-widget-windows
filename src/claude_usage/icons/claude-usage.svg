@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2B2A27"/>
+      <stop offset="1" stop-color="#151514"/>
+    </linearGradient>
+    <linearGradient id="arc" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#C15F3C"/>
+      <stop offset="1" stop-color="#F0A07E"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#tile)"/>
+  <rect x="9" y="9" width="238" height="238" rx="55" fill="none" stroke="#FFFFFF" stroke-opacity="0.08" stroke-width="2"/>
+  <!-- The gauge from the app's sidebar: a full track and a 250 degree arc from 135 degrees, centre dot. -->
+  <circle cx="128" cy="128" r="72" fill="none" stroke="#D97757" stroke-opacity="0.22" stroke-width="26"/>
+  <path d="M 77.09 178.91 A 72 72 0 1 1 193.25 158.43" fill="none" stroke="url(#arc)" stroke-width="26" stroke-linecap="round"/>
+  <circle cx="128" cy="128" r="22" fill="#D97757"/>
+</svg>

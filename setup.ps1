@@ -13,8 +13,15 @@ $ErrorActionPreference = "Stop"
 
 # -- Paths ------------------------------------------------------------------
 $repoDir      = $PSScriptRoot
-$launcherDst  = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\claude-usage-launcher.vbs"
+$appDir       = "$env:LOCALAPPDATA\claude-usage"   # also where the app keeps its store
+$launcherDst  = Join-Path $appDir "launcher.vbs"
+$iconDst      = Join-Path $appDir "claude-usage.ico"
+$startMenuDst = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Claude Usage.lnk"
 $shortcutDst  = "$env:USERPROFILE\Desktop\Claude Usage.lnk"
+# Written by older versions of this script: a launcher script listed in the Start menu, and a shared
+# Start menu shortcut to it with the script host's icon.
+$legacyLauncher = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\claude-usage-launcher.vbs"
+$legacyShared   = "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Claude Usage.lnk"
 $startupDir   = [Environment]::GetFolderPath('Startup')
 # The same file the app's "Launch at startup" setting creates and removes.
 $autostartDst = Join-Path $startupDir "claude-usage-widget.vbs"
@@ -27,8 +34,12 @@ function Write-Warn($msg) { Write-Host "   WARN: $msg" -ForegroundColor Yellow }
 # -- Uninstall --------------------------------------------------------------
 if ($Uninstall) {
     Write-Step "Uninstalling..."
-    if (Test-Path $launcherDst) { Remove-Item $launcherDst; Write-OK "Removed launcher VBS" }
-    if (Test-Path $shortcutDst) { Remove-Item $shortcutDst; Write-OK "Removed desktop shortcut" }
+    foreach ($p in @($launcherDst, $iconDst, $legacyLauncher)) {
+        if (Test-Path $p) { Remove-Item $p; Write-OK "Removed $(Split-Path $p -Leaf)" }
+    }
+    foreach ($p in @($startMenuDst, $shortcutDst, $legacyShared)) {
+        if (Test-Path $p) { Remove-Item $p -ErrorAction SilentlyContinue; Write-OK "Removed shortcut $p" }
+    }
     foreach ($p in @($autostartDst, $legacyAutostart)) {
         if (Test-Path $p) { Remove-Item $p; Write-OK "Removed autostart entry" }
     }
@@ -63,22 +74,33 @@ Write-Step "Installing claude-usage-widget from local source..."
 uv tool install $repoDir --force --reinstall-package claude-usage-widget
 Write-OK "Installed from $repoDir"
 
-# -- Install console-less launcher -----------------------------------------
-Write-Step "Installing launcher (no console window)..."
+# -- Install console-less launcher and the icon ----------------------------
+Write-Step "Installing launcher (no console window) and icon..."
+New-Item -ItemType Directory -Force $appDir | Out-Null
 $vbsSrc = Join-Path $repoDir "launcher\claude-usage-launcher.vbs"
 Copy-Item $vbsSrc $launcherDst -Force
-Write-OK "Launcher installed to Start Menu"
+Copy-Item (Join-Path $repoDir "src\claude_usage\icons\claude-usage.ico") $iconDst -Force
+Write-OK "Launcher and icon installed to $appDir"
 
-# -- Create desktop shortcut ------------------------------------------------
-Write-Step "Creating desktop shortcut..."
+# -- Start menu and desktop shortcuts ---------------------------------------
+Write-Step "Creating Start menu and desktop shortcuts..."
 $shell = New-Object -ComObject WScript.Shell
-$lnk   = $shell.CreateShortcut($shortcutDst)
-$lnk.TargetPath  = "wscript.exe"
-$lnk.Arguments   = "`"$launcherDst`""
-$lnk.WindowStyle = 7
-$lnk.Description = "Claude Usage Widget"
-$lnk.Save()
-Write-OK "Desktop shortcut created: Claude Usage.lnk"
+foreach ($dst in @($startMenuDst, $shortcutDst)) {
+    $lnk = $shell.CreateShortcut($dst)
+    $lnk.TargetPath   = "wscript.exe"
+    $lnk.Arguments    = "`"$launcherDst`""
+    $lnk.WindowStyle  = 7
+    $lnk.IconLocation = "$iconDst,0"
+    $lnk.Description  = "Claude Usage"
+    $lnk.Save()
+}
+if (Test-Path $legacyLauncher) { Remove-Item $legacyLauncher }
+if (Test-Path $legacyShared) {
+    # Only an admin can edit it, but its owner can delete it; the new per-user shortcut replaces it.
+    Remove-Item $legacyShared -ErrorAction SilentlyContinue
+    if (Test-Path $legacyShared) { Write-Warn "Could not remove the old shared shortcut $legacyShared (it has the old icon). Delete it as an administrator." }
+}
+Write-OK "Shortcuts created: Start menu and Desktop (Claude Usage)"
 
 # -- Optional: launch automatically at login --------------------------------
 # An entry from an older version of this script counts as a yes, so the Settings toggle sees it.

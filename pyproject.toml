@@ -50,7 +50,7 @@ include = ["claude_usage*"]
 version = { attr = "claude_usage.__version__" }
 
 [tool.setuptools.package-data]
-claude_usage = ["py.typed", "icons/*.svg", "app/qml/*.qml", "app/qml/qmldir"]
+claude_usage = ["py.typed", "icons/*.svg", "icons/*.ico", "app/qml/*.qml", "app/qml/qmldir"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

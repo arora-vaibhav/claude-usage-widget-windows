@@ -89,8 +89,15 @@ def _launch_gui() -> int:
     from PySide6.QtCore import QLockFile, QtMsgType, qInstallMessageHandler
     from PySide6.QtWidgets import QApplication, QMessageBox
 
+    from PySide6.QtGui import QIcon
+
+    if sys.platform == "win32":  # its own taskbar button and icon, not grouped under python.exe
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ClaudeUsage.App")
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("claude-usage")
+    app.setWindowIcon(QIcon(os.path.join(os.path.dirname(__file__), "icons", "claude-usage.ico")))
     app.setQuitOnLastWindowClosed(False)
 
     config = load_config(user_config_path())

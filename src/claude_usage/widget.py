@@ -38,7 +38,7 @@ ON_TOP_MS = 2000
 SAVE_DELAY_MS = 400  # one write per burst of changes (a slider drag sends dozens)
 SAVE_RETRY_MS = 60_000  # after a failed write; a locked file or a full disk can clear
 OPEN_FAILED = "Couldn't open the Claude Usage window. Restart Claude Usage."
-ICON = os.path.join(os.path.dirname(__file__), "icons", "claude-tray.svg")
+ICON = os.path.join(os.path.dirname(__file__), "icons", "claude-usage.ico")
 
 
 def _rect_on_some_screen(x: int, y: int, w: int, h: int) -> bool:
