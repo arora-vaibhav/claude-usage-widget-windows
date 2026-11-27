@@ -266,8 +266,15 @@ def test_top_sessions_come_from_the_whole_range(h):
     page = find(h.win, "OverviewPage")[0]
     table = [t for t in find(h.win, "SessionTable") if page.isAncestorOf(t)][0]
     assert [r["id"] for r in js(table.property("rows"))] == ["the-costliest"]
+    seen = len(h.win.warnings)
+    for _ in range(3):  # and back: the rows once read the old top_sessions and threw
+        h.win.update_snapshot(h.snap)
+        pump(60)
+        h.win.update_snapshot(snap)
+        pump(60)
     h.win.update_snapshot(h.snap)
     pump(60)
+    assert h.win.warnings[seen:] == []
 
 
 def test_all_projects_count_is_not_carried_across_ranges(h):
@@ -297,13 +304,13 @@ def test_headline_numbers_fit_at_the_minimum_size(h):
         pump()
 
 
-def qml_eval(h, expr):
-    """Evaluate a JS expression with the Ui singleton in scope."""
+def qml_eval(h, expr, root="QtObject"):
+    """Evaluate a JS expression with the Ui singleton (and *root*'s members) in scope."""
     from PySide6.QtCore import QUrl
     from PySide6.QtQml import QQmlComponent
     from claude_usage.app.window import QML_MAIN
     comp = QQmlComponent(h.win.engine)
-    comp.setData(f"import QtQuick\nQtObject {{ property var out: {expr} }}".encode(),
+    comp.setData(f"import QtQuick\n{root} {{ property var out: {expr} }}".encode(),
                  QUrl.fromLocalFile(str(QML_MAIN.with_name("Eval.qml"))))
     obj = comp.create()
     assert obj is not None, [e.toString() for e in comp.errors()]
@@ -564,6 +571,89 @@ def test_close_hides_and_remembers_geometry(h):
     h.win.show()
     pump(50)
     assert h.win.is_visible()
+
+
+def test_before_the_first_snapshot_the_page_shows_its_shape():
+    win = AppWindow(lambda r, p: None, settings={"appearance": "light"})
+    try:
+        win.window.resize(1280, 820)
+        win.show()
+        pump(100)
+        page = find(win, "OverviewPage")[0]
+        assert len([g for g in find_in(page, "Ghost") if g.isVisible()]) >= 3
+        # nothing that only makes sense with data: scope lines, the cost footnote
+        texts = [t.property("text") for t in find_in(page, "Txt") if t.isVisible()]
+        assert not any("Account-wide" in t or "API-equivalent" in t for t in texts), texts
+        assert win.warnings == []
+    finally:
+        win.prepare_quit()
+        win.window.close()
+
+
+def test_first_index_says_it_is_still_reading(h):
+    snap = copy.deepcopy(h.snap)
+    STATES["empty"](snap)
+    snap["project"] = None
+    snap["status"]["indexing"] = {"done": 412, "total": 12512}
+    h.win.update_snapshot(snap)
+    h.win.backend.pageRequested.emit("overview")
+    pump(60)
+    try:
+        page = find(h.win, "OverviewPage")[0]
+        texts = [t.property("text") for t in find_in(page, "Txt") if t.isVisible()]
+        assert "Still reading your transcripts" in texts and not any(t.startswith("No activity") for t in texts), texts
+        assert not [b for b in find_in(page, "Btn") if b.isVisible() and b.property("text") == "Show all time"]
+    finally:
+        h.win.update_snapshot(h.snap)
+        pump(60)
+
+
+def test_the_kpi_row_is_in_the_first_screen(h):
+    # Plan limits come first; at the default size they must leave room for
+    # the whole KPI row.
+    from PySide6.QtCore import QPointF
+    h.win.backend.pageRequested.emit("overview")
+    page = find(h.win, "OverviewPage")[0]
+    page.setProperty("contentY", 0)
+    pump()
+    bottoms = [k.mapToItem(page, QPointF(0, k.height())).y() for k in find_in(page, "KpiCard") if k.isVisible()]
+    assert len(bottoms) == 5 and max(bottoms) <= page.height(), (bottoms, page.height())
+
+
+def test_turns_without_records_read_as_unknown(h):
+    cells = "[cell({turns: 0, agent_ms: 0}, 'turns'), cell({turns: 0, agent_ms: 5000}, 'turns'), cell({turns: 3, agent_ms: 0}, 'turns')]"
+    assert qml_eval(h, cells, root="SessionTable") == ["-", "0", "3"]
+
+
+def test_legend_keeps_whole_names_when_the_row_has_room(h):
+    snap = copy.deepcopy(h.snap)
+    long_name = "a-rather-long-project-folder-name"
+    snap["timeline"]["by"]["project"]["keys"][0] = long_name
+    h.win.backend.pageRequested.emit("overview")
+    h.win.window.resize(1600, 1000)
+    h.win.update_snapshot(snap)
+    pump()
+    try:
+        tl = find(h.win, "TimelineCard")[0]
+        names = [t for t in find_in(tl, "TipTxt") if t.property("text") == long_name]
+        assert names and not names[0].property("truncated")
+    finally:
+        h.win.window.resize(1280, 820)
+        h.win.update_snapshot(h.snap)
+        pump()
+
+
+def test_windows_animation_setting_turns_motion_off(h, monkeypatch):
+    from claude_usage.app import window
+    assert isinstance(window.animations_on(), bool)
+    monkeypatch.setattr(window, "animations_on", lambda: False)
+    h.win.backend.themeChanged.emit()
+    try:
+        assert qml_eval(h, "[Ui.fast, Ui.ms(300)]") == [0, 0]
+    finally:
+        monkeypatch.undo()
+        h.win.backend.themeChanged.emit()
+    assert qml_eval(h, "[Ui.fast, Ui.ms(300)]") == ([140, 300] if window.animations_on() else [0, 0])
 
 
 # The tests below run in a child process on the real Windows platform

@@ -29,7 +29,8 @@ Item {
     }
     function cell(s, key) {
         if (key === "agent_ms") return s.agent_ms || s.turns ? Ui.dur(s.agent_ms) : "-"
-        if (key === "turns") return Ui.int(s.turns)
+        // no turn records at all reads as unknown, like agent time beside it
+        if (key === "turns") return s.turns || s.agent_ms ? Ui.int(s.turns) : "-"
         if (key === "tokens") return Ui.tok(s.tokens)
         if (key === "cost") return Ui.cents(s.cost)
         if (key === "cache_hit") return Ui.pct(s.cache_hit, 1)

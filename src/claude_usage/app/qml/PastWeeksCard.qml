@@ -48,7 +48,7 @@ Card {
 
     Item {
         id: chart
-        y: note.y + note.height + 16
+        y: note.y + note.height + 8
         width: parent.width
         height: parent.height - y
         readonly property int n: card.weeks.length

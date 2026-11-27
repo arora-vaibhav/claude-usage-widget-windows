@@ -32,6 +32,13 @@ Page {
         Btn { glyph: ""; tip: "Refresh"; spin: backend.busy; onClicked: backend.refresh() }
     ]
 
+    // Placeholders in the page's shape until the first snapshot; no animation.
+    component Ghost: Card {
+        Rectangle { width: Math.min(140, parent.width * 0.5); height: 12; radius: 6; color: Ui.p.track }
+        Rectangle { y: 30; width: Math.min(110, parent.width * 0.4); height: 26; radius: 8; color: Ui.p.track }
+        Rectangle { y: 76; width: parent.width; height: Math.max(0, parent.height - 76); radius: 10; color: Ui.alpha(Ui.p.track, 0.5) }
+    }
+
     // ---- first run: building the history
     Card {
         id: indexing
@@ -52,7 +59,7 @@ Page {
                 Rectangle {
                     height: 6; radius: 3; color: Ui.p.accent
                     width: parent.width * indexing.frac
-                    Behavior on width { NumberAnimation { duration: 300; easing.type: Easing.OutCubic } }
+                    Behavior on width { NumberAnimation { duration: Ui.ms(300); easing.type: Easing.OutCubic } }
                 }
             }
             Txt {
@@ -78,7 +85,7 @@ Page {
     Eyebrow {
         width: page.cw
         title: "PLAN LIMITS"
-        sub: page.signedOut ? "" : "Account-wide" + (page.limitsAsOf && !page.stale ? ", as of " + Ui.clock(page.limitsAsOf) : "") + (page.snap && page.snap.project ? ". Limits are not split by project." : ".")
+        sub: page.signedOut || !page.snap ? "" : "Account-wide" + (page.limitsAsOf && !page.stale ? ", as of " + Ui.clock(page.limitsAsOf) : "") + (page.snap && page.snap.project ? ". Limits are not split by project." : ".")
         pill: page.stale ? "Not refreshed since " + (page.limitsAsOf ? Ui.whenShort(page.limitsAsOf) : "a while") : ""
         pillKind: "warn"
     }
@@ -139,6 +146,14 @@ Page {
             height: past.height
         }
     }
+    Row {
+        visible: !page.snap
+        spacing: Ui.gap
+        Repeater {
+            model: limitsRow.wide ? [1.55, 0.95, 1.1] : [0]
+            Ghost { width: modelData ? limitsRow.colW * modelData : page.cw; height: 380 }
+        }
+    }
 
     // ---- usage for the range
     Item { width: 1; height: 8 }
@@ -149,20 +164,28 @@ Page {
              + (page.snap.range.key === "all" ? "" : " Changes compare with the same length of time just before, to the hour.") : ""
     }
     Card {
+        id: emptyCard
+        // nothing yet because the first index is still running, not because nothing ran
+        readonly property var ix: page.st ? page.st.indexing : null
         visible: page.empty
         width: page.cw; height: 150
         Column {
             anchors.centerIn: parent
             spacing: 6
-            Txt { anchors.horizontalCenter: parent.horizontalCenter; text: "No activity " + Ui.inRange(page.range); font.pixelSize: 15; font.weight: 600 }
+            Txt {
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: emptyCard.ix ? "Still reading your transcripts" : "No activity " + Ui.inRange(page.range)
+                font.pixelSize: 15; font.weight: 600
+            }
             Txt {
                 anchors.horizontalCenter: parent.horizontalCenter
                 color: Ui.p.text_muted
-                text: page.snap && page.snap.project ? page.snap.project + " has no sessions in this range." : "No Claude Code sessions in this range."
+                text: emptyCard.ix ? Ui.int(emptyCard.ix.done) + " of " + Ui.int(emptyCard.ix.total) + " so far. Usage shows up here as they are indexed."
+                    : page.snap && page.snap.project ? page.snap.project + " has no sessions in this range." : "No Claude Code sessions in this range."
             }
             Item { width: 1; height: 6 }
             Btn {
-                visible: page.range && page.range.key !== "all"
+                visible: !emptyCard.ix && !!page.range && page.range.key !== "all"
                 anchors.horizontalCenter: parent.horizontalCenter
                 text: "Show all time"
                 onClicked: backend.setRange("all")
@@ -195,6 +218,15 @@ Page {
             }
         }
     }
+    Row {
+        visible: !page.snap
+        spacing: Ui.gap
+        Repeater {
+            model: kpis.columns
+            Ghost { width: (page.cw - Ui.gap * (kpis.columns - 1)) / kpis.columns - 0.01; height: 180 }
+        }
+    }
+    Ghost { visible: !page.snap; width: page.cw; height: 500 }
     TimelineCard {
         visible: !page.empty && !!page.snap
         width: page.cw
@@ -218,8 +250,11 @@ Page {
             height: 24 + 40 + 12 + top.implicitHeight + 56
             // top_sessions ranks the whole range; sessions is capped to the most recent
             readonly property bool ranked: !!(page.snap && page.snap.top_sessions)
-            readonly property var rows: !page.snap ? [] : ranked ? page.snap.top_sessions.slice(0, 10)
-                : page.snap.sessions.slice().sort(function (a, b) { return b.cost - a.cost }).slice(0, 10)
+            // read top_sessions here, not through ranked, which can still hold the last snapshot's answer
+            readonly property var rows: {
+                var ts = page.snap && page.snap.top_sessions
+                return !page.snap ? [] : ts ? ts.slice(0, 10) : page.snap.sessions.slice().sort(function (a, b) { return b.cost - a.cost }).slice(0, 10)
+            }
             Item {
                 x: Ui.pad; y: 24
                 width: parent.width - 2 * Ui.pad; height: 40
@@ -269,6 +304,7 @@ Page {
         range: page.range
     }
     Column {
+        visible: !!page.snap
         width: page.cw
         spacing: 4
         topPadding: 4

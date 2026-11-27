@@ -19,8 +19,8 @@ Rectangle {
     border.color: Ui.dark ? Ui.p.line_strong : "transparent"
     width: Math.min(340, Math.max(176, fm.advanceWidth(title) + 24, big.advanceWidth(value) + 24, rowsWidth() + 24))
     height: col.implicitHeight + 20
-    Behavior on x { enabled: tip.visible; NumberAnimation { duration: 90; easing.type: Easing.OutCubic } }
-    Behavior on y { enabled: tip.visible; NumberAnimation { duration: 90; easing.type: Easing.OutCubic } }
+    Behavior on x { enabled: tip.visible; NumberAnimation { duration: Ui.ms(90); easing.type: Easing.OutCubic } }
+    Behavior on y { enabled: tip.visible; NumberAnimation { duration: Ui.ms(90); easing.type: Easing.OutCubic } }
 
     FontMetrics { id: fm; font.family: Ui.fontUi; font.pixelSize: 12; font.variableAxes: Ui.axes(false) }
     FontMetrics { id: big; font.family: Ui.fontUi; font.pixelSize: 15; font.weight: 600; font.variableAxes: Ui.axes(false) }

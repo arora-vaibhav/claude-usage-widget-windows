@@ -91,7 +91,7 @@ Rectangle {
         Item {
             width: parent.width; height: 24
             Txt { x: 12; height: parent.height; text: "PROJECTS"; font.pixelSize: 11; font.weight: 600; font.letterSpacing: 0.9; color: Ui.p.text_faint }
-            Txt { anchors.right: parent.right; anchors.rightMargin: 10; height: parent.height; text: side.active.length + " active"; font.pixelSize: 12; color: Ui.p.text_faint }
+            Txt { anchors.right: parent.right; anchors.rightMargin: 10; height: parent.height; text: side.snap ? side.active.length + " active" : ""; font.pixelSize: 12; color: Ui.p.text_faint }
         }
     }
 
@@ -163,7 +163,7 @@ Rectangle {
                 Rectangle {
                     height: 4; radius: 2; color: Ui.p.accent
                     width: parent.parent.ix && parent.parent.ix.total ? parent.width * Math.min(1, parent.parent.ix.done / parent.parent.ix.total) : 0
-                    Behavior on width { NumberAnimation { duration: 300; easing.type: Easing.OutCubic } }
+                    Behavior on width { NumberAnimation { duration: Ui.ms(300); easing.type: Easing.OutCubic } }
                 }
             }
         }
@@ -176,7 +176,7 @@ Rectangle {
                 color: parent.st === "ok" ? (side.snap && side.snap.now.live ? Ui.p.ok : Ui.p.text_faint)
                      : parent.st === "stale" ? Ui.p.warn_fill : parent.st === "loading" ? Ui.p.text_faint : Ui.p.bad_fill
                 Rectangle {
-                    visible: side.snap && side.snap.now.live && parent.parent.st === "ok"
+                    visible: !!(side.snap && side.snap.now.live) && parent.parent.st === "ok"
                     anchors.centerIn: parent; width: 16; height: 16; radius: 8
                     color: Ui.alpha(Ui.p.ok, 0.18)
                 }

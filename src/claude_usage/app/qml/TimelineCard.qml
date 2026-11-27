@@ -83,7 +83,7 @@ Card {
     // the big total counts to its new value; a metric switch jumps, since the units differ
     property real shown: 0
     property string shownMetric: metric
-    Behavior on shown { id: countUp; NumberAnimation { duration: 300; easing.type: Easing.OutCubic } }
+    Behavior on shown { id: countUp; NumberAnimation { duration: Ui.ms(300); easing.type: Easing.OutCubic } }
     onTotalChanged: {
         countUp.enabled = shownMetric === metric
         shown = total
@@ -93,21 +93,28 @@ Card {
     function replay() { enter.restart() }
 
     // The legend stays on one row while labels can keep 104 px or more;
-    // past that it splits into two even rows rather than leave one chip alone.
+    // past that it splits into two even rows rather than leave one chip
+    // alone. Only names longer than the widest cap that fits are cut.
     FontMetrics { id: fmName; font.family: Ui.fontUi; font.pixelSize: 13; font.variableAxes: Ui.axes(false) }
     FontMetrics { id: fmVal; font.family: Ui.fontUi; font.pixelSize: 12; font.variableAxes: Ui.axes(false) }
     readonly property var legendFit: {
-        var room = width - 2 * padding
-        function rowW(list, cap) {
-            var w = -legend.spacing
-            for (var i = 0; i < list.length; i++)
-                w += legend.spacing + 50 + Math.min(fmName.advanceWidth(seriesName(list[i])), cap) + fmVal.advanceWidth(mt.big(list[i].sum))
-            return w
+        var room = width - 2 * padding - 2, sp = legend.spacing   // 2 px for text that renders a hair wider
+        var names = all.map(function (s) { return fmName.advanceWidth(seriesName(s)) })
+        var fixed = all.map(function (s) { return 50 + fmVal.advanceWidth(mt.big(s.sum)) })
+        function rowW(a, b, cap) { var w = -sp; for (var i = a; i < b; i++) w += sp + fixed[i] + Math.min(names[i], cap); return w }
+        function fit(rows) {
+            function ok(cap) { return rows.every(function (r) { return rowW(r[0], r[1], cap) <= room }) }
+            var lo = 104, hi = Math.max(lo, Math.max.apply(null, names))
+            if (!ok(lo)) return -1
+            if (ok(hi)) return hi
+            for (var k = 0; k < 10; k++) { var mid = (lo + hi) / 2; if (ok(mid)) lo = mid; else hi = mid }
+            return lo
         }
-        var caps = [160, 140, 120, 104]
-        for (var c = 0; c < caps.length; c++) if (rowW(all, caps[c]) <= room) return { cap: caps[c], w: room }
-        var half = Math.ceil(all.length / 2)
-        return { cap: 160, w: Math.min(room, Math.max(rowW(all.slice(0, half), 160), rowW(all.slice(half), 160)) + 1) }
+        var one = fit([[0, all.length]])
+        if (one >= 0) return { cap: one, w: room + 2 }
+        var half = Math.ceil(all.length / 2), two = fit([[0, half], [half, all.length]])
+        if (two >= 0) return { cap: two, w: Math.max(rowW(0, half, two), rowW(half, all.length, two)) + 3 }
+        return { cap: 104, w: room + 2 }
     }
 
     // ---- header
@@ -387,8 +394,8 @@ Card {
         }
         ParallelAnimation {
             id: enter
-            NumberAnimation { target: plot; property: "grow"; from: 0.9; to: 1; duration: 260; easing.type: Easing.OutCubic }
-            NumberAnimation { target: plot; property: "opacity"; from: 0.2; to: 1; duration: 200; easing.type: Easing.OutCubic }
+            NumberAnimation { target: plot; property: "grow"; from: 0.9; to: 1; duration: Ui.ms(260); easing.type: Easing.OutCubic }
+            NumberAnimation { target: plot; property: "opacity"; from: 0.2; to: 1; duration: Ui.ms(200); easing.type: Easing.OutCubic }
         }
 
         // the bucket still filling: a dashed lead from the last complete bucket to an open dot

@@ -14,7 +14,7 @@ Card {
 
     // the headline counts to a new value when the range or project changes
     property real shown: k ? k.value : 0
-    Behavior on shown { id: countUp; NumberAnimation { duration: 300; easing.type: Easing.OutCubic } }
+    Behavior on shown { id: countUp; NumberAnimation { duration: Ui.ms(300); easing.type: Easing.OutCubic } }
     property string shownKey: ""
     onKChanged: {
         if (!k) return

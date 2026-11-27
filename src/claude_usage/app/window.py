@@ -8,8 +8,10 @@ tests/unit/snapshot_contract.py) and a settings callback
 
 from __future__ import annotations
 
+import ctypes
 import json
 import logging
+import sys
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -29,6 +31,18 @@ PAGES = ("overview", "sessions", "settings")
 VARIABLE_FONT = "Segoe UI Variable"
 
 Provider = Callable[[str, Optional[str]], dict]
+
+
+def animations_on() -> bool:
+    """Windows' "Animation effects" setting (Accessibility, Visual effects)."""
+    if sys.platform != "win32":
+        return True
+    on = ctypes.c_int(1)
+    spi_getclientareaanimation = 0x1042
+    if not ctypes.windll.user32.SystemParametersInfoW(spi_getclientareaanimation, 0, ctypes.byref(on), 0):
+        return True
+    return bool(on.value)
+
 OnSetting = Callable[[str, Any], None]
 OnAction = Callable[[str], None]  # "refresh", "reindex", "check_updates"
 
@@ -107,6 +121,7 @@ class Backend(QObject):
             "fontUi": VARIABLE_FONT if variable else "Segoe UI",
             "fontDisplay": VARIABLE_FONT if variable else "Segoe UI",
             "opsz": variable,
+            "motion": animations_on(),
             "caution": float(th[0]),
             "critical": float(th[1]),
         }

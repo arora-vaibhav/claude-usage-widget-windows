@@ -23,7 +23,10 @@ QtObject {
     readonly property int radius: 16
     readonly property int pad: 24
     readonly property int gap: 16
-    readonly property int fast: 140
+    // Windows' "Animation effects" off: values and pages change at once
+    readonly property bool motion: t.motion !== false
+    function ms(d) { return motion ? d : 0 }
+    readonly property int fast: ms(140)
 
     readonly property var wd: ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
     readonly property var mon: ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]

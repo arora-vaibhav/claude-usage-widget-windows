@@ -66,8 +66,8 @@ ApplicationWindow {
         onCurrentIndexChanged: { fade.target = children[currentIndex]; enter.restart() }
         ParallelAnimation {
             id: enter
-            NumberAnimation { target: rise; property: "y"; from: 10; to: 0; duration: 150; easing.type: Easing.OutCubic }
-            NumberAnimation { id: fade; property: "opacity"; from: 0; to: 1; duration: 150; easing.type: Easing.OutCubic }
+            NumberAnimation { target: rise; property: "y"; from: 10; to: 0; duration: Ui.ms(150); easing.type: Easing.OutCubic }
+            NumberAnimation { id: fade; property: "opacity"; from: 0; to: 1; duration: Ui.ms(150); easing.type: Easing.OutCubic }
         }
 
         OverviewPage { id: overview; snap: root.snap; nowMs: root.nowMs; viewH: root.viewH; onOpenSessions: root.go("sessions") }

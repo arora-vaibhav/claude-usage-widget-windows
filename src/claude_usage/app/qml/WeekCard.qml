@@ -7,7 +7,8 @@ Card {
     property var w: null           // snapshot.limits.weekly
     property real nowMs: Date.now()
     property bool stale: false
-    readonly property real natural: head.height + 8 + big.height + 8 + verdict.height + 8 + (facts.cols === 4 ? 190 : 160) + 16 + facts.height + 2 * padding
+    // kept short so the KPI row still shows below the limits at 1280x820
+    readonly property real natural: head.height + 8 + big.height + 8 + verdict.height + 8 + 140 + 16 + facts.height + 2 * padding
 
     readonly property bool ok: !!w
     readonly property var reset: ok && w.resets_at ? Ui.date(w.resets_at) : null
@@ -77,7 +78,7 @@ Card {
         id: chart
         y: verdict.y + verdict.height + 8
         width: parent.width
-        height: Math.max(150, facts.y - y - 16)
+        height: Math.max(120, facts.y - y - 16)
         w: card.w
     }
     Rectangle { y: facts.y - 16; width: parent.width; height: 1; color: Ui.p.line }
@@ -85,24 +86,26 @@ Card {
         id: facts
         y: parent.height - height
         width: parent.width
-        // four across when there is room, else two by two
-        readonly property int cols: width >= 560 ? 4 : 2
+        // four across down to a narrow card, else two by two
+        readonly property int cols: width >= 340 ? 4 : 2
         columns: cols
         rowSpacing: 6
         readonly property var items: card.ok ? [
-            ["Speed vs an even week", card.w.pace != null ? card.w.pace.toFixed(1) + "x" : "n/a"],
-            ["Usual by now", Ui.pct(card.w.usual)],
-            ["To stay under 100%", card.w.pct < 1 && card.w.daily_budget != null ? Ui.pct(card.w.daily_budget, 1) + " a day" : "n/a"],
-            ["Burn rate", card.w.hourly_rate != null ? Ui.pct(card.w.hourly_rate, 1) + " an hour" : "n/a"]
+            ["Pace vs even", card.w.pace != null ? card.w.pace.toFixed(1) + "x" : "n/a", "Speed against an even spread over the week"],
+            ["Usual by now", Ui.pct(card.w.usual), "Median of past weeks at this point"],
+            ["Daily budget", card.w.pct < 1 && card.w.daily_budget != null ? Ui.pct(card.w.daily_budget, 1) : "n/a", "Use per day that stays under 100%"],
+            ["Burn per hour", card.w.hourly_rate != null ? Ui.pct(card.w.hourly_rate, 1) : "n/a", "Share of the weekly limit used per hour"]
         ] : []
         Repeater {
             model: facts.items
             Column {
                 width: facts.width / facts.cols
-                height: 44
+                height: 42
                 spacing: 2
+                Accessible.role: Accessible.StaticText
+                Accessible.name: modelData[0] + " " + modelData[1] + ". " + modelData[2]
                 Txt { width: parent.width - 8; text: modelData[0]; font.pixelSize: 12; color: Ui.p.text_faint }
-                Txt { width: parent.width - 8; text: modelData[1]; font.pixelSize: 15; font.weight: 600 }
+                Txt { width: parent.width - 8; text: modelData[1]; font.pixelSize: 14; font.weight: 600 }
             }
         }
     }

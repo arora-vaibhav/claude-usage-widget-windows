@@ -9,7 +9,7 @@ Card {
 
     // The API sends codes like "out_of_credits"; show them as a short sentence.
     function reasonText(code) {
-        var known = { out_of_credits: "Off because the account is out of credits.", org_disabled: "Turned off by your organization." }
+        var known = { out_of_credits: "Out of credits.", org_disabled: "Turned off by your organization." }
         var t = known[code] || String(code).replace(/_/g, " ")
         return known[code] ? t : t.charAt(0).toUpperCase() + t.slice(1) + "."
     }
@@ -32,14 +32,20 @@ Card {
         var ex = L.extra_usage
         if (ex) {
             var cap = ex.monthly_limit != null ? ex.currency + " " + ex.monthly_limit.toFixed(2) : null
-            var used = ex.used ? ex.currency + " " + ex.used.toFixed(2) + " used this month. " : "Nothing used this month. "
-            var s = ex.enabled ? (cap ? "Pays past the limit, up to " + cap + " a month. " : "Pays past the limit. ") : (cap ? "Monthly cap " + cap + ". " : "")
+            var s = ex.enabled ? [cap ? "Pays past the limit, up to " + cap + " a month." : "Pays past the limit."]
+                               : [ex.reason ? card.reasonText(ex.reason) : "", cap ? "Cap " + cap + " a month." : ""]
+            // the billing note only matters once it can charge
+            if (ex.enabled || ex.used)
+                s.push((ex.used ? ex.currency + " " + ex.used.toFixed(2) : "Nothing") + " used this month, billed in " + ex.currency + " apart from the API-equivalent costs here.")
             out.push({ label: "Extra usage", pill: ex.enabled ? "On" : "Off", pillKind: ex.enabled ? "ok" : "none",
-                       sub: s + used + "Billed in " + ex.currency + ", separate from the API-equivalent USD in this app." + (ex.reason ? " " + card.reasonText(ex.reason) : "") })
+                       sub: s.filter(function (x) { return x }).join(" ") })
         }
+        // one surface with all of the use says nothing the weekly card does not
+        var sf = L.surfaces.filter(function (x) { return x.pct_of_limit > 0 })
+        if (sf.length > 1 || sf.length === 1 && sf[0].pct < 0.995)
+            out.push({ label: "Where the weekly limit went", sub: sf.map(function (x) { return x.name + " " + Ui.pct(x.pct_of_limit) }).join(", ") + "." })
         return out
     }
-    readonly property var surfaces: limits ? limits.surfaces.filter(function (s) { return s.pct_of_limit > 0 }) : []
 
     Txt { id: title; height: 24; text: "Other limits"; color: Ui.p.text_muted }
     Column {
@@ -50,10 +56,10 @@ Card {
             model: card.rows
             Column {
                 width: col.width
-                bottomPadding: 12
-                spacing: 6
+                bottomPadding: index < card.rows.length - 1 ? 10 : 0
+                spacing: 5
                 Rectangle { visible: index > 0; width: parent.width; height: 1; color: Ui.p.line }
-                Item { width: 1; height: index ? 4 : 0 }
+                Item { width: 1; height: index ? 3 : 0 }
                 Item {
                     width: parent.width; height: 24
                     Txt { height: 24; text: modelData.label; font.weight: 600; width: parent.width - 90 }
@@ -77,19 +83,6 @@ Card {
                     font.pixelSize: 12; color: Ui.p.text_muted
                     lineHeight: 1.15
                 }
-            }
-        }
-        Column {
-            visible: card.surfaces.length > 0
-            width: col.width
-            topPadding: 12
-            spacing: 8
-            Rectangle { width: parent.width; height: 1; color: Ui.p.line }
-            Txt { height: 24; text: "Where the weekly limit went"; font.weight: 600 }
-            Flow {
-                width: parent.width
-                spacing: 8
-                Repeater { model: card.surfaces; Tag { text: modelData.name + " " + Ui.pct(modelData.pct_of_limit) } }
             }
         }
     }

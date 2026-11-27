@@ -23,7 +23,7 @@ Flickable {
         glide.to = Math.max(0, Math.min(contentHeight - height, y))
         if (glide.to !== contentY) glide.restart()
     }
-    NumberAnimation { id: glide; target: page; property: "contentY"; duration: 150; easing.type: Easing.OutCubic }
+    NumberAnimation { id: glide; target: page; property: "contentY"; duration: Ui.ms(150); easing.type: Easing.OutCubic }
     Keys.onPressed: function (e) {
         var y = glide.running ? glide.to : contentY, k = e.key
         if (k === Qt.Key_PageDown || k === Qt.Key_Space && !(e.modifiers & Qt.ShiftModifier)) y += height * 0.9
