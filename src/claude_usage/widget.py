@@ -1,150 +1,53 @@
-"""Detailed popup window + application orchestrator (PySide6).
+"""The controller: OSD, tray, the one menu, the app window and the refresh worker.
 
-No system-tray icon: the :class:`ClaudeUsageApp` wires the OSD overlay to a
-context menu (right-click) and a detail popup (left-click).  All background
-data collection runs in a daemon thread and posts results back to the GUI
-via a thread-safe signal.
+One worker thread does all collection (transcript ingest, the limits fetch,
+utilization samples, the "now" dict), so two refreshes never overlap. A second
+thread builds app snapshots, which take up to a second on a large store. Both
+report to the GUI thread through Qt signals.
 """
 
 from __future__ import annotations
 
 import os
-import sys
 import threading
-import warnings
-from datetime import datetime
-from typing import Any
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
+from typing import Any, Callable, Optional
 
-from PySide6.QtCore import (
-    QObject,
-    QPoint,
-    QPointF,
-    QRectF,
-    QTimer,
-    Qt,
-    Signal,
-    Slot,
-)
-from PySide6.QtGui import QAction, QColor, QFont, QPainter, QPaintEvent
-from PySide6.QtWidgets import (
-    QApplication,
-    QLabel,
-    QMenu,
-    QScrollArea,
-    QVBoxLayout,
-    QWidget,
-)
+from PySide6.QtCore import QObject, QPoint, QRect, Qt, QTimer, Signal
+from PySide6.QtGui import QGuiApplication, QIcon
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
+from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QToolTip
 
-from claude_usage.collector import UsageStats, collect_all
-from claude_usage.forecast import format_forecast
+from claude_usage import __version__, autostart, collector, ingest, snapshot, store, tokens, updater
+from claude_usage.auth_watchdog import AuthWatchdog, is_auth_error
+from claude_usage.config import drop_bad_values, save_config, user_config_path
+from claude_usage.logging_setup import get_logger
 from claude_usage.notifier import UsageNotifier
-from claude_usage.overlay import UsageOverlay, _hex_to_qcolor
-from claude_usage.pricing import MODEL_PRICING, calculate_cost
-from claude_usage.themes import ThemeStyle, get_style, get_theme
+from claude_usage.osd import NO_LIMITS, Osd, _clock, _font, _indexing, _parse, _pct, _rate, _resets, _span, _when
+from claude_usage.winchrome import apply_win11_chrome
 
+log = get_logger()
 
-# ---------------------------------------------------------------------------
-# Layout constants
-# ---------------------------------------------------------------------------
-POPUP_WIDTH = 680
-POPUP_PAD = 20
-HEATMAP_HEIGHT = 18
-SPARKLINE_HEIGHT = 32
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _format_tokens(n: int) -> str:
-    """Format a token count compactly: ``1234567 -> '1.2M'``, ``5400 -> '5.4K'``."""
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.1f}M"
-    if n >= 1_000:
-        return f"{n / 1_000:.1f}K"
-    return str(int(n))
-
-
-def _short_model_name(model: str) -> str:
-    """Strip ``claude-`` prefix and trailing date for compact display."""
-    m = model.removeprefix("claude-")
-    if len(m) >= 9 and m[-9:-8] == "-" and m[-8:].isdigit():
-        m = m[:-9]
-    return m
-
-
-def _prettify_project_name(name: str) -> str:
-    """Convert Claude Code's dashed path (``-home-user-proj``) to ``~/proj``.
-
-    Claude Code encodes every non-alphanumeric path component character as
-    ``-``. On POSIX ``/home/alice/proj`` becomes ``-home-alice-proj``; on
-    Windows ``C:\\Users\\alice\\proj`` becomes ``C--Users-alice-proj``
-    (verified against real Claude Code output — see anthropics/claude-code
-    issue #46071). We build candidate home-dir encodings for both shapes
-    so the pretty form renders correctly on every OS.
-    """
-    if not name:
-        return "?"
-    home = os.path.expanduser("~")
-    # Both POSIX-style ("/home/alice" → "-home-alice") and Windows-style
-    # ("C:\\Users\\alice" → "C--Users-alice") — colons AND backslashes map
-    # to dashes.
-    home_posix = home.replace("/", "-")
-    home_windows = home.replace("\\", "-").replace(":", "-")
-    candidates = {home_posix, home_windows}
-    for home_dashed in candidates:
-        if not home_dashed:
-            continue
-        if name == home_dashed:
-            return "~"
-        if name.startswith(home_dashed + "-"):
-            return "~/" + name[len(home_dashed) + 1:]
-    return name
-
-
-def _format_reset_duration(reset_ts: int) -> str:
-    """``'Resets in 3 hr 28 min'`` / ``'Resets in 45 min'`` / ``''``."""
-    if reset_ts <= 0:
-        return ""
-    remaining = int(reset_ts - datetime.now().timestamp())
-    if remaining <= 0:
-        return "Resets soon"
-    hours, rem = divmod(remaining, 3600)
-    minutes = rem // 60
-    if hours > 0:
-        return f"Resets in {hours} hr {minutes} min"
-    return f"Resets in {minutes} min"
-
-
-def _format_reset_day(reset_ts: int) -> str:
-    """``'Resets Mon 04:00 PM'`` / ``''``."""
-    if reset_ts <= 0:
-        return ""
-    return datetime.fromtimestamp(reset_ts).strftime("Resets %a %I:%M %p")
-
-
-def _format_session_duration(total_seconds: int) -> str:
-    hours, rem = divmod(total_seconds, 3600)
-    minutes = rem // 60
-    return f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m"
+SERVER_NAME = "claude-usage-" + (os.environ.get("USERNAME") or os.environ.get("USER") or "user")
+BACKOFF_S = (60, 120, 300)  # limits fetch retry after 1, 2, 3+ failures in a row
+FORCE_GAP_S = 5  # Refresh now, clicked again and again, still fetches at most this often
+NEWER_STORE = "Your usage store is from a newer version of Claude Usage. Update to see your usage."
+ON_TOP_MS = 2000
+SAVE_DELAY_MS = 400  # one write per burst of changes (a slider drag sends dozens)
+SAVE_RETRY_MS = 60_000  # after a failed write; a locked file or a full disk can clear
+OPEN_FAILED = "Couldn't open the Claude Usage window. Restart Claude Usage."
+ICON = os.path.join(os.path.dirname(__file__), "icons", "claude-tray.svg")
 
 
 def _rect_on_some_screen(x: int, y: int, w: int, h: int) -> bool:
-    """True if a rect at (x, y) of size (w, h) has real presence on a screen.
+    """True if a rect at (x, y) of size (w, h) is meaningfully on some screen.
 
-    Used to validate the saved OSD position before restoring it. Checks each
-    connected screen's **full** geometry — deliberately NOT availableGeometry,
-    which excludes the taskbar: users park the always-on-top OSD over the
-    taskbar, and that's a perfectly reachable spot (the old available-area
-    check silently snapped such positions back to the default). The guard's
-    only job is the truly-unreachable case — a monitor that was unplugged or
-    shrank — i.e. a rect with no meaningful overlap on ANY screen. The height
-    floor is small (4px) so even the minimized 6px strip parked at the very
-    bottom edge still counts as visible.
+    Uses each screen's full geometry, not availableGeometry: parking the OSD
+    over the taskbar is allowed. Only a rect on no screen at all (an unplugged
+    monitor) fails.
     """
-    from PySide6.QtCore import QRect
-    from PySide6.QtGui import QGuiApplication
-
     rect = QRect(x, y, max(w, 80), max(h, 24))
     for screen in QGuiApplication.screens():
         inter = screen.geometry().intersected(rect)
@@ -153,1934 +56,566 @@ def _rect_on_some_screen(x: int, y: int, w: int, h: int) -> bool:
     return False
 
 
-# ---------------------------------------------------------------------------
-# Custom-painted atomic widgets
-# ---------------------------------------------------------------------------
-
-class _ProgressBar(QWidget):
-    """Thin rounded bar, fill colour depends on utilisation."""
-
-    def __init__(self, theme: dict[str, str], height: int = 12) -> None:
-        super().__init__()
-        self._theme = theme
-        self._fraction = 0.0
-        self.setFixedHeight(height)
-
-    def set_fraction(self, value: float) -> None:
-        """Set fill fraction (clamped to [0, 1]) and request a repaint."""
-        self._fraction = max(0.0, min(1.0, float(value)))
-        self.update()
-
-    def set_theme(self, theme: dict[str, str]) -> None:
-        """Swap the colour palette and request a repaint."""
-        self._theme = theme
-        self.update()
-
-    def paintEvent(self, event: QPaintEvent) -> None:
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        w, h = self.width(), self.height()
-        r = h / 2
-
-        p.setPen(Qt.NoPen)
-        p.setBrush(_hex_to_qcolor(self._theme["bar_track"]))
-        p.drawRoundedRect(QRectF(0, 0, w, h), r, r)
-
-        if self._fraction > 0:
-            fill_w = max(w * self._fraction, h)
-            p.setBrush(_hex_to_qcolor(self._theme["bar_blue"]))
-            p.drawRoundedRect(QRectF(0, 0, fill_w, h), r, r)
+def ask_running_instance(timeout_ms: int = 1000) -> bool:
+    """Ask the instance already running to open its app window. False if none answered."""
+    sock = QLocalSocket()
+    sock.connectToServer(SERVER_NAME)
+    if not sock.waitForConnected(timeout_ms):
+        return False
+    sock.disconnectFromServer()  # the connection itself is the request
+    return True
 
 
-class _Sparkline(QWidget):
-    """Vertical-bar sparkline of per-bucket utilisation values."""
-
-    def __init__(self, theme: dict[str, str]) -> None:
-        super().__init__()
-        self._theme = theme
-        self._buckets: list[float] = []
-        self.setFixedHeight(SPARKLINE_HEIGHT)
-
-    def set_buckets(self, buckets: list[float]) -> None:
-        """Replace the bucket series and request a repaint."""
-        self._buckets = list(buckets or [])
-        self.update()
-
-    def paintEvent(self, event: QPaintEvent) -> None:
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        w, h = self.width(), self.height()
-
-        p.setPen(Qt.NoPen)
-        p.setBrush(_hex_to_qcolor(self._theme["bar_track"]))
-        p.drawRoundedRect(QRectF(0, 0, w, h), 4, 4)
-
-        if not self._buckets:
-            return
-        n = len(self._buckets)
-        gap = 1.0
-        bar_w = max(1.0, (w - (n - 1) * gap) / n)
-        fill = _hex_to_qcolor(self._theme["bar_blue"])
-        p.setBrush(fill)
-        for i, v in enumerate(self._buckets):
-            if v <= 0:
-                continue
-            bx = i * (bar_w + gap)
-            bh = max(1.0, h * min(float(v), 1.0))
-            p.drawRect(QRectF(bx, h - bh, bar_w, bh))
+def _qss(dark: bool) -> str:
+    p = tokens.palette(dark)
+    # On Windows 11 DWM rounds the popup and draws its border and shadow.
+    border = "none" if os.name == "nt" else f"1px solid {p['line_strong']}"
+    return f"""
+QMenu {{ background: {p['surface']}; color: {p['text']}; border: {border}; padding: 4px; }}
+QMenu::item {{ padding: 7px 32px 7px 12px; border-radius: 4px; }}
+QMenu::item:selected {{ background: {p['surface_alt']}; }}
+QMenu::item:disabled {{ color: {p['text_muted']}; }}
+QMenu::separator {{ height: 1px; background: {p['line']}; margin: 4px 8px; }}
+QToolTip {{ background: {p['tooltip_bg']}; color: {p['tooltip_text']}; border: 1px solid {p['line_strong']};
+            padding: 6px 8px; }}
+"""
 
 
-class _Heatmap(QWidget):
-    """Single-row heatmap strip (e.g. 90 daily cells)."""
-
-    def __init__(self, theme: dict[str, str]) -> None:
-        super().__init__()
-        self._theme = theme
-        self._buckets: list[float] = []
-        self.setFixedHeight(HEATMAP_HEIGHT)
-
-    def set_buckets(self, buckets: list[float]) -> None:
-        """Replace the bucket series and request a repaint."""
-        self._buckets = list(buckets or [])
-        self.update()
-
-    def paintEvent(self, event: QPaintEvent) -> None:
-        p = QPainter(self)
-        w, h = self.width(), self.height()
-        p.setPen(Qt.NoPen)
-        p.setBrush(_hex_to_qcolor(self._theme["bar_track"]))
-        p.drawRect(QRectF(0, 0, w, h))
-
-        n = len(self._buckets)
-        if n == 0:
-            return
-        cell_w = w / n
-        base = self._theme["bar_blue"]
-        for i, v in enumerate(self._buckets):
-            if v <= 0:
-                continue
-            alpha = max(0.0, min(1.0, float(v)))
-            p.setBrush(_hex_to_qcolor(base, alpha))
-            p.drawRect(QRectF(i * cell_w, 0, cell_w, h))
+def _active_scoped(shown: Optional[dict]) -> list[dict]:
+    """Scoped weekly limits in use this window (Fable on Ultra), from the limits fetch."""
+    return [{"name": x.get("name") or str(x.get("kind") or "Limit").replace("_", " ").capitalize(),
+             "pct": float(x["pct"]), "resets_at": x.get("resets_at")}
+            for x in (shown or {}).get("limits") or []
+            if x.get("kind") != "weekly_all" and x.get("active") and x.get("pct") is not None]
 
 
-def _align_calendar_buckets(
-    buckets: list[float],
-    today_weekday: int | None = None,
-) -> list[float]:
-    """Align an oldest-first daily series to a 52×7 GitHub-style grid.
-
-    The column-major grid has row 0 = Sunday and today pinned to the
-    bottom-right column at its real weekday. Buckets older than the grid
-    can hold are dropped; trailing empties are appended so future days of
-    the current week render as blank cells.
-
-    ``today_weekday`` is Python's ``datetime.weekday()`` (Mon=0..Sun=6);
-    pass ``None`` to use ``datetime.now()``.
-    """
-    if today_weekday is None:
-        today_weekday = datetime.now().weekday()
-    # Convert to Sunday-indexed 0..6 to match GitHub's top-row convention.
-    today_row = (today_weekday + 1) % 7
-    total = 52 * 7
-    trailing = 6 - today_row  # empty cells after today within current week
-    usable = total - trailing  # number of real daily cells that fit
-    if len(buckets) > usable:
-        buckets = buckets[-usable:]
-    padded = buckets + [0.0] * trailing
-    # Pad the head if we had fewer buckets than usable slots.
-    missing_head = total - len(padded)
-    if missing_head > 0:
-        padded = [0.0] * missing_head + padded
-    return padded
-
-
-class _CalendarHeatmap(QWidget):
-    """GitHub-style calendar heatmap: 52 weeks × 7 days of peak utilization."""
-
-    CELL_SIZE = 10
-    CELL_GAP = 2
-    WEEKS = 52
-    DAYS = 7
-
-    def __init__(self, theme: dict[str, str]) -> None:
-        super().__init__()
-        self._theme = theme
-        self._buckets: list[float] = []
-        total_w = self.WEEKS * (self.CELL_SIZE + self.CELL_GAP)
-        total_h = self.DAYS * (self.CELL_SIZE + self.CELL_GAP)
-        self.setFixedSize(total_w, total_h)
-
-    def set_buckets(self, buckets: list[float]) -> None:
-        """Replace the bucket series and request a repaint."""
-        self._buckets = list(buckets or [])
-        self.update()
-
-    def paintEvent(self, event: QPaintEvent) -> None:
-        p = QPainter(self)
-        p.setPen(Qt.NoPen)
-        track = _hex_to_qcolor(self._theme["bar_track"])
-        base = self._theme["bar_blue"]
-        # Draw from oldest (top-left) to newest (bottom-right).  The list is
-        # already oldest-first, length WEEKS*DAYS = 364.
-        n = len(self._buckets)
-        for i in range(self.WEEKS * self.DAYS):
-            col = i // self.DAYS
-            row = i % self.DAYS
-            x = col * (self.CELL_SIZE + self.CELL_GAP)
-            y = row * (self.CELL_SIZE + self.CELL_GAP)
-            v = self._buckets[i] if i < n else 0.0
-            if v > 0:
-                alpha = max(0.15, min(1.0, float(v)))
-                p.setBrush(_hex_to_qcolor(base, alpha))
+def _summary(now: Optional[dict], shown: Optional[dict], indexing: Optional[dict] = None) -> list[str]:
+    """What the menu header and the tray tooltip say: each limit the API reported, the binding
+    one first as on the OSD, then the state, indexing progress and the live rate (always last).
+    A limit it did not report (the 5-hour limit on Ultra) gets no part, never a 0%."""
+    if now is None or now["state"] == "loading":
+        return ["Loading usage"]
+    if now["state"] == "signed_out":
+        return ["Signed out"]
+    t, parts = datetime.now().astimezone(), []
+    meters = [("Weekly", now["weekly"], True), ("5-hour", now["session"], True)]
+    if now["primary"] == "session":
+        meters.reverse()
+    for name, m, with_reset in meters + [(x["name"], x, False) for x in _active_scoped(shown)]:
+        if not m:
+            continue
+        if _pct(m) == "--":
+            parts.append(f"{name} not started")
+            continue
+        part, reset = f"{name} {_pct(m)}%", with_reset and _parse(m["resets_at"])
+        eta = reset and _parse(m["eta"])
+        if reset and reset > t:
+            if m["level"] == "limited":
+                part += f", limited until {_when(reset, t)}"
+            elif eta and eta < reset:  # the time to the limit, as the pill shows it, says more than the reset
+                part += f", limit in ~{_span(eta - t)}" if eta - t >= timedelta(minutes=1) else ", limit any minute"
             else:
-                p.setBrush(track)
-            p.drawRect(QRectF(x, y, self.CELL_SIZE, self.CELL_SIZE))
-
-
-class SkinPopupWidget(QWidget):
-    """Full-surface paintEvent popup used when a handoff skin is active.
-
-    Unlike the default :class:`UsagePopup`, this widget doesn't lay out any
-    child widgets — the whole window is painted by the skin's
-    ``paint_popup(painter, rect, data, scale)`` function. A ``QScrollArea``
-    wraps it so tall popups still fit on small screens.
-    """
-
-    def __init__(self, config: dict[str, Any]) -> None:
-        super().__init__()
-        from claude_usage.skins import SKIN_MODULES
-        self._config = config
-        self._all_skins = SKIN_MODULES
-        self._skin = SKIN_MODULES.get(str(config.get("theme", "")))
-        self._data = None
-        self._scale = 1.0
-        # Phase driver for the pre-data "Loading..." animation. Bumps every
-        # tick so dots cycle / arcs sweep while we wait for first collect.
-        self._loading_phase = 0.0
-        self._loading_timer = QTimer(self)
-        self._loading_timer.setInterval(120)
-        self._loading_timer.timeout.connect(self._tick_loading)
-        self._loading_timer.start()
-
-        self.setWindowTitle("Claude Usage")
-        self.setWindowFlags(Qt.Tool | Qt.WindowStaysOnTopHint | Qt.WindowCloseButtonHint)
-        self.setAttribute(Qt.WA_X11NetWmWindowTypeUtility, True)
-
-        # Inner content widget sized to measure_popup output; wrapped in
-        # a scroll area so the window is resizable without losing content.
-        self._content = QWidget(self)
-        self._content.paintEvent = self._paint_content  # type: ignore[method-assign]
-        self._scroll = QScrollArea(self)
-        self._scroll.setWidget(self._content)
-        self._scroll.setWidgetResizable(False)
-        self._scroll.setFrameShape(QScrollArea.NoFrame)
-        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.addWidget(self._scroll)
-
-        self._apply_scrollbar_style()
-        self.resize(540, 360)
-        self._resize_content()
-
-        # Native Win11 chrome: dark title bar + rounded corners. Must stay
-        # after the last setWindowFlags (flag changes recreate the HWND).
-        from claude_usage.winchrome import apply_win11_chrome
-        apply_win11_chrome(self)
-
-    def apply_config(self, config: dict[str, Any]) -> None:
-        """Re-bind the active skin module and restyle when the user picks
-        a different theme at runtime."""
-        self._config = config
-        self._skin = self._all_skins.get(str(config.get("theme", "")))
-        self._apply_scrollbar_style()
-        self._content.update()
-
-    def _apply_scrollbar_style(self) -> None:
-        """Tint the scroll area's chrome with the active skin palette so
-        the default grey Qt widgets don't break the visual language."""
-        if self._skin is None:
-            return
-        t = self._skin.THEME
-        bg = t.get("bg", "#1a1a2e")
-        track = t.get("bar_track", "#333340")
-        thumb = t.get("accent", t.get("bar_blue", "#5B9BD5"))
-        self._scroll.setStyleSheet(
-            f"QScrollArea, QScrollArea QWidget {{ background: {bg}; border: 0; }}"
-            f"QScrollBar:vertical {{ background: {bg}; width: 10px; margin: 0; }}"
-            f"QScrollBar::handle:vertical {{ background: {thumb}; border-radius: 4px; min-height: 24px; }}"
-            f"QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; background: none; }}"
-            f"QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: {track}; }}"
-        )
-
-    def update_stats(self, stats) -> None:
-        """Project the latest UsageStats into the skin's popup-data shape
-        and trigger a repaint.
-
-        Hidden popups defer the (non-trivial) projection until shown —
-        mirroring UsagePopup — so users who never open this window don't
-        rebuild heatmap/ticker projections every 30s refresh."""
-        self._pending_raw_stats = stats
-        if not self.isVisible():
-            # No point animating a hidden loading placeholder either.
-            if self._loading_timer.isActive():
-                self._loading_timer.stop()
-            return
-        from claude_usage.skins._adapter import build_popup_data
-        self._data = build_popup_data(stats)
-        # First-data-in: stop the loading animation and repaint immediately
-        # so the placeholder doesn't linger for another timer interval.
-        if self._loading_timer.isActive():
-            self._loading_timer.stop()
-        self._resize_content()
-        self._content.update()
-
-    def showEvent(self, event) -> None:  # noqa: N802
-        """Flush stats that arrived while hidden (deferred build above)."""
-        pending = getattr(self, "_pending_raw_stats", None)
-        if pending is not None:
-            self.update_stats(pending)
-        super().showEvent(event)
-
-    def _tick_loading(self) -> None:
-        if self._data is not None:
-            self._loading_timer.stop()
-            return
-        self._loading_phase = (self._loading_phase + 0.12) % 1.0
-        self._content.update()
-
-    def _resize_content(self) -> None:
-        if self._skin is None:
-            return
-        width = int(self._skin.METRICS.get("popup_width", 540) * self._scale)
-        if self._data is None:
-            # No data yet — size the content so the loading indicator has
-            # a sensible canvas. 360px covers every skin's paint_loading.
-            placeholder_h = int(360 * self._scale)
-            self._content.setFixedSize(width, placeholder_h)
-            self.resize(width, placeholder_h)
-            return
-        measure = getattr(self._skin, "measure_popup", None)
-        if callable(measure):
-            height = int(measure(self._data, self._scale))
-        else:
-            # Generic-layout skins need roughly this much for the full
-            # section stack (plan / calendar / cost / projects / tips /
-            # weekly report / ticker footer). 1180 is the observed max
-            # across dashboard / hud / receipt / strip / brutalist at 1.0x.
-            height = int(1180 * self._scale)
-        # Snap to a minimum so short data doesn't leave a tiny postage-
-        # stamp window either.
-        height = max(height, int(520 * self._scale))
-        self._content.setFixedSize(width, height)
-        # Size the outer window to exactly wrap the content so we don't
-        # leave grey gutters around a small popup. Cap the height at 90%
-        # of the available screen so a very tall popup still scrolls
-        # inside a sane window frame.
-        try:
-            from PySide6.QtWidgets import QApplication
-            screen = QApplication.primaryScreen()
-            max_h = int(screen.availableGeometry().height() * 0.9) if screen else height
-        except Exception:
-            max_h = height
-        # Add scrollbar width when the content is taller than the
-        # available space so nothing gets hidden under a floating bar.
-        chrome_w = 14 if height > max_h else 0
-        window_h = min(height, max_h)
-        self.resize(width + chrome_w, window_h)
-
-    def _paint_content(self, _event) -> None:
-        if self._skin is None:
-            return
-        from PySide6.QtCore import QRectF
-        p = QPainter(self._content)
-        p.setRenderHint(QPainter.Antialiasing, True)
-        p.setRenderHint(QPainter.TextAntialiasing, True)
-        try:
-            if self._data is None:
-                # First-open placeholder — animated by _tick_loading.
-                paint_loading = getattr(self._skin, "paint_loading", None)
-                if callable(paint_loading):
-                    paint_loading(p, QRectF(self._content.rect()),
-                                  self._loading_phase, self._scale)
-                return
-            self._skin.paint_popup(
-                p, QRectF(self._content.rect()), self._data, self._scale,
-            )
-        except Exception:
-            import traceback
-            traceback.print_exc()
-
-
-class _Barcode(QWidget):
-    """Decorative 1D barcode — used as the receipt-popup footer stamp.
-
-    Deterministic bar widths (no PRNG) so screenshot runs are byte-stable.
-    Doesn't encode anything real; it's pure thermal-chit visual vibe.
-    """
-
-    HEIGHT = 32
-
-    def __init__(self, theme: dict[str, str]) -> None:
-        super().__init__()
-        self._theme = theme
-        self.setFixedHeight(self.HEIGHT)
-        self.setMinimumWidth(260)
-
-    def paintEvent(self, event: QPaintEvent) -> None:
-        p = QPainter(self)
-        w, h = self.width(), self.height()
-        p.fillRect(self.rect(), _hex_to_qcolor(self._theme["bg"]))
-        ink = _hex_to_qcolor(self._theme["text_primary"])
-        p.setPen(Qt.NoPen)
-        p.setBrush(ink)
-        # 32 bar units interleaved with 32 gap units, mirroring the design
-        # mock's `repeat-in-pattern` approach.
-        pattern = (1, 2, 1, 3, 2, 1, 1, 3, 1, 2, 2, 1, 3, 1, 2, 1,
-                   1, 3, 1, 2, 1, 3, 2, 1, 1, 2, 3, 1, 2, 1, 3, 1)
-        total_units = sum(pattern) * 2
-        unit = w / total_units
-        cx = 0.0
-        for i, wu in enumerate(pattern):
-            bw = wu * unit
-            if i % 2 == 0:  # even index = solid bar, odd = gap
-                p.drawRect(QRectF(cx, 0, bw, h))
-            cx += bw
-
-
-# ---------------------------------------------------------------------------
-# Detail popup
-# ---------------------------------------------------------------------------
-
-class UsagePopup(QWidget):
-    """Scrollable detail window showing all :class:`UsageStats` fields."""
-
-    def __init__(self, config: dict[str, Any]) -> None:
-        super().__init__()
-        self._config = config
-        theme_name = str(config.get("theme", "default"))
-        self._theme = get_theme(theme_name)
-        self._style: ThemeStyle = get_style(theme_name)
-
-        self.setWindowTitle("Claude Usage")
-        # Resizable: set a sensible initial size and a minimum, but let the
-        # user drag the window edges to widen it. A fixed width makes the
-        # scrollbar overlap content and denies power users more horizontal
-        # room for the per-model cost breakdown.
-        self.resize(POPUP_WIDTH, 720)
-        self.setMinimumWidth(460)
-        self.setMinimumHeight(400)
-        # Qt.Tool keeps the popup hidden from the dock / taskbar — exit is
-        # via the OSD right-click menu. WindowCloseButtonHint still gives us
-        # a native close button on the title bar for discoverability.
-        self.setWindowFlags(Qt.Tool | Qt.WindowStaysOnTopHint | Qt.WindowCloseButtonHint)
-        # Reinforce "don't show me in the dock" via the NET_WM window-type
-        # hint. Utility windows are excluded from KDE/GNOME taskbars by spec.
-        self.setAttribute(Qt.WA_X11NetWmWindowTypeUtility, True)
-
-        # Style sheet — applied once per instance.
-        self.setStyleSheet(self._build_qss())
-
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-
-        # Most-recent stats snapshot — stored while the popup is hidden so
-        # we can flush it on show without rebuilding the tree every 30 s
-        # for a popup nobody's looking at.
-        self._pending_stats: UsageStats | None = None
-
-        self._scroll = QScrollArea(self)
-        self._scroll.setWidgetResizable(True)
-        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._scroll.setFrameShape(QScrollArea.NoFrame)
-        root.addWidget(self._scroll)
-
-        # Content container.  We rebuild its layout on every update().
-        self._content = QWidget()
-        self._content.setObjectName("popupRoot")
-        self._layout = QVBoxLayout(self._content)
-        self._layout.setContentsMargins(POPUP_PAD, POPUP_PAD, POPUP_PAD, POPUP_PAD)
-        self._layout.setSpacing(0)
-        self._scroll.setWidget(self._content)
-
-        # Native Win11 chrome: dark title bar + rounded corners. Must stay
-        # after the last setWindowFlags (flag changes recreate the HWND).
-        from claude_usage.winchrome import apply_win11_chrome
-        apply_win11_chrome(self)
-
-    # ------------------------------------------------------------------ QSS
-
-    def _build_qss(self) -> str:
-        t = self._theme
-        return f"""
-            QWidget#popupRoot, QScrollArea {{ background-color: {t['bg']}; }}
-            QLabel {{ color: {t['text_primary']}; }}
-            QLabel[role="header"] {{ font-size: 14px; font-weight: bold; color: {t['text_primary']}; }}
-            QLabel[role="sub"]    {{ font-size: 11px; color: {t['text_secondary']}; }}
-            QLabel[role="dim"]    {{ font-size: 11px; color: {t['text_dim']}; }}
-            QLabel[role="metric"] {{ font-size: 13px; font-weight: bold; color: {t['text_primary']}; }}
-            QLabel[role="pct"]    {{ font-size: 12px; color: {t['text_secondary']}; }}
-            QLabel[role="link"]   {{ font-size: 11px; color: {t['text_link']}; }}
-            QLabel[role="error"]  {{ font-size: 11px; color: {t['error']}; }}
-            QScrollBar:vertical {{
-                background: transparent; width: 10px;
-                margin: 2px 2px 2px 0; border: none;
-            }}
-            QScrollBar::handle:vertical {{
-                background: {t['bar_track']}; border-radius: 4px; min-height: 32px;
-            }}
-            QScrollBar::handle:vertical:hover {{ background: {t['text_dim']}; }}
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; background: none; }}
-            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
-        """
-
-    # -------------------------------------------------------------- helpers
-
-    def _clear_layout(self) -> None:
-        while self._layout.count():
-            item = self._layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
-
-    def _label(self, text: str, role: str = "") -> QLabel:
-        lbl = QLabel(text)
-        lbl.setWordWrap(True)
-        # Default to plain text — never interpret user-sourced content
-        # (prompt previews, AI report output, project paths) as rich HTML.
-        lbl.setTextFormat(Qt.PlainText)
-        if role:
-            lbl.setProperty("role", role)
-        return lbl
-
-    def _add_section_header(self, title: str, right: str = "") -> None:
-        from PySide6.QtWidgets import QHBoxLayout, QFrame
-
-        row = QFrame()
-        row.setStyleSheet("QFrame { background: transparent; }")
-        hl = QHBoxLayout(row)
-        hl.setContentsMargins(0, 0, 0, 10)
-
-        title_lbl = self._label(title, "header")
-        title_lbl.setWordWrap(False)  # keep header on one line
-        hl.addWidget(title_lbl, 1, Qt.AlignLeft)
-
-        if right:
-            right_lbl = self._label(right, "sub")
-            hl.addWidget(right_lbl, 0, Qt.AlignRight)
-
-        self._layout.addWidget(row)
-
-    def _add_usage_row(self, label: str, subtitle: str, fraction: float) -> None:
-        from PySide6.QtWidgets import QHBoxLayout, QFrame
-
-        row = QFrame()
-        row.setStyleSheet("QFrame { background: transparent; }")
-        hl = QHBoxLayout(row)
-        hl.setContentsMargins(0, 0, 0, 14)
-        hl.setSpacing(12)
-
-        # Left: label + subtitle
-        left = QWidget()
-        left.setFixedWidth(140)
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(2)
-        name = self._label(label, "metric")
-        left_layout.addWidget(name)
-        if subtitle:
-            left_layout.addWidget(self._label(subtitle, "sub"))
-        hl.addWidget(left)
-
-        # Middle: bar
-        bar = _ProgressBar(self._theme, height=12)
-        bar.set_fraction(fraction)
-        hl.addWidget(bar, 1)
-
-        # Right: percentage
-        pct = self._label(f"{min(int(fraction * 100), 100)}% used", "pct")
-        pct.setFixedWidth(72)
-        pct.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        hl.addWidget(pct)
-
-        self._layout.addWidget(row)
-
-    def _add_dim_line(self, text: str, role: str = "dim", margin_bottom: int = 6) -> None:
-        lbl = self._label(text, role)
-        lbl.setContentsMargins(0, 0, 0, margin_bottom)
-        self._layout.addWidget(lbl)
-
-    def _add_sparkline(self, buckets: list[float], caption: str) -> None:
-        sp = _Sparkline(self._theme)
-        sp.set_buckets(buckets)
-        self._layout.addWidget(sp)
-        self._add_dim_line(caption, margin_bottom=12)
-
-    def _add_heatmap(self, buckets: list[float], caption: str) -> None:
-        hm = _Heatmap(self._theme)
-        hm.set_buckets(buckets)
-        self._layout.addWidget(hm)
-        self._add_dim_line(caption, margin_bottom=12)
-
-    def _add_calendar_heatmap(self, buckets: list[float], caption: str) -> None:
-        from PySide6.QtWidgets import QHBoxLayout, QFrame
-        row = QFrame()
-        row.setStyleSheet("QFrame { background: transparent; }")
-        hl = QHBoxLayout(row)
-        hl.setContentsMargins(0, 0, 0, 0)
-        hl.setSpacing(0)
-        cal = _CalendarHeatmap(self._theme)
-        cal.set_buckets(_align_calendar_buckets(list(buckets)))
-        hl.addWidget(cal)
-        hl.addStretch(1)
-        self._layout.addWidget(row)
-        self._add_dim_line(caption, margin_bottom=12)
-
-    def _add_separator(self) -> None:
-        from PySide6.QtWidgets import QFrame
-        # Spacer above the hairline
-        self._layout.addSpacing(6)
-        sep = QFrame()
-        sep.setFixedHeight(1)
-        sep.setStyleSheet(
-            f"background-color: {self._theme['separator']}; border: none;"
-        )
-        self._layout.addWidget(sep)
-        # Spacer below the hairline
-        self._layout.addSpacing(14)
-
-    # --------------------------------------------------------------- update
-
-    def apply_config(self, config: dict[str, Any]) -> None:
-        """Re-read theme/opacity in case the user changed it at runtime."""
-        self._config = config
-        theme_name = str(config.get("theme", "default"))
-        self._theme = get_theme(theme_name)
-        self._style = get_style(theme_name)
-        self.setStyleSheet(self._build_qss())
-        # Built rows bake in the OLD theme's colors (bars, sparklines, …).
-        # Drop them so the next update/show rebuilds in the new palette —
-        # the showEvent flush only fires on an EMPTY layout.
-        if self._layout.count():
-            self._clear_layout()
-
-    @Slot(object)
-    def update_stats(self, stats: UsageStats) -> None:
-        """Rebuild the popup contents from *stats*.
-
-        Hidden popups skip the full layout teardown+rebuild — when the user
-        opens it again we re-run with the then-current stats (see ``show``
-        override below).
-        """
-        self._pending_stats = stats
-        import time as _t
-        self._last_update_ts = _t.time()
-        if not self.isVisible():
-            return
-        self._rebuild_from(stats)
-
-    def showEvent(self, event) -> None:  # noqa: N802
-        """Flush any deferred stats build on first reveal — see
-        :meth:`update_stats` for why hidden popups skip the rebuild."""
-        # First show after stats arrived while we were hidden — flush.
-        if self._pending_stats is not None and self._layout.count() == 0:
-            self._rebuild_from(self._pending_stats)
-        super().showEvent(event)
-        # Defer height fit so the layout has fully settled
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(0, self._fit_height)
-
-    def _rebuild_from(self, stats: UsageStats) -> None:
-        self._clear_layout()
-
-        # --- Plan usage limits ---
-        self._add_section_header("Plan usage limits")
-        self._add_usage_row(
-            "Current session",
-            _format_reset_duration(stats.session_reset),
-            stats.session_utilization,
-        )
-        s_fc = format_forecast(stats.session_forecast)
-        if s_fc:
-            self._add_dim_line(s_fc)
-        self._add_sparkline(stats.session_history, "Last 5 hours")
-        self._add_separator()
-
-        # --- Weekly limits ---
-        self._add_section_header("Weekly limits")
-        self._add_usage_row(
-            "All models",
-            _format_reset_day(stats.weekly_reset),
-            stats.weekly_utilization,
-        )
-        w_fc = format_forecast(stats.weekly_forecast)
-        if w_fc:
-            self._add_dim_line(w_fc)
-        self._add_sparkline(stats.weekly_history, "Last 7 days")
-
-        # 90-day heatmap
-        heatmap = getattr(stats, "daily_heatmap", []) or []
-        if any(v > 0 for v in heatmap):
-            self._add_heatmap(heatmap, "Last 90 days")
-
-        # 52-week × 7-day calendar heatmap (GitHub-style)
-        yearly = getattr(stats, "yearly_heatmap", []) or []
-        if any(v > 0 for v in yearly):
-            self._add_calendar_heatmap(yearly, "Last 52 weeks")
-        self._add_separator()
-
-        # --- Anomaly banner ---
-        anomaly = getattr(stats, "anomaly", None)
-        if anomaly is not None and getattr(anomaly, "is_anomaly", False):
-            self._add_section_header("⚠ Unusual activity")
-            self._add_dim_line(anomaly.message, margin_bottom=12)
-            self._add_separator()
-
-        # --- Cost / API-equivalent value ---
-        self._render_cost_section(stats)
-
-        # --- Top projects ---
-        self._render_top_projects(stats)
-
-        # --- Tips ---
-        tips = getattr(stats, "tips", []) or []
-        if tips:
-            self._add_section_header("💡 Tips")
-            for tip in tips:
-                self._add_dim_line(tip, margin_bottom=6)
-            self._add_separator()
-
-        # --- Cache savings opportunities ---
-        self._render_cache_opportunities(stats)
-
-        # --- Weekly Claude-authored report ---
-        self._render_weekly_report(stats)
-
-        # --- Active sessions (disabled - not functional) ---
-        # self._render_active_sessions(stats)
-
-        # --- Footer ---
-        self._render_footer(stats)
-        # Resize window to fit new content once layout settles
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(0, self._fit_height)
-
-    def _fit_height(self) -> None:
-        """Resize the popup to fit its content without a scrollbar.
-
-        adjustSize() does not see through QScrollArea, so we query the
-        inner layout directly and cap at 88% of the available screen.
-        """
-        # When embedded in the unified tabbed window the popup is a child
-        # widget, not a top-level window — self-resizing is both meaningless
-        # and unsafe. And this runs from a deferred singleShot timer, so the
-        # underlying C++ object may already be gone. Bail on either.
-        try:
-            if self.parent() is not None:
-                return
-            self._layout.activate()
-        except RuntimeError:
-            return
-        content_h = self._layout.sizeHint().height() + 2 * POPUP_PAD
-        # Frame height delta (title bar + border) -- may be 0 before first paint
-        fg = self.frameGeometry()
-        frame_extra = (fg.height() - self.height()) if fg.height() > self.height() else 40
-        target_h = content_h + frame_extra
-        screen = self.screen() if self.screen() else QApplication.primaryScreen()
-        if not screen:
-            return
-        avail = screen.availableGeometry()
-        max_h = int(avail.height() * 0.88)
-        new_h = min(max(target_h, self.minimumHeight()), max_h)
-        if abs(new_h - self.height()) > 8:
-            self.resize(self.width(), new_h)
-
-    # ------------------------------------------------------------ sections
-
-    def _render_cost_section(self, stats: UsageStats) -> None:
-        today_cost = float(getattr(stats, "today_cost", 0.0) or 0.0)
-        if today_cost <= 0:
-            return
-
-        cache_savings = float(getattr(stats, "cache_savings", 0.0) or 0.0)
-        sub = (getattr(stats, "subscription_type", "") or "").lower()
-        is_subscriber = sub in ("pro", "max", "team", "enterprise")
-
-        # Short header; detailed framing lives in the dim sub-line below so the
-        # popup width doesn't force the title onto two lines.
-        if is_subscriber:
-            self._add_section_header("Cost (today)", right=f"{sub.capitalize()} plan")
-            self._add_dim_line(f"${today_cost:.2f}", role="metric", margin_bottom=4)
-            self._add_dim_line(
-                "API pay-as-you-go equivalent — included in your plan",
-                margin_bottom=4,
-            )
-        else:
-            self._add_section_header("Cost (today)")
-            self._add_dim_line(f"${today_cost:.2f}", role="metric", margin_bottom=4)
-
-        if cache_savings > 0:
-            self._add_dim_line(f"${cache_savings:.2f} saved by cache", margin_bottom=8)
-
-        by_model = getattr(stats, "today_by_model_detailed", {}) or {}
-        if by_model:
-            self._render_per_model_breakdown(by_model)
-
-        self._add_separator()
-
-    def _render_per_model_breakdown(self, by_model: dict) -> None:
-        total_in = total_out = total_cr = total_cc = 0
-        rows = []
-        for model, counts in by_model.items():
-            in_t = int(counts.get("input", 0) or 0)
-            out_t = int(counts.get("output", 0) or 0)
-            cr_t = int(counts.get("cache_read", 0) or 0)
-            cc_t = int(counts.get("cache_creation", 0) or 0)
-            total_in += in_t
-            total_out += out_t
-            total_cr += cr_t
-            total_cc += cc_t
-            bk = calculate_cost(model, in_t, out_t, cr_t, cc_t)
-            rows.append((_short_model_name(model), model, in_t, out_t, cr_t, cc_t, bk))
-        rows.sort(key=lambda r: r[6]["total"], reverse=True)
-
-        self._add_dim_line(
-            f"Tokens: {_format_tokens(total_in)} in • "
-            f"{_format_tokens(total_out)} out • "
-            f"{_format_tokens(total_cr)} cache read • "
-            f"{_format_tokens(total_cc)} cache write",
-            margin_bottom=6,
-        )
-
-        for short, model, in_t, out_t, cr_t, cc_t, bk in rows:
-            if bk["total"] < 0.01:
-                continue
-            rates = MODEL_PRICING.get(model, MODEL_PRICING["claude-sonnet-4-6"])
-            self._add_dim_line(f"  {short}: ${bk['total']:.2f} total", margin_bottom=2)
-            if in_t > 0:
-                self._add_dim_line(
-                    f"     input:  {_format_tokens(in_t):>7} × ${rates['input']:.2f}/M = ${bk['input']:.2f}",
-                    margin_bottom=2,
-                )
-            if out_t > 0:
-                self._add_dim_line(
-                    f"     output: {_format_tokens(out_t):>7} × ${rates['output']:.2f}/M = ${bk['output']:.2f}",
-                    margin_bottom=2,
-                )
-            if cr_t > 0:
-                self._add_dim_line(
-                    f"     cache read:  {_format_tokens(cr_t):>7} × ${rates['cache_read']:.2f}/M = ${bk['cache_read']:.2f}",
-                    margin_bottom=2,
-                )
-            if cc_t > 0:
-                self._add_dim_line(
-                    f"     cache write: {_format_tokens(cc_t):>7} × ${rates['cache_creation']:.2f}/M = ${bk['cache_creation']:.2f}",
-                    margin_bottom=4,
-                )
-
-    def _render_top_projects(self, stats: UsageStats) -> None:
-        projects = getattr(stats, "today_by_project", {}) or {}
-        if not projects:
-            return
-        self._add_section_header("Top projects today")
-        items = sorted(projects.items(), key=lambda kv: kv[1], reverse=True)
-        for name, tokens in items[:5]:
-            try:
-                tok = int(tokens)
-            except (TypeError, ValueError):
-                tok = 0
-            self._add_dim_line(
-                f"{_prettify_project_name(name)}: {_format_tokens(tok)} tokens",
-                margin_bottom=4,
-            )
-        self._add_separator()
-
-    def _render_cache_opportunities(self, stats: UsageStats) -> None:
-        opps = getattr(stats, "cache_opportunities", []) or []
-        if not opps:
-            return
-        total = sum(float(o.potential_savings_usd) for o in opps)
-        self._add_section_header(
-            "💰 Cache opportunities",
-            right=f"~${total:.2f}/wk savings" if total > 0 else "",
-        )
-        for o in opps[:5]:
-            name = _prettify_project_name(getattr(o, "project", "") or "?")
-            preview = (getattr(o, "prefix_preview", "") or "").strip()
-            if len(preview) > 70:
-                preview = preview[:67] + "…"
-            self._add_dim_line(
-                f"{name}: {getattr(o, 'occurrences', 0)}× × "
-                f"{_format_tokens(getattr(o, 'token_count', 0))} tokens → "
-                f"${float(getattr(o, 'potential_savings_usd', 0.0)):.2f}",
-                margin_bottom=2,
-            )
-            if preview:
-                self._add_dim_line(f"    “{preview}”", margin_bottom=6)
-        self._add_separator()
-
-    def _render_weekly_report(self, stats: UsageStats) -> None:
-        text = (getattr(stats, "weekly_report_text", "") or "").strip()
-        if not text:
-            return
-        self._add_section_header("🪄 Your week with Claude")
-        self._add_dim_line(text, margin_bottom=12)
-        self._add_separator()
-
-    def _render_active_sessions(self, stats: UsageStats) -> None:
-        self._add_section_header(
-            "Active sessions",
-            f"{len(stats.active_sessions)} running",
-        )
-        if stats.active_sessions:
-            for sess in stats.active_sessions:
-                started = datetime.fromtimestamp(sess.get("startedAt", 0) / 1000)
-                duration = datetime.now() - started
-                cwd = sess.get("cwd", "?").replace(os.path.expanduser("~"), "~")
-                dur = _format_session_duration(int(duration.total_seconds()))
-                self._add_dim_line(f"{cwd}    {dur}", role="link", margin_bottom=4)
-        else:
-            self._add_dim_line("No active sessions", margin_bottom=4)
-
-    def _render_footer(self, stats: UsageStats) -> None:
-        self._add_separator()
-        # Real "updated N ago" stamp from when this snapshot was applied —
-        # previously hardcoded "just now", which was always a lie on an open
-        # window whose 30s-refreshed content could be minutes old.
-        ts = getattr(self, "_last_update_ts", 0.0)
-        if ts <= 0:
-            updated = "Last updated: just now"
-        else:
-            import time as _t
-            secs = max(0, int(_t.time() - ts))
-            if secs < 5:
-                rel = "just now"
-            elif secs < 60:
-                rel = f"{secs}s ago"
-            elif secs < 3600:
-                rel = f"{secs // 60}m ago"
-            else:
-                rel = f"{secs // 3600}h {(secs % 3600) // 60}m ago"
-            updated = f"Last updated: {rel}"
-        self._add_dim_line(updated, margin_bottom=0)
-        if stats.rate_limit_error:
-            self._add_dim_line(f"API: {stats.rate_limit_error}", role="error", margin_bottom=0)
-
-        # Receipt-skin statement stamp: "— END OF STATEMENT —" + 1D barcode
-        # + a version line. Matches the thermal-chit popup footer in the
-        # Claude Design source.
-        if self._style.decoration == "receipt":
-            from PySide6.QtWidgets import QHBoxLayout, QFrame
-            self._layout.addSpacing(8)
-            end_line = self._label("— END OF STATEMENT —", role="dim")
-            end_line.setAlignment(Qt.AlignHCenter)
-            self._layout.addWidget(end_line)
-
-            bar_row = QFrame()
-            bar_row.setStyleSheet("QFrame { background: transparent; }")
-            h_layout = QHBoxLayout(bar_row)
-            h_layout.setContentsMargins(0, 8, 0, 4)
-            barcode = _Barcode(self._theme)
-            h_layout.addStretch(1)
-            h_layout.addWidget(barcode)
-            h_layout.addStretch(1)
-            self._layout.addWidget(bar_row)
-
-            from claude_usage import __version__ as _v
-            ver_line = self._label(
-                f"CLAUDE-USAGE-WIDGET-{_v}", role="dim",
-            )
-            ver_line.setAlignment(Qt.AlignHCenter)
-            self._layout.addWidget(ver_line)
-
-
-# ---------------------------------------------------------------------------
-# Application orchestrator
-# ---------------------------------------------------------------------------
-
-class ClaudeUsageApp(QObject):
-    """Wires OSD, popup, timer, refresh thread, webhooks, and notifier."""
-
-    # Emitted on the GUI thread once background collection completes.
-    stats_ready = Signal(object)
-
-    def __init__(self, config: dict[str, Any]) -> None:
+                part += ", " + _resets(reset, t)[0].replace("Resets", "resets")
+        parts.append(part)
+    if now["state"] in ("stale", "error"):
+        as_of = _parse(now["as_of"])
+        parts.append(f"as of {_clock(as_of)}" if parts and as_of else now["message"] or "Can't reach Claude")
+    elif not parts:
+        parts.append(NO_LIMITS)
+    if indexing:  # today's numbers are still partial
+        parts.append(_indexing(indexing))
+    if now["live"]:
+        parts.append("Live " + _rate(now["tokens_per_min"]))
+    return parts
+
+
+def _tray_tip(now: dict, shown: Optional[dict], indexing: Optional[dict] = None) -> str:
+    lines = ["Claude Usage", *_summary(now, shown, indexing)]
+    # _summary ends with the indexing progress and the live rate: they give way first
+    n = bool(indexing) + bool(now["live"]) if now["state"] not in ("loading", "signed_out") else 0
+    lines, extra = lines[:len(lines) - n], lines[len(lines) - n:]
+    why = now["message"] if now["state"] in ("stale", "error", "signed_out") and now["message"] not in lines else None
+    out: list[str] = []
+    for line in lines + [why] * bool(why) + extra:  # within the 127 characters of a Windows tray tip
+        room = 127 - len("\n".join(out + [""]))
+        if len(line) <= room:
+            out.append(line)
+        elif line == why and room >= 24:  # the reason is cut short rather than left out
+            out.append(line[:room - 3].rstrip() + "...")
+    return "\n".join(out)
+
+
+class Controller(QObject):
+    """Owns the config, the OSD, tray, menu and app window, and the two worker threads."""
+
+    _refreshed = Signal(object, object, object)  # now, limits shown, indexing progress
+    _built = Signal(object, object)                       # (range, project), snapshot or None
+    _notice = Signal(str, str)                            # a balloon from any thread
+    _update_checked = Signal(object, bool, bool)          # tag, newer, asked by the user
+
+    def __init__(self, config: dict[str, Any], *, store_path: Optional[str] = None,
+                 config_path: Optional[str] = None,
+                 fetch: Callable[[str], dict] = collector.fetch_rate_limits) -> None:
         super().__init__()
         self.config = config
-        self.stats = UsageStats()
-        self._alive = True
-        self._refreshing = False
-        self._apply_tooltip_qss()  # themed QToolTip (OSD hover tooltip)
-        # Backoff / resilience state
-        self._consecutive_errors: int = 0
-        self._last_good_stats = None   # last UsageStats with no error
-        self._BACKOFF_SECS = [60, 120, 300]  # retry intervals on error
-        self._last_daily_report_date: str = ""
-        # Wall-clock of the last successful collect, used for the menu's
-        # "Updated Xs ago" footer.  Never read by anything else.
-        import time as _time
-        self._last_refresh_ts: float = 0.0
+        self.store_path = store_path or store.default_path()
+        self.config_path = config_path or user_config_path()
+        self.claude_dir = config["claude_dir"]
+        self._fetch = fetch
+        self.app = None  # AppWindow, created on first open
+        self._shown: Optional[dict] = None
+        self._now: Optional[dict] = None
+        self._indexing: Optional[dict] = None
+        self._updated_at: Optional[float] = None
+        self._want: Optional[tuple] = None
+        self._building = False
+        self._dirty = False  # a refresh or a new choice came in while a build ran: build once more after it
+        self._repairing = False
+        self._newer = False  # the store is from a newer version: never read or written
+        self._stop, self._wake, self._reindex, self._ready = (threading.Event() for _ in range(4))
+        self._bconn = None  # the snapshot thread's own connection
 
-        # UI components — we keep BOTH popup implementations around:
-        # the default one (full QLayout + child widgets) handles the five
-        # classic themes, and the skin popup delegates its whole paintEvent
-        # to the active direction module. `_show_popup` picks whichever
-        # matches the current theme.
-        self.overlay = UsageOverlay(config)
-        self.popup = UsagePopup(config)
-        self.skin_popup = SkinPopupWidget(config)
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(SAVE_DELAY_MS)
+        self._save_timer.timeout.connect(self._save)
 
-        # Context menu shown on right-click of the OSD.
-        self._context_menu = QMenu()
-        self._build_context_menu()
+        self.notifier = UsageNotifier(self._thresholds(), self._balloon, bool(config.get("notifications_enabled", True)))
+        self.watchdog = AuthWatchdog(self.claude_dir, on_repair_attempt=lambda m: self._notice.emit("Claude Usage", m))
 
-        # System-tray icon — a persistent, always-findable entry point to the
-        # dashboard (the floating OSD is easy to lose behind other windows).
-        self._setup_tray()
-
-        # Webhook dispatcher + notifier
-        from claude_usage.webhooks import WebhookDispatcher
-        self._webhooks = WebhookDispatcher(config.get("webhooks", {}))
-        self.notifier = UsageNotifier(
-            config,
-            on_threshold=lambda scope, t: self._webhooks.fire(
-                "threshold_crossed", {"scope": scope, "threshold": t},
-            ),
-        )
-
-        # Optional: localhost JSON API server. Bind failures (port in use,
-        # permission denied) are non-fatal — the widget still starts, just
-        # without the HTTP surface.
-        self._api_server = None
-        if config.get("api_server_enabled"):
-            from claude_usage.api_server import UsageAPIServer
-            try:
-                self._api_server = UsageAPIServer(
-                    host=config.get("api_server_host", "127.0.0.1"),
-                    port=int(config.get("api_server_port", 8765)),
-                    get_stats=lambda: self.stats,
-                )
-                self._api_server.start()
-            except OSError as exc:
-                print(
-                    f"claude-usage: API server failed to start: {exc}",
-                    file=sys.stderr,
-                )
-                self._api_server = None
-
-        # --- Wire signals ---
-        self.overlay.clicked.connect(self._on_overlay_click)
-        self.overlay.rightClicked.connect(self._on_overlay_right_click)
-        self.stats_ready.connect(self._apply_stats)
-
-        # Restore saved OSD position (if user has dragged it before) — but only
-        # if it still lands on a connected screen. Otherwise (a monitor was
-        # unplugged / resolution changed) it would restore off-screen and become
-        # unreachable; fall back to the default position instead.
-        _osd_x = config.get("osd_x")
-        _osd_y = config.get("osd_y")
-        if _osd_x is not None and _osd_y is not None:
-            if self._osd_pos_visible(int(_osd_x), int(_osd_y)):
-                self.overlay.move(int(_osd_x), int(_osd_y))
+        self.osd = Osd(config.get("osd_style", "card"), False, float(config.get("osd_opacity", 1.0)),
+                       float(config.get("osd_scale", 1.0)))
+        x, y = config.get("osd_x"), config.get("osd_y")
+        if x is not None and y is not None:
+            if _rect_on_some_screen(int(x), int(y), self.osd.width(), self.osd.height()):
+                self.osd.move(int(x), int(y))
             else:
-                from claude_usage.logging_setup import get_logger
-                get_logger().info(
-                    "saved OSD position (%s,%s) is off-screen; using default",
-                    _osd_x, _osd_y,
-                )
+                log.info("saved OSD position (%s, %s) is off-screen; using the default", x, y)
+        self.osd.clicked.connect(lambda: self.open_app())
+        self.osd.right_clicked.connect(self._popup_menu)
+        self.osd.moved.connect(self._on_osd_moved)
+        self.osd.style_toggled.connect(self._on_style_toggled)
 
-        # Persist position whenever the user drags the overlay.
-        def _save_osd_position(x: int, y: int) -> None:
-            from claude_usage.config import save_config, user_config_path
-            _cfg_path = user_config_path()
-            _cfg_copy = dict(config)
-            _cfg_copy["osd_x"] = x
-            _cfg_copy["osd_y"] = y
-            config["osd_x"] = x
-            config["osd_y"] = y
-            try:
-                save_config(_cfg_path, _cfg_copy)
-            except OSError:
-                pass
-        self.overlay.positionSaved.connect(_save_osd_position)
+        self.menu = self._build_menu()
+        self.tray = self._build_tray()
+        QToolTip.setFont(_font(12))
+        QGuiApplication.styleHints().colorSchemeChanged.connect(lambda *_: self._on_scheme())
+        self._apply_appearance()
 
-        # Persist the collapsed/expanded state the same way, so an OSD parked
-        # minimized comes back minimized after a restart.
-        def _save_osd_minimized(minimized: bool) -> None:
-            from claude_usage.config import save_config, user_config_path
-            _cfg_copy = dict(config)
-            _cfg_copy["osd_minimized"] = bool(minimized)
-            config["osd_minimized"] = bool(minimized)
-            try:
-                save_config(user_config_path(), _cfg_copy)
-            except OSError:
-                pass
-        self.overlay.minimizedChanged.connect(_save_osd_minimized)
+        self._refreshed.connect(self._on_refreshed)
+        self._built.connect(self._on_built)
+        self._notice.connect(self._balloon)
+        self._update_checked.connect(self._on_update_checked)
 
-        # Show the overlay and kick off the first refresh.
-        self.overlay.show()
-        
-        # Keep the OSD reliably above other windows. On Windows the
-        # WindowStaysOnTopHint z-order is lost over time when other topmost or
-        # fullscreen windows appear, so re-raise the overlay on a short timer.
-        # raise_() only (never activateWindow) so we never steal keyboard focus
-        # from whatever the user is actually working in.
-        self._ontop_timer = QTimer(self)
-        self._ontop_timer.timeout.connect(
-            lambda: self.overlay.raise_() if self.overlay.isVisible() else None
-        )
-        self._ontop_timer.start(2000)
+        self._on_top = QTimer(self)
+        self._on_top.setInterval(ON_TOP_MS)
+        self._on_top.timeout.connect(self._keep_on_top)
+        self._builder = ThreadPoolExecutor(1, thread_name_prefix="claude-usage-snapshot")
+        self._worker = threading.Thread(target=self._run, name="claude-usage-refresh", daemon=True)
+        self._server: Optional[QLocalServer] = None
 
-        # Autonomous auth self-healing: when the plan-usage fetch fails with a
-        # credential error for several cycles in a row, the watchdog re-mints a
-        # long-lived token (`claude setup-token`) so the widget recovers without
-        # a manual re-login. Repairs run on a worker thread (setup-token can take
-        # a while) and are rate-limited internally.
-        from claude_usage.auth_watchdog import AuthWatchdog
-        self._auth_watchdog = AuthWatchdog(
-            self.config["claude_dir"], on_repair_attempt=self._on_auth_repair,
-        )
-        self._repair_inflight = False
+    # ----------------------------------------------------------- lifecycle
 
-        self._refresh_async()
+    def start(self, check_updates: bool = True) -> None:
+        self._apply_on_top()  # also shows the OSD
+        self._on_top.start()
+        self._worker.start()
+        self._server = QLocalServer(self)
+        QLocalServer.removeServer(SERVER_NAME)  # a stale socket file after a crash (not Windows)
+        if self._server.listen(SERVER_NAME):
+            self._server.newConnection.connect(self._on_peer)
+        else:
+            log.warning("single-instance server failed: %s", self._server.errorString())
+        if check_updates:
+            threading.Thread(target=self._check_update, args=(False,), daemon=True).start()
 
-        # Periodic refresh timer (runs on the GUI thread).
-        refresh_secs = int(config.get("refresh_seconds", 30))
-        self._timer = QTimer()
-        self._timer.setInterval(refresh_secs * 1000)
-        self._timer.timeout.connect(self._refresh_async)
-        self._timer.start()
-
-        # One-shot GitHub release check.
-        self._latest_tag: str | None = None
-        threading.Thread(target=self._check_update, daemon=True).start()
-
-        # Tracks whether a weekly-report generation is already in flight, so
-        # the hourly check doesn't spawn multiple Haiku calls in parallel.
-        self._weekly_report_in_flight = False
-
-    # ----------------------------------------------------------- menu build
-
-    def _build_context_menu(self) -> None:
-        m = self._context_menu
-
-        # ── Header (non-interactive, dim) ────────────────────────────
-        # Live-stats summary updated in `_sync_menu_state`. Disabled so
-        # clicks/keyboard nav skip over it.
-        self._act_stats_header = QAction("Loading…", m)
-        self._act_stats_header.setEnabled(False)
-        m.addAction(self._act_stats_header)
-
-        # Update banner — hidden until the GitHub release check finds a
-        # newer tag. Clickable: copies the upgrade hint to clipboard.
-        self._act_update_banner = QAction("", m)
-        self._act_update_banner.setVisible(False)
-        self._act_update_banner.triggered.connect(self._on_update_banner_click)
-        m.addAction(self._act_update_banner)
-
-        m.addSeparator()
-
-        # ── Primary actions ──────────────────────────────────────────
-        act_details = QAction("◉  Details…", m)
-        act_details.triggered.connect(self._show_popup)
-        m.addAction(act_details)
-
-        act_dashboard = QAction("▭  Dashboard…", m)
-        act_dashboard.triggered.connect(self._open_dashboard)
-        m.addAction(act_dashboard)
-
-        self._act_refresh = QAction("↻  Refresh", m)
-        self._act_refresh.triggered.connect(self._refresh_async)
-        m.addAction(self._act_refresh)
-
-        m.addSeparator()
-
-        # ── Display submenus (dynamic titles in _sync_menu_state) ────
-        self._opacity_menu = m.addMenu("◐  OSD Opacity")
-        self._opacity_actions: dict[int, QAction] = {}
-        from PySide6.QtGui import QActionGroup
-        opacity_group = QActionGroup(self._opacity_menu)
-        opacity_group.setExclusive(True)
-        for pct in (100, 75, 50, 25):
-            a = QAction(f"{pct}%", self._opacity_menu)
-            a.setCheckable(True)
-            a.setActionGroup(opacity_group)
-            a.triggered.connect(
-                lambda _checked=False, v=pct / 100.0, p=pct:
-                self._on_pick_opacity(v, p)
-            )
-            self._opacity_menu.addAction(a)
-            self._opacity_actions[pct] = a
-
-        from claude_usage.overlay import VIEW_MODES
-        self._view_menu = m.addMenu("⚏  OSD View")
-        view_group = QActionGroup(self._view_menu)
-        view_group.setExclusive(True)
-        self._view_actions: dict[str, QAction] = {}
-        for mode in VIEW_MODES:
-            a = QAction(mode.capitalize(), self._view_menu)
-            a.setCheckable(True)
-            a.setActionGroup(view_group)
-            a.triggered.connect(lambda _checked=False, md=mode: self._on_pick_view_mode(md))
-            self._view_menu.addAction(a)
-            self._view_actions[mode] = a
-
-        # Theme submenu — radio group so only one is ticked at a time. The
-        # selection auto-persists to the user config so a restart keeps it.
-        from claude_usage.themes import THEMES
-        self._theme_menu = m.addMenu("◭  Theme")
-        self._theme_group = QActionGroup(self._theme_menu)
-        self._theme_group.setExclusive(True)
-        self._theme_actions: dict[str, QAction] = {}
-        for name in sorted(THEMES.keys()):
-            a = QAction(name, self._theme_menu)
-            a.setCheckable(True)
-            a.setActionGroup(self._theme_group)
-            a.triggered.connect(lambda _checked=False, n=name: self._on_pick_theme(n))
-            self._theme_menu.addAction(a)
-            self._theme_actions[name] = a
-
-        act_minimize = QAction("▭  Minimize / Restore", m)
-        act_minimize.triggered.connect(self.overlay.toggle_minimized)
-        m.addAction(act_minimize)
-
-        self._act_ticker = QAction("✦  Show cost ticker", m)
-        self._act_ticker.setCheckable(True)
-        self._act_ticker.setChecked(self.overlay.is_ticker_enabled())
-        self._act_ticker.toggled.connect(self._on_toggle_ticker)
-        m.addAction(self._act_ticker)
-
-        # Launch-at-startup toggle — backed by the Startup-folder script, whose
-        # existence is the source of truth (checked state re-synced on open).
-        from claude_usage import autostart
-        self._act_autostart = QAction("🚀  Launch at startup", m)
-        self._act_autostart.setCheckable(True)
-        self._act_autostart.setChecked(autostart.is_enabled())
-        self._act_autostart.toggled.connect(self._on_toggle_autostart)
-        m.addAction(self._act_autostart)
-        m.aboutToShow.connect(self._sync_menu_state)
-
-        m.addSeparator()
-
-        # ── Footer (non-interactive, dim) ────────────────────────────
-        self._act_refresh_footer = QAction("Updated never", m)
-        self._act_refresh_footer.setEnabled(False)
-        m.addAction(self._act_refresh_footer)
-
-        act_quit = QAction("⏻  Quit", m)
-        act_quit.triggered.connect(self._on_quit)
-        m.addAction(act_quit)
-
-        # Apply theme-tinted styling — kills the default Qt grey palette.
-        self._apply_menu_qss()
-
-    def _on_toggle_ticker(self, checked: bool) -> None:
-        self.overlay.set_ticker_enabled(checked)
-        self.config["show_ticker"] = bool(checked)
-        self._persist_config()
-
-    def _on_toggle_autostart(self, checked: bool) -> None:
-        from claude_usage import autostart
-        if not autostart.set_enabled(checked):
-            # Failed (exe not found / Startup folder unwritable): revert the
-            # checkbox to reality without re-firing this handler.
-            self._act_autostart.blockSignals(True)
-            self._act_autostart.setChecked(autostart.is_enabled())
-            self._act_autostart.blockSignals(False)
-            try:
-                from claude_usage.notifier import notify
-                notify("Claude Usage", "Couldn't change the launch-at-startup setting.")
-            except Exception:
-                pass
-
-    def _on_pick_theme(self, name: str) -> None:
-        # If a STANDALONE popup is open, close it — switching themes swaps
-        # the painter/layout wholesale, and leaving the old window visible
-        # causes a jarring mid-paint flicker. The classic popup is normally
-        # EMBEDDED in the unified window's Overview tab: hiding it there
-        # blanks the tab permanently (hidden children skip the deferred
-        # rebuild and nothing re-shows them), so only hide real windows.
-        if self.popup.isWindow() and self.popup.isVisible():
-            self.popup.hide()
-        if self.skin_popup.isVisible():
-            self.skin_popup.hide()
-        self.overlay.set_theme(name)
-        merged = {**self.config, "theme": name}
-        self.popup.apply_config(merged)
-        self.skin_popup.apply_config(merged)
-        self.config["theme"] = name
-        self._persist_config()
-        # The unified window caches its construction-time palette — re-theme
-        # it live (tabs/toolbar/History dashboard) and rebuild the Overview
-        # tab from the latest stats so no stale-colored rows linger.
-        unified = getattr(self, "_unified", None)
-        if unified is not None:
-            try:
-                unified.apply_config(merged)
-                shown = getattr(self, "_last_display", None) or getattr(self, "stats", None)
-                if shown is not None:
-                    unified.update_stats(shown)
-            except RuntimeError:
-                self._unified = None  # C++ object gone — recreated on next open
-        # Retint the context menu so it follows the new palette instead of
-        # staying on the previous theme's colors.
-        self._apply_menu_qss()
-        # The tray menu shares the context-menu sheet — keep it in step.
-        if getattr(self, "_tray_menu", None) is not None:
-            self._tray_menu.setStyleSheet(self._context_menu.styleSheet())
-        self._apply_tooltip_qss()
-
-    def _apply_tooltip_qss(self) -> None:
-        """Theme the QToolTip — the OSD's rich hover tooltip otherwise renders
-        in the stock Windows beige box, the last piece of unthemed chrome on
-        the overlay. App-level sheet scoped to QToolTip only."""
-        from claude_usage.themes import get_theme
-
-        t = get_theme(str(self.config.get("theme", "default")))
-        app = QApplication.instance()
-        if app is not None:
-            app.setStyleSheet(f"""
-                QToolTip {{
-                    background-color: {t['bg']};
-                    color: {t['text_primary']};
-                    border: 1px solid {t['separator']};
-                    padding: 6px 8px;
-                    font-size: 11px;
-                }}
-            """)
-
-    def _on_pick_view_mode(self, mode: str) -> None:
-        self.overlay.set_view_mode(mode)
-        self.config["osd_view_mode"] = mode
-        self._persist_config()
-
-    def _on_pick_opacity(self, value: float, pct: int) -> None:
-        self.overlay.set_opacity(value)
-        self.config["osd_opacity"] = float(value)
-        self._persist_config()
-
-    def _on_update_banner_click(self) -> None:
-        """When the user clicks the update banner, copy the upgrade hint
-        to the system clipboard so they can paste it straight into a shell."""
+    def quit(self) -> None:
+        self._stop.set()
+        self._wake.set()
+        self._ready.set()  # a build still waiting for the store must not hold the process at exit
         try:
-            QApplication.clipboard().setText(
-                "pip install --upgrade claude-usage-widget"
-            )
+            self._on_top.stop()
+            if self.app is not None:
+                self.app.prepare_quit()
+                self.app.hide()  # reports app_geometry
+            if self._save_timer.isActive():
+                self._save_timer.stop()
+                self._save()
+            if self.tray is not None:
+                self.tray.hide()
+            self._builder.shutdown(wait=False, cancel_futures=True)
+            if self._worker.is_alive():
+                self._worker.join(2)  # it stops between files; a stuck fetch is left to die with the process
         except Exception:
-            pass
+            log.exception("error while quitting")
+        QApplication.quit()  # always, or Quit would leave the process running
 
-    # ----------------------------------------------------------- menu styling
+    def refresh_now(self) -> None:
+        self._wake.set()
 
-    def _menu_palette(self) -> dict[str, str]:
-        """Pull menu colors from the active theme — works for both classic
-        themes (`bg`, `bar_blue`, `separator`, ...) and skin themes which
-        carry richer keys (`accent`, `border`, ...). Falls back gracefully
-        when a key is absent."""
-        from claude_usage.skins import SKIN_MODULES
-        name = str(self.config.get("theme", "default"))
-        skin = SKIN_MODULES.get(name)
-        if skin is not None:
-            t = skin.THEME
-            return {
-                "bg":     t.get("panel", t.get("bg", "#1a1a2e")),
-                "text":   t.get("text_primary", "#e0e0e8"),
-                "dim":    t.get("text_dim", "#8a8a9a"),
-                "accent": t.get("accent", t.get("bar_blue", "#5B9BD5")),
-                "border": t.get("border", t.get("separator", "#2a2a38")),
-            }
-        # Classic theme — narrower schema.
-        from claude_usage.themes import get_theme
-        t = get_theme(name)
-        return {
-            "bg":     t.get("bg", "#1a1a2e"),
-            "text":   t.get("text_primary", "#e0e0e8"),
-            "dim":    t.get("text_dim", "#8a8a9a"),
-            "accent": t.get("bar_blue", "#5B9BD5"),
-            "border": t.get("separator", "#2a2a38"),
-        }
+    def reindex(self) -> None:
+        self._reindex.set()
+        self._wake.set()
 
-    @staticmethod
-    def _hex_to_rgba(hex_str: str, alpha: float) -> str:
-        """`#rrggbb` + alpha → CSS `rgba(r, g, b, a)`. Used for hover tints
-        on top of the menu background — Qt QSS supports `rgba()`."""
-        h = hex_str.lstrip("#")
-        if len(h) == 3:
-            h = "".join(c * 2 for c in h)
+    def open_app(self, page: Optional[str] = None) -> None:
         try:
-            r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-        except ValueError:
-            return hex_str
-        return f"rgba({r},{g},{b},{alpha:.2f})"
+            if self.app is None:
+                # Imported here so the QML engine and its libraries load only when the window is first opened.
+                from claude_usage.app import AppWindow
+                self.app = AppWindow(self._provider, self._app_settings(), self._on_setting, self._on_action)
+            self.app.show(page)
+        except Exception:  # called from clicks and menus: say so instead of failing silently
+            log.exception("could not open the app window")
+            self._balloon("Claude Usage", OPEN_FAILED)
 
-    def _apply_menu_qss(self) -> None:
-        """Tint the context menu with the active theme. Without this Qt
-        falls back to the system's default grey menu, which clashes with
-        every skin we ship."""
-        c = self._menu_palette()
-        accent_hover = self._hex_to_rgba(c["accent"], 0.18)
-        accent_check = self._hex_to_rgba(c["accent"], 0.85)
-        qss = f"""
-        QMenu {{
-            background-color: {c["bg"]};
-            color: {c["text"]};
-            border: 1px solid {c["border"]};
-            padding: 6px 4px;
-            font-size: 12px;
-        }}
-        QMenu::item {{
-            padding: 6px 24px 6px 14px;
-            margin: 2px 6px;
-            border-radius: 5px;
-            background: transparent;
-            color: {c["text"]};
-        }}
-        QMenu::item:selected {{
-            background-color: {accent_hover};
-            color: {c["text"]};
-        }}
-        QMenu::item:disabled {{
-            color: {c["dim"]};
-            background: transparent;
-        }}
-        QMenu::separator {{
-            height: 1px;
-            background: {c["border"]};
-            margin: 6px 14px;
-        }}
-        QMenu::indicator {{
-            width: 12px;
-            height: 12px;
-            margin-left: 6px;
-        }}
-        QMenu::indicator:checked {{
-            background: {accent_check};
-            border: 1px solid {c["accent"]};
-            border-radius: 6px;
-        }}
-        QMenu::indicator:unchecked {{
-            background: transparent;
-            border: 1px solid {c["dim"]};
-            border-radius: 6px;
-        }}
-        QMenu::right-arrow {{
-            image: none;
-            width: 0;
-            height: 0;
-            border-style: solid;
-            border-width: 4px 0 4px 6px;
-            border-color: transparent transparent transparent {c["dim"]};
-            margin-right: 8px;
-        }}
-        """
-        self._context_menu.setStyleSheet(qss)
-        # Submenus inherit the parent's QSS in Qt 6 only when explicitly
-        # set, so cascade it.
-        for sub in (
-            getattr(self, "_opacity_menu", None),
-            getattr(self, "_view_menu", None),
-            getattr(self, "_theme_menu", None),
-        ):
-            if sub is not None:
-                sub.setStyleSheet(qss)
+    # ----------------------------------------------------------- worker thread
 
-    def _sync_menu_state(self) -> None:
-        """Refresh dynamic labels and tick marks each time the menu opens —
-        live-stats header, submenu titles showing the current selection,
-        update banner visibility, and the "Updated Xs ago" footer."""
-        # Stats header — "Session 42% · Weekly 71% · ● 10.5k t/m".
-        s_pct = int((getattr(self.stats, "session_utilization", 0.0) or 0.0) * 100)
-        w_pct = int((getattr(self.stats, "weekly_utilization", 0.0) or 0.0) * 100)
-        live = getattr(self.stats, "live_activity", None)
-        live_txt = ""
-        if live is not None and getattr(live, "is_live", False):
-            tpm = float(getattr(live, "tokens_per_minute", 0.0) or 0.0)
-            live_txt = f"  ·  ● {tpm / 1000:.1f}k t/m"
-        if self._last_refresh_ts <= 0:
-            self._act_stats_header.setText("Loading…")
-        else:
-            self._act_stats_header.setText(
-                f"Session {s_pct}%  ·  Weekly {w_pct}%{live_txt}"
-            )
-
-        # Update banner — only visible when the GitHub release check
-        # found something newer than __version__.
-        tag = getattr(self, "_latest_tag", None)
-        if tag:
-            self._act_update_banner.setText(
-                f"↑  Update available: {tag}  (click to copy upgrade cmd)"
-            )
-            self._act_update_banner.setVisible(True)
-        else:
-            self._act_update_banner.setVisible(False)
-
-        # Refresh action — show "(refreshing…)" suffix while in flight.
-        self._act_refresh.setText(
-            "↻  Refresh (refreshing…)" if self._refreshing else "↻  Refresh"
-        )
-
-        # Submenu titles — surface the current selection so the user
-        # doesn't have to drill in to know what's active.
-        current_theme = str(self.config.get("theme", "default"))
-        self._theme_menu.setTitle(f"◭  Theme · {current_theme}")
-        current_view = self.overlay.view_mode()
-        self._view_menu.setTitle(f"⚏  OSD View · {current_view}")
-        opacity_pct = int(round(float(self.config.get("osd_opacity", 1.0)) * 100))
-        self._opacity_menu.setTitle(f"◐  OSD Opacity · {opacity_pct}%")
-
-        # Tick marks on radio-grouped items.
-        self._act_ticker.setChecked(self.overlay.is_ticker_enabled())
-        # Autostart reflects the Startup-folder file (may have been changed
-        # externally, e.g. via setup.ps1 or manual delete) — sync silently.
-        from claude_usage import autostart
-        self._act_autostart.blockSignals(True)
-        self._act_autostart.setChecked(autostart.is_enabled())
-        self._act_autostart.blockSignals(False)
-        theme_act = self._theme_actions.get(current_theme)
-        if theme_act is not None:
-            theme_act.setChecked(True)
-        view_act = self._view_actions.get(current_view)
-        if view_act is not None:
-            view_act.setChecked(True)
-        op_act = self._opacity_actions.get(opacity_pct)
-        if op_act is not None:
-            op_act.setChecked(True)
-
-        # Footer — "Updated 12s ago" / "5m ago" / "1h 23m ago".
-        if self._last_refresh_ts <= 0:
-            self._act_refresh_footer.setText("Updated never")
-        else:
-            import time as _t
-            secs = max(0, int(_t.time() - self._last_refresh_ts))
-            if secs < 60:
-                ago = f"{secs}s ago"
-            elif secs < 3600:
-                ago = f"{secs // 60}m ago"
-            else:
-                ago = f"{secs // 3600}h {(secs % 3600) // 60}m ago"
-            self._act_refresh_footer.setText(f"Updated {ago}")
-
-    def _persist_config(self) -> None:
-        """Write the in-memory config to the user's XDG config file.
-
-        Best-effort: if the filesystem is read-only (sandboxed installs,
-        full disk) we swallow the error rather than crashing the GUI.
-        The change still applies for the remainder of the session.
-        """
-        from claude_usage.config import save_config, user_config_path
-        try:
-            save_config(user_config_path(), self.config)
-        except OSError:
-            pass
-
-    # ------------------------------------------------------------- refresh
-
-    def _refresh_async(self) -> None:
-        if self._refreshing or not self._alive:
-            return
-        self._refreshing = True
-
-        def _worker() -> None:
+    def _open(self) -> tuple:
+        """The worker's store connection and ingestor, retried with backoff: a locked
+        store or a full disk can clear later. (None, None) once quit, or for a newer store."""
+        tries = 0
+        while not self._stop.is_set():
+            conn = None
             try:
-                stats = collect_all(self.config)
-            except Exception as _exc:
-                # Log the full traceback to the rotating log file. (This used a
-                # hardcoded per-user temp path that was broken for every other
-                # user; route it through the shared logger instead.)
-                from claude_usage.logging_setup import get_logger
-                get_logger().exception("collection failed")
-                _msg = f"{type(_exc).__name__}: {_exc}"[:120]
-                stats = UsageStats(rate_limit_error=f"Collection error: {_msg}")
-            # Emit cross-thread signal; the slot runs on the GUI thread.
-            if self._alive:
-                self.stats_ready.emit(stats)
-
-        threading.Thread(target=_worker, daemon=True).start()
-
-    @Slot(object)
-    def _apply_stats(self, stats: UsageStats) -> None:
-        self._refreshing = False
-        if not self._alive:
-            return
-        self.stats = stats
-        import time as _t
-        self._last_refresh_ts = _t.time()
-
-        # Autonomous auth self-healing: hand the outcome to the watchdog, which
-        # counts consecutive *credential* failures (ignoring transient 429/net)
-        # and, past its threshold, re-mints a long-lived token on a worker
-        # thread. Guarded so only one repair runs at a time.
-        self._maybe_self_heal_auth(stats.rate_limit_error)
-
-        # ── Resilience: backoff on transient auth / network errors ──────
-        if stats.rate_limit_error:
-            self._consecutive_errors += 1
-            # Escalate retry interval: 60 s → 2 min → 5 min
-            backoff = self._BACKOFF_SECS[
-                min(self._consecutive_errors - 1, len(self._BACKOFF_SECS) - 1)
-            ]
-            self._timer.setInterval(backoff * 1000)
-            # Persistent auth failures (expired / invalid credentials) won't
-            # fix themselves on retry, so surface them immediately. Only
-            # transient (network) errors get the "show last known-good for the
-            # first 2 failures" grace that avoids flashing on a momentary blip.
-            _err = (stats.rate_limit_error or "").lower()
-            _auth_failure = (
-                "credential" in _err
-                or "re-authenticate" in _err
-                or "log in" in _err
-                or "expired" in _err
-            )
-            if (
-                not _auth_failure
-                and self._consecutive_errors <= 2
-                and self._last_good_stats is not None
-            ):
-                display = self._last_good_stats
-            else:
-                display = stats
-        else:
-            # Success: reset backoff, restore normal refresh cadence
-            if self._consecutive_errors > 0:
-                self._consecutive_errors = 0
-                refresh_secs = int(self.config.get("refresh_seconds", 30))
-                self._timer.setInterval(refresh_secs * 1000)
-            self._last_good_stats = stats
-            display = stats
-        # ────────────────────────────────────────────────────────────────
-        # What the UI is currently showing (grace-substituted) — theme picks
-        # and lazy window creation rebuild from this, not raw self.stats, so
-        # they can't flash zeroed bars during a transient network blip.
-        self._last_display = display
-
-        self.overlay.update_stats(display)
-        # Exactly ONE driver for the embedded popup: once the unified window
-        # exists, its update_stats refreshes the popup internally — calling
-        # both rebuilt the whole label tree twice per refresh. Before the
-        # window is first opened, drive the popup directly (guarded: if Qt
-        # ever deleted the embedded child, the call would raise per refresh).
-        _unified = getattr(self, "_unified", None)
-        if _unified is None:
-            try:
-                self.popup.update_stats(display)
-            except RuntimeError:
-                pass
-        else:
-            try:
-                _unified.update_stats(display)
-            except RuntimeError:
-                self._unified = None  # window was destroyed — fall back next tick
-        self.skin_popup.update_stats(display)
-        self.notifier.check_stats(stats)
-
-        # Webhook: anomaly
-        if getattr(stats.anomaly, "is_anomaly", False):
-            self._webhooks.fire("anomaly", {
-                "ratio": stats.anomaly.ratio,
-                "z_score": stats.anomaly.z_score,
-                "message": stats.anomaly.message,
-            })
-
-        # Weekly report: kick off a background regeneration if the on-disk
-        # cache is stale and we're not already generating. Pass a snapshot
-        # of the stats so the worker never observes a torn mid-refresh mix
-        # of fields.
-        if not stats.weekly_report_text and not self._weekly_report_in_flight:
-            self._weekly_report_in_flight = True
-            threading.Thread(
-                target=self._generate_weekly_report,
-                args=(stats,),
-                daemon=True,
-            ).start()
-
-        # Webhook: daily report (first refresh of each local day)
-        today_iso = datetime.now().strftime("%Y-%m-%d")
-        if today_iso != self._last_daily_report_date:
-            self._last_daily_report_date = today_iso
-            self._webhooks.fire("daily_report", {
-                "date": today_iso,
-                "session_utilization": stats.session_utilization,
-                "weekly_utilization": stats.weekly_utilization,
-                "today_cost": stats.today_cost,
-                "today_tokens": stats.today_tokens,
-            })
-
-    # -------------------------------------------------------------- slots
-
-    def _maybe_self_heal_auth(self, error: str | None) -> None:
-        """Feed a fetch outcome to the auth watchdog; run any repair off-thread.
-
-        The watchdog decides whether this counts as an auth failure and whether
-        a repair is due (threshold + cooldown). Because ``claude setup-token``
-        can take a while, the repair runs on a daemon thread so the UI never
-        freezes; ``_repair_inflight`` ensures only one runs at a time.
-        """
-        wd = getattr(self, "_auth_watchdog", None)
-        if wd is None or getattr(self, "_repair_inflight", False):
-            # Still let success reset the streak even while a repair is in flight.
-            if wd is not None and error is None:
-                wd.note_result(None)
-            return
-        import threading
-
-        def _run() -> None:
-            try:
-                wd.note_result(error)
-            finally:
-                self._repair_inflight = False
-
-        # Only spin a thread when there's a credential error to act on; success
-        # / transient errors are cheap and handled inline.
-        from claude_usage.auth_watchdog import is_auth_error
-        if is_auth_error(error):
-            self._repair_inflight = True
-            threading.Thread(target=_run, name="auth-watchdog", daemon=True).start()
-        else:
-            wd.note_result(error)  # resets streak on success; ignores 429/net
-
-    def _on_auth_repair(self, message: str) -> None:
-        """Watchdog notification hook — log + best-effort desktop notification."""
-        try:
-            from claude_usage.notifier import notify
-            notify("Claude Usage", message)
-        except Exception:
-            pass  # notifier is optional; the log already records the event
-
-    def _reconnect_auth(self) -> None:
-        """Manual tray 'Reconnect': force a token repair, bypassing backoff/give-up."""
-        wd = getattr(self, "_auth_watchdog", None)
-        if wd is None or getattr(self, "_repair_inflight", False):
-            return
-        import threading
-
-        def _run() -> None:
-            try:
-                wd.force_repair()
-            finally:
-                self._repair_inflight = False
-
-        self._repair_inflight = True
-        threading.Thread(target=_run, name="auth-reconnect", daemon=True).start()
-
-    def _on_overlay_click(self) -> None:
-        self._show_popup()
-
-    def _on_overlay_right_click(self, global_pos: QPoint) -> None:
-        self._context_menu.popup(global_pos)
-
-    def _osd_pos_visible(self, x: int, y: int) -> bool:
-        """True if an OSD placed at (x, y) would land on a connected screen."""
-        return _rect_on_some_screen(x, y, self.overlay.width(), self.overlay.height())
-
-    def _get_unified_window(self):
-        """Return the singleton unified (Overview + History tabs) window.
-
-        Embeds the live ``self.popup`` as the Overview tab and a
-        ``DashboardWindow`` as the History tab, so the existing
-        ``self.popup.update_stats(...)`` in ``_apply_stats`` keeps the Overview
-        tab live with zero extra wiring. Lazily created; recreated if the
-        underlying C++ object was destroyed.
-        """
-        from claude_usage.dashboard import DashboardWindow, UnifiedWindow
-
-        w = getattr(self, "_unified", None)
-        try:
-            if w is None:
-                raise RuntimeError("create")
-            _ = w.isVisible()  # raises if the C++ object was destroyed
-        except RuntimeError:
-            dashboard = DashboardWindow(self.config)
-            w = UnifiedWindow(self.config, self.popup, dashboard,
-                              on_refresh=self._refresh_async)
-            self._unified = w
-            # Seed the Overview tab with what the UI is showing (grace-
-            # substituted display stats, falling back to the raw snapshot).
-            seed = getattr(self, "_last_display", None) or getattr(self, "stats", None)
-            if seed is not None:
+                conn = store.connect(self.store_path)
+                if conn.execute("PRAGMA user_version").fetchone()[0] > store.SCHEMA_VERSION:
+                    # Writing into a layout this version does not know could corrupt it; a retry cannot help.
+                    log.error("%s was made by a newer Claude Usage; not using it", self.store_path)
+                    self._notice.emit("Claude Usage", NEWER_STORE)
+                    conn.close()
+                    self._newer = True
+                    return None, None
                 try:
-                    w.update_stats(seed)
-                except Exception:
-                    pass
-        return w
-
-    def _present_unified(self, tab_index: int) -> None:
-        """Bring the unified window to the front on the given tab."""
-        from PySide6.QtCore import Qt
-
-        w = self._get_unified_window()
-        w.show_tab(tab_index)
-        w.setWindowState((w.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
-        w.show()
-        w.raise_()
-        w.activateWindow()
-
-    def _open_dashboard(self) -> None:
-        """Open the unified window on the History tab, brought to front."""
-        self._present_unified(1)
-
-    def _setup_tray(self) -> None:
-        """Add a system-tray icon: a persistent entry point to the dashboard.
-
-        The floating OSD is easily lost behind maximised windows; the tray icon
-        is always reachable. Single- or double-clicking it opens the dashboard;
-        right-click gives the full menu. Non-fatal where no system tray exists.
-        """
-        import os
-
-        from PySide6.QtGui import QIcon
-        from PySide6.QtWidgets import QMenu, QSystemTrayIcon
-
-        self._tray = None
-        try:
-            if not QSystemTrayIcon.isSystemTrayAvailable():
-                return
-        except Exception:
-            return
-
-        icon_path = os.path.join(os.path.dirname(__file__), "icons", "claude-tray.svg")
-        icon = QIcon(icon_path)
-
-        tray = QSystemTrayIcon(icon, self)
-        tray.setToolTip("Claude Usage")
-
-        menu = QMenu()
-        for label, slot in (
-            ("📊  Open Dashboard", self._open_dashboard),
-            ("◉  Details…", self._show_popup),
-            ("↻  Refresh", self._refresh_async),
-            ("🔌  Reconnect (re-auth)", self._reconnect_auth),
-        ):
-            act = QAction(label, menu)
-            act.triggered.connect(slot)
-            menu.addAction(act)
-        menu.addSeparator()
-        act_quit = QAction("⏻  Quit", menu)
-        act_quit.triggered.connect(self._on_quit)
-        menu.addAction(act_quit)
-
-        tray.setContextMenu(menu)
-        # The tray menu otherwise renders in the system's default grey — copy
-        # the themed context-menu stylesheet (_setup_tray runs after
-        # _build_context_menu in __init__, so it's already populated).
-        menu.setStyleSheet(self._context_menu.styleSheet())
-        tray.activated.connect(self._on_tray_activated)
-        tray.show()
-        self._tray = tray
-        self._tray_menu = menu  # keep a reference so Qt doesn't GC the menu
-
-    def _on_tray_activated(self, reason) -> None:
-        """Left-click (Trigger) or double-click the tray icon → open dashboard."""
-        from PySide6.QtWidgets import QSystemTrayIcon
-
-        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
-            self._open_dashboard()
-
-    def _show_popup(self) -> None:
-        # Classic themes use the unified tabbed window (Overview + History),
-        # which embeds the layout-based popup as its Overview tab. The 6 handoff
-        # skins keep their bespoke pure-paintEvent SkinPopupWidget.
-        from claude_usage.skins import SKIN_MODULES
-        theme_name = str(self.config.get("theme", "default"))
-        if theme_name not in SKIN_MODULES:
-            self._present_unified(0)  # Overview tab
-            return
-
-        target = self.skin_popup
-        # Hide the classic popup if it somehow leaked onto screen — but only
-        # when it's a real window; embedded in the unified Overview tab a
-        # hide() here would blank that tab for good.
-        if self.popup.isWindow() and self.popup.isVisible():
-            self.popup.hide()
-        # Position popup relative to the OSD overlay
-        try:
-            osd = self.overlay
-            screen = osd.screen() if osd.screen() else QApplication.primaryScreen()
-            avail = screen.availableGeometry() if screen else None
-            if avail:
-                ox, oy = osd.x(), osd.y()
-                pw, ph = target.width(), target.height()
-                sw, sh = avail.width(), avail.height()
-                # Prefer right side; fall back to left; clamp vertically
-                if ox + osd.width() + pw + 10 <= avail.x() + sw:
-                    tx = ox + osd.width() + 10
-                else:
-                    tx = max(avail.x(), ox - pw - 10)
-                ty = max(avail.y(), min(oy, avail.y() + sh - ph))
-                target.move(tx, ty)
-        except Exception:
-            pass
-        target.show()
-        target.raise_()
-        target.activateWindow()
-
-    def _generate_weekly_report(self, snapshot: UsageStats) -> None:
-        try:
-            from claude_usage.ai_report import generate_report
-            from claude_usage.collector import _load_credentials
-            claude_dir = self.config["claude_dir"]
-            summary = {
-                "week_cost": snapshot.week_cost,
-                "week_tokens": snapshot.week_tokens,
-                "week_messages": snapshot.week_messages,
-                "subscription_type": snapshot.subscription_type,
-                "top_projects": sorted(
-                    snapshot.today_by_project.items(),
-                    key=lambda kv: kv[1],
-                    reverse=True,
-                )[:3],
-                "by_model": snapshot.today_by_model_detailed,
-            }
-            generate_report(
-                claude_dir=claude_dir,
-                summary=summary,
-                token_loader=lambda: _load_credentials(claude_dir),
-            )
-        except Exception:
-            pass
-        finally:
-            self._weekly_report_in_flight = False
-
-    def _check_update(self) -> None:
-        try:
-            from claude_usage import __version__ as v
-            from claude_usage.updater import check_latest_version
-            tag, available = check_latest_version(v)
-            if available and tag:
-                self._latest_tag = tag
-                self.notifier._send(
-                    f"Claude Usage {tag} available",
-                    "Update with: pip install --upgrade claude-usage-widget",
-                )
-        except Exception:
-            pass
-        # Also check the Windows-port repo for patch updates
-        try:
-            import json as _json
-            from urllib.request import Request as _Req, urlopen as _uopen
-            _api = "https://api.github.com/repos/arora-vaibhav/claude-usage-widget-windows/releases/latest"
-            _req = _Req(_api, headers={"User-Agent": "claude-usage-widget-windows/1.0"})
-            with _uopen(_req, timeout=10) as _r:
-                _rel = _json.loads(_r.read(32768).decode("utf-8", errors="replace"))
-            _win_tag = _rel.get("tag_name", "")
-            _installed = getattr(self, "_win_patch_version", None)
-            if _win_tag and _win_tag != _installed:
-                # Persist seen tag so we only notify once per version
-                self._win_patch_version = _win_tag
-                _body = _rel.get("body", "").split("\n")[0][:80]  # first line of notes
-                self.notifier._send(
-                    f"Windows patch {_win_tag} available",
-                    _body or "Run setup.ps1 again to apply the latest patch.",
-                )
-        except Exception:
-            pass
-
-    def _on_quit(self) -> None:
-        self._alive = False
-        self._timer.stop()
-        if self._api_server is not None:
-            try:
-                self._api_server.stop()
+                    store.import_legacy(conn, self.claude_dir)
+                except Exception:  # the old daily totals are optional; a bad row must not keep the store closed
+                    log.exception("could not import the old usage files; going on without them")
+                return conn, ingest.Ingestor(conn, os.path.join(self.claude_dir, "projects"))
             except Exception:
-                pass
-        QApplication.instance().quit()
+                log.exception("could not open the store at %s", self.store_path)
+                if conn is not None:
+                    conn.close()
+                if not tries:
+                    self._notice.emit("Claude Usage", "Could not open the usage store. Retrying; see claude-usage.log.")
+                tries += 1
+                self._stop.wait(BACKOFF_S[min(tries, len(BACKOFF_S)) - 1])
+        return None, None
+
+    def _run(self) -> None:
+        conn, ing = self._open()
+        self._ready.set()
+        if conn is None:
+            if self._newer:  # say why on the OSD, tray, menu and app, from an empty in-memory store
+                lim, mem = {"error": NEWER_STORE, "error_kind": "store"}, store.connect(":memory:")
+                self._refreshed.emit(snapshot.now_state(mem, lim, time.time(), self._thresholds()), lim, None)
+                mem.close()
+            return
+        last_good: Optional[dict] = None
+        shown: Optional[dict] = None
+        errors, next_fetch, last_fetch, full = 0, 0.0, float("-inf"), True
+        ix: dict = {}
+
+        def progress(done: int, total: int) -> None:
+            ix.update(done=done, total=total)
+
+        force, interval = True, 30  # the first pass always fetches
+        while not self._stop.is_set():
+            try:  # one failure must not end the thread and freeze the OSD
+                interval = max(5, int(self.config.get("refresh_seconds") or 30))
+                if self._reindex.is_set():
+                    self._reindex.clear()
+                    self._wake.clear()  # reindex() woke us; left set, it would cancel the pass below at once
+                    with conn:  # forget every read offset; re-reading is safe, calls are upserted
+                        conn.execute("DELETE FROM files")
+                    ing, full, force = ingest.Ingestor(conn, os.path.join(self.claude_dir, "projects")), True, True
+                try:
+                    if full:
+                        # A short first pass gets the OSD its first numbers within seconds on a first run;
+                        # later passes stay short so the app's indexing progress keeps moving.
+                        deadline = time.monotonic() + (min(interval, 10) if shown is not None else 3)
+                        r = ing.index(progress, cancel=lambda: (self._stop.is_set() or self._wake.is_set()
+                                                                or time.monotonic() > deadline))
+                        full = r["cancelled"]
+                    else:
+                        ing.tail(cancel=lambda: self._stop.is_set() or self._wake.is_set())
+                except Exception:
+                    log.exception("ingest failed")
+                    full = False  # tail() retries the full walk; never spin on a broken pass
+                if self._stop.is_set():
+                    break
+                if self._wake.is_set():  # Refresh now or Re-index; it also cuts an indexing pass short
+                    self._wake.clear()
+                    force = time.monotonic() - last_fetch >= FORCE_GAP_S  # else only "now" is worked out again
+                if force or time.monotonic() >= next_fetch:
+                    force, last_fetch = False, time.monotonic()
+                    try:
+                        lim = self._fetch(self.claude_dir)
+                    except Exception as exc:
+                        log.exception("limits fetch failed")
+                        lim = {"error": f"Collection error: {type(exc).__name__}"}
+                    error = lim.get("error")
+                    if error:
+                        errors += 1
+                        # The plan is in the credentials, not the reply: a first fetch that fails still names it.
+                        shown = dict(last_good or {}, error=error, plan=lim.get("plan") or collector._plan(self.claude_dir))
+                        next_fetch = time.monotonic() + BACKOFF_S[min(errors, len(BACKOFF_S)) - 1]
+                    else:
+                        errors = 0
+                        last_good = shown = lim
+                        next_fetch = time.monotonic() + interval
+                        w, f = lim.get("weekly"), lim.get("five_hour")
+                        try:
+                            store.add_sample(conn, lim["fetched_at"], w and w["pct"], f and f["pct"],
+                                             {"resets_at": (w or {}).get("resets_at"), "source": lim.get("source")})
+                        except Exception:
+                            log.exception("could not store the utilization sample")
+                    self._heal(error)
+                now = snapshot.now_state(conn, shown, time.time(), self._thresholds())
+                self._refreshed.emit(now, shown, dict(ix) if full else None)
+            except Exception:
+                log.exception("refresh failed")
+                full = False
+            if not full:
+                self._wake.wait(interval)  # not cleared here, so a wake that lands mid-refresh is kept
+        conn.close()
+
+    def _heal(self, error: Optional[str]) -> None:
+        """Feed a fetch outcome to the auth watchdog. A repair runs `claude setup-token`
+        (up to minutes), so it gets its own thread and the refreshes go on."""
+        if self._repairing:
+            return
+        if not is_auth_error(error):
+            self.watchdog.note_result(error)  # success resets the streak; 429 and network errors don't count
+            return
+        self._repairing = True
+
+        def run() -> None:
+            try:
+                self.watchdog.note_result(error)
+            finally:
+                self._repairing = False
+
+        threading.Thread(target=run, name="claude-usage-auth", daemon=True).start()
+
+    # ----------------------------------------------------------- GUI thread
+
+    def _on_refreshed(self, now: dict, shown: Optional[dict], indexing: Optional[dict]) -> None:
+        self._now, self._shown, self._indexing, self._updated_at = now, shown, indexing, time.time()
+        self.osd.set_now(now, indexing)
+        if self.tray is not None:
+            self.tray.setToolTip(_tray_tip(now, shown, indexing))
+        self.notifier.check_now(now, _active_scoped(shown))
+        if self.app is not None and self.app.is_visible() and not self.app.window.windowState() & Qt.WindowMinimized:
+            self._kick_build()
+
+    def _provider(self, range_key: str, project: Optional[str]) -> None:
+        """AppWindow's provider: queue a build and return None; the result arrives via update_snapshot."""
+        self._want = (range_key, project)
+        self._kick_build()
+        return None
+
+    def _kick_build(self) -> None:
+        if self._want is None or self._stop.is_set():
+            return
+        if self._building:
+            self._dirty = True
+            return
+        self._building, self._dirty = True, False
+        self._builder.submit(self._build_job, self._want, self._shown, self._indexing, self._updated_at,
+                             self._thresholds())
+
+    def _build_job(self, want: tuple, limits: Optional[dict], indexing: Optional[dict],
+                   updated_at: Optional[float], thresholds: tuple) -> None:
+        snap = None
+        try:
+            self._ready.wait()  # the worker creates or migrates the store first
+            if self._stop.is_set():
+                return
+            if self._bconn is None:
+                self._bconn = store.connect(":memory:" if self._newer else self.store_path)
+            snap = snapshot.build(self._bconn, want[0], want[1], time.time(), limits, indexing=indexing,
+                                  updated_at=updated_at, thresholds=thresholds)
+        except Exception:
+            log.exception("snapshot build failed for %s", want)
+        try:
+            self._built.emit(want, snap)
+        except RuntimeError:  # the controller was deleted at exit while this build ran
+            pass
+
+    def _on_built(self, want: tuple, snap: Optional[dict]) -> None:
+        self._building = False
+        if want == self._want and snap is not None and self.app is not None:
+            self.app.update_snapshot(snap)
+        if self._dirty or want != self._want:
+            self._kick_build()  # newer limits, or another range or project, came in while this one built
+
+    # ----------------------------------------------------------- settings
+
+    def _thresholds(self) -> tuple:
+        t = self.config.get("notify_thresholds") or [tokens.CAUTION, tokens.CRITICAL]
+        return float(t[0]), float(t[1])
+
+    def _app_settings(self) -> dict:
+        return dict(self.config, autostart=autostart.is_enabled(), store_path=self.store_path)
+
+    def _set(self, key: str, value: Any) -> None:
+        """The one config writer: update in memory, save shortly after."""
+        if self.config.get(key) == value:
+            return
+        self.config[key] = value
+        self._save_timer.start(SAVE_DELAY_MS)
+
+    def _save(self) -> None:
+        try:
+            save_config(self.config_path, self.config)
+        except OSError as exc:
+            log.warning("could not save the config to %s: %s; retrying", self.config_path, exc)
+            self._save_timer.start(SAVE_RETRY_MS)  # quit() also saves while a retry is pending
+        except (TypeError, ValueError) as exc:  # a value JSON cannot hold
+            log.warning("could not save the config to %s: %s", self.config_path, exc)
+
+    def _on_setting(self, key: str, value: Any) -> None:
+        raw_js = hasattr(value, "toVariant")  # a QJSValue: QML passed a JS array (the alert thresholds)
+        if raw_js:
+            value = value.toVariant()
+        if key == "autostart":  # the Startup-folder file is the truth, not the config
+            if not autostart.set_enabled(bool(value)):
+                self._balloon("Claude Usage", "Couldn't change the launch-at-startup setting.")
+            if self.app is not None:
+                self.app.set_settings(self._app_settings())
+            return
+        clean = drop_bad_values({key: value})
+        if key not in clean:  # e.g. thresholds that do not parse would fail every refresh
+            log.warning("ignored a bad value for %s: %r", key, value)
+            if self.app is not None:
+                self.app.set_settings(self._app_settings())
+            return
+        value = clean[key]
+        self._set(key, value)
+        if key == "appearance":
+            self._apply_appearance()
+        elif key == "osd_style":
+            self.osd.set_style(value)
+        elif key == "osd_opacity":
+            self.osd.set_opacity(float(value))
+        elif key == "osd_always_on_top":
+            self._apply_on_top()
+        elif key == "notifications_enabled":
+            self.notifier.enabled = bool(value)
+        elif key == "notify_thresholds":
+            self.notifier.set_thresholds(self._thresholds())
+            self.refresh_now()  # the meter levels come from the worker; recolour now, not at the next tick
+        if raw_js and self.app is not None:
+            self.app.set_settings(self._app_settings())  # the window kept the QJSValue; give it the plain value
+
+    def _on_action(self, name: str) -> None:
+        if name == "refresh":
+            self.refresh_now()
+        elif name == "reindex":
+            self.reindex()
+        elif name == "check_updates":
+            threading.Thread(target=self._check_update, args=(True,), daemon=True).start()
+
+    def _on_osd_moved(self, x: int, y: int) -> None:
+        self._set("osd_x", x)
+        self._set("osd_y", y)
+
+    def _on_style_toggled(self, style: str) -> None:
+        self._set("osd_style", style)
+        if self.app is not None:
+            self.app.set_settings(self._app_settings())
+
+    def _apply_on_top(self) -> None:
+        on = bool(self.config.get("osd_always_on_top", True))
+        if bool(self.osd.windowFlags() & Qt.WindowStaysOnTopHint) != on:
+            self.osd.setWindowFlag(Qt.WindowStaysOnTopHint, on)  # recreates the native window and hides it
+        self.osd.show()
+
+    def _keep_on_top(self) -> None:
+        if self.config.get("osd_always_on_top", True):
+            self.osd.keep_on_top()
+
+    def _dark(self) -> bool:
+        choice = self.config.get("appearance", "system")
+        if choice in ("light", "dark"):
+            return choice == "dark"
+        return QGuiApplication.styleHints().colorScheme() == Qt.ColorScheme.Dark
+
+    def _apply_appearance(self) -> None:
+        hints = QGuiApplication.styleHints()
+        if hasattr(hints, "setColorScheme"):  # Qt 6.8+: the app window's Fluent controls follow it too
+            scheme = {"light": Qt.ColorScheme.Light, "dark": Qt.ColorScheme.Dark}
+            hints.setColorScheme(scheme.get(self.config.get("appearance"), Qt.ColorScheme.Unknown))
+        self._on_scheme()
+
+    def _on_scheme(self) -> None:
+        dark = self._dark()
+        self.osd.set_dark(dark)
+        QApplication.instance().setStyleSheet(_qss(dark))
+
+    # ----------------------------------------------------------- menu, tray, peers
+
+    def _build_menu(self) -> QMenu:
+        menu = QMenu()
+        menu.setFont(_font(14))
+        self._act_head = menu.addAction("Loading usage")
+        self._act_head.setEnabled(False)
+        menu.addSeparator()
+        menu.addAction("Open Claude Usage").triggered.connect(lambda: self.open_app())
+        self._act_refresh = menu.addAction("Refresh now")
+        self._act_refresh.triggered.connect(self.refresh_now)
+        self._act_style = menu.addAction("")
+        self._act_style.triggered.connect(lambda: self.osd.toggle_style())
+        menu.addAction("Settings...").triggered.connect(lambda: self.open_app("settings"))
+        menu.addSeparator()
+        menu.addAction("Quit").triggered.connect(self.quit)
+        menu.aboutToShow.connect(self._on_menu_show)
+        return menu
+
+    def _popup_menu(self, pos: QPoint) -> None:
+        # Open above (or below) the overlay, never over it: the overlay is top-most and would cover the menu.
+        self._on_menu_show()
+        r, h = self.osd.frameGeometry(), self.menu.sizeHint().height()
+        screen = self.osd.screen() or QGuiApplication.primaryScreen()
+        y = r.top() - h if r.top() - h >= screen.availableGeometry().top() else r.bottom() + 1
+        self.menu.popup(QPoint(pos.x(), y))
+
+    def _on_menu_show(self) -> None:
+        self._act_head.setText("  ·  ".join(_summary(self._now, self._shown, self._indexing)))
+        self._act_refresh.setVisible(not self._newer)  # a store from a newer version: refreshing can't help
+        self._act_style.setText("Show as card" if self.osd.osd_style() == "pill" else "Show as pill")
+        apply_win11_chrome(self.menu, self._dark())
+
+    def _build_tray(self) -> Optional[QSystemTrayIcon]:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return None
+        tray = QSystemTrayIcon(QIcon(ICON), self)
+        tray.setToolTip("Claude Usage")
+        tray.setContextMenu(self.menu)
+        tray.activated.connect(lambda reason: self.open_app() if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick) else None)
+        tray.show()
+        return tray
+
+    def _balloon(self, title: str, body: str) -> None:
+        log.info("notice: %s: %s", title, body)
+        if self.tray is not None:
+            self.tray.showMessage(title, body, QSystemTrayIcon.MessageIcon.Information, 6000)
+
+    def _on_peer(self) -> None:
+        while self._server.hasPendingConnections():
+            sock = self._server.nextPendingConnection()
+            sock.disconnectFromServer()
+            sock.deleteLater()
+        self.open_app()
+
+    def _check_update(self, asked: bool) -> None:
+        tag, newer = updater.check_latest_version(__version__)
+        self._update_checked.emit(tag, newer, asked)
+
+    def _on_update_checked(self, tag: Optional[str], newer: bool, asked: bool) -> None:
+        if newer and (asked or tag != self.config.get("update_notified")):
+            self._set("update_notified", tag)  # the startup check tells about a release once
+            self._balloon(f"Claude Usage {tag} is available", updater.UPGRADE_HINT)
+        elif asked:
+            self._balloon("Claude Usage", f"You have the latest version ({__version__})." if tag
+                          else "Couldn't reach GitHub to check for updates.")

@@ -1,8 +1,10 @@
-# Phase 0 — Foundation Implementation Plan
+# Phase 0: Foundation Implementation Plan
+
+Superseded by [2026-11-26-native-app-design.md](../specs/2026-11-26-native-app-design.md).
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans (inline, chosen) to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Turn the patch-overlay distribution into a maintainable full-source fork of `claude-usage-widget` under git, installable via `uv tool install .`, with a test harness — behavior-identical to the current working install.
+**Goal:** Turn the patch-overlay distribution into a maintainable full-source fork of `claude-usage-widget` under git, installable via `uv tool install .`, with a test harness, behavior-identical to the current working install.
 
 **Architecture:** Continue the existing public repo (`arora-vaibhav/claude-usage-widget-windows`) in place to preserve history/launcher/setup/README. Vendor the *currently installed* (already-patched) `claude_usage` source into a `src/` layout, add `pyproject.toml`/`LICENSE`/`NOTICE`/tests, and rewrite `setup.ps1` to install from local source instead of PyPI-plus-patches.
 
@@ -77,7 +79,7 @@ foreach ($f in "collector.py","overlay.py","widget.py","cache_analyzer.py","tick
   if ($d) { "DIFFERS: $f ($($d.Count) lines)" } else { "match: $f" }
 }
 ```
-Expected: ideally all "match". If any DIFFER, the live install diverged from tracked patches — record which, and treat the **live install as source of truth** (it is the working app). Note the result in the Task 3 commit message.
+Expected: ideally all "match". If any DIFFER, the live install diverged from tracked patches: record which, and treat the **live install as source of truth** (it is the working app). Note the result in the Task 3 commit message.
 
 ---
 
@@ -483,16 +485,16 @@ git -C "C:/Projects/Claude Widget" add pyproject.toml LICENSE NOTICE setup.ps1 R
 git -C "C:/Projects/Claude Widget" commit -m "build: full-source packaging (pyproject, LICENSE, NOTICE, tests); setup.ps1 installs from source"
 ```
 
-- [ ] **Step 6: CHECKPOINT** — report results to the user; do NOT push yet (pushing to the public repo is outward-facing — confirm first). Then proceed to the Phase 1 plan.
+- [ ] **Step 6: CHECKPOINT**: report results to the user; do NOT push yet (pushing to the public repo is outward-facing, confirm first). Then proceed to the Phase 1 plan.
 
 ---
 
 ## Self-Review
 
-**Spec coverage (Phase 0 rows):** repo continuity (D2) → Task 1; full-source fork + merge patches (D1) → Tasks 2–3; pyproject/src layout → Task 4; LICENSE+NOTICE → Task 5; tests scaffold → Task 6; setup.ps1 from source (fixes patch-drift) → Task 7; README → Task 8; install + verify acceptance criteria → Task 9. All Phase 0 deliverables/acceptance items covered.
+**Spec coverage (Phase 0 rows):** repo continuity (D2) → Task 1; full-source fork + merge patches (D1) → Tasks 2-3; pyproject/src layout → Task 4; LICENSE+NOTICE → Task 5; tests scaffold → Task 6; setup.ps1 from source (fixes patch-drift) → Task 7; README → Task 8; install + verify acceptance criteria → Task 9. All Phase 0 deliverables/acceptance items covered.
 
-**Placeholder scan:** none — all file contents and commands are concrete.
+**Placeholder scan:** none, all file contents and commands are concrete.
 
-**Type/name consistency:** package import name `claude_usage`, dist name `claude-usage-widget`, console script `claude-usage` (= `claude_usage.cli:main`), dep `PySide6-Essentials>=6.5,<7` — consistent across pyproject, setup.ps1, tests, and verify steps. Vendoring source path consistent in Tasks 2/3.
+**Type/name consistency:** package import name `claude_usage`, dist name `claude-usage-widget`, console script `claude-usage` (= `claude_usage.cli:main`), dep `PySide6-Essentials>=6.5,<7`, consistent across pyproject, setup.ps1, tests, and verify steps. Vendoring source path consistent in Tasks 2/3.
 
-**Open risk:** `[tool.setuptools.dynamic] version = {attr=...}` under src layout — if version resolution fails at build (Task 9 Step 1), fall back to a static `version = "0.6.6"` in `[project]` (remove the `dynamic`/`[tool.setuptools.dynamic]` lines). Caught by the Task 9 install step.
+**Open risk:** `[tool.setuptools.dynamic] version = {attr=...}` under src layout: if version resolution fails at build (Task 9 Step 1), fall back to a static `version = "0.6.6"` in `[project]` (remove the `dynamic`/`[tool.setuptools.dynamic]` lines). Caught by the Task 9 install step.

@@ -24,7 +24,7 @@ def setup_logging(claude_dir: str, level: int = logging.INFO) -> logging.Logger:
     """Attach a rotating file handler to the package logger (idempotent).
 
     Safe to call more than once: a second call when a file handler already
-    exists is a no-op, so we never attach duplicate handlers. Never raises --
+    exists is a no-op, so we never attach duplicate handlers. Never raises:
     a logging-setup failure must not stop the widget from running.
     """
     logger = logging.getLogger(LOGGER_NAME)
@@ -53,7 +53,7 @@ def get_logger() -> logging.Logger:
     """Return the package logger.
 
     Handlers are attached lazily by :func:`setup_logging`; if it was never
-    called (e.g. a one-off ``--once`` CLI run), warnings still surface via
+    called (a one-off ``--json`` or ``--reindex`` run), warnings still surface via
     Python's last-resort stderr handler.
     """
     return logging.getLogger(LOGGER_NAME)

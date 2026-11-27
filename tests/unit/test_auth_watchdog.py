@@ -2,10 +2,10 @@ from claude_usage.auth_watchdog import AuthWatchdog, is_auth_error
 
 
 def test_is_auth_error_classification():
-    assert is_auth_error("Credentials expired -- re-authenticate with 'claude'")
+    assert is_auth_error("Credentials expired. Run claude to sign in again.")
     assert is_auth_error("invalid_grant")
-    assert not is_auth_error("Rate limited -- try again shortly")
-    assert not is_auth_error("API request failed -- check network")
+    assert not is_auth_error("Rate limited by the usage API. Retrying shortly.")
+    assert not is_auth_error("Can't reach the usage API. Check your network.")
     assert not is_auth_error(None)
 
 
@@ -28,7 +28,7 @@ def test_triggers_after_threshold(tmp_path):
 def test_transient_errors_do_not_count(tmp_path):
     wd, calls = _watchdog(tmp_path, fail_threshold=2, cooldown_s=0)
     for i in range(10):
-        wd.note_result("Rate limited -- try again shortly", now=float(i))
+        wd.note_result("Rate limited by the usage API. Retrying shortly.", now=float(i))
     assert calls["n"] == 0  # 429s never trigger repair
 
 
@@ -133,14 +133,3 @@ def test_success_stops_all_future_repairs(tmp_path):
         wd.note_result("invalid", now=float(i + 1))
     assert st["calls"] == 1  # no further attempts after success
 
-
-def test_force_repair_bypasses_giveup(tmp_path):
-    wd, st = _wd_with_repair(
-        tmp_path, token_each_time=lambda n: None,
-        fail_threshold=1, cooldown_s=0,
-    )
-    wd._gave_up = True  # simulate having given up
-    wd.note_result("invalid", now=0.0)
-    assert st["calls"] == 0           # gave_up blocks auto-repair
-    wd.force_repair()                 # manual override
-    assert st["calls"] == 1

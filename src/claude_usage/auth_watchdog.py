@@ -9,8 +9,8 @@ The widget reads a token to call the plan-usage API. Two things break it:
 
 The durable cure is a **long-lived token** (``claude setup-token``) which does
 not rotate. This watchdog watches for sustained auth failure and, past a
-threshold, runs ``claude setup-token`` to (re)mint that long-lived token —
-cooldown-limited so it can't spam the browser — capturing the printed token to
+threshold, runs ``claude setup-token`` to (re)mint that long-lived token
+(cooldown-limited so it can't spam the browser), capturing the printed token to
 ``~/.claude/claude-usage-token`` (which :func:`collector._load_long_lived_token`
 already prefers). It also surfaces a notification so the user knows.
 
@@ -36,11 +36,11 @@ _FAIL_THRESHOLD = int(os.environ.get("CLAUDE_USAGE_AUTH_FAIL_THRESHOLD", "5"))
 _REPAIR_COOLDOWN_S = int(os.environ.get("CLAUDE_USAGE_AUTH_REPAIR_COOLDOWN", str(15 * 60)))
 _SETUP_TIMEOUT_S = int(os.environ.get("CLAUDE_USAGE_SETUP_TIMEOUT", "180"))
 # After a repair that yields NO token (it needs an interactive browser sign-in),
-# wait this long before trying again — far longer than the normal cooldown so a
+# wait this long before trying again: far longer than the normal cooldown so a
 # broken machine never spawns a storm of hung `setup-token` processes.
 _FAILED_REPAIR_BACKOFF_S = int(os.environ.get("CLAUDE_USAGE_AUTH_FAILED_BACKOFF", str(6 * 3600)))
 # Hard ceiling on auto-repair attempts per process. Past this we give up and
-# leave it to the user (manual tray "Reconnect" / `claude setup-token`).
+# leave it to the user (`claude setup-token`).
 _MAX_REPAIR_ATTEMPTS = int(os.environ.get("CLAUDE_USAGE_AUTH_MAX_ATTEMPTS", "3"))
 
 # Error substrings that mean "the token is bad" (vs transient 429/network).
@@ -68,7 +68,7 @@ def _setup_token_already_running() -> bool:
     """True if a `claude setup-token` process is already running (Windows).
 
     Guards against stacking a second interactive token flow on top of one that's
-    still waiting for the browser — the exact cause of the process pile-up.
+    still waiting for the browser, the exact cause of the process pile-up.
     """
     if os.name != "nt":
         return False
@@ -137,11 +137,11 @@ class AuthWatchdog:
             self._consecutive_auth_fails = 0
             return False
         if not is_auth_error(error):
-            return False  # transient (429/network) — don't count toward repair
+            return False  # transient (429/network): don't count toward repair
 
         self._consecutive_auth_fails += 1
         if self._succeeded or self._gave_up:
-            return False  # already healed, or escalated to the user — never storm
+            return False  # already healed, or escalated to the user: never storm
         if self._consecutive_auth_fails < self._fail_threshold:
             return False
 
@@ -164,19 +164,19 @@ class AuthWatchdog:
         cli = _find_claude_cli()
         if cli is None:
             _log.warning("auth-watchdog: claude CLI not found; cannot self-repair")
-            self._notify("Claude Usage: auth broken and claude CLI not found — run `claude setup-token` manually.")
+            self._notify("Sign-in is failing and the claude CLI was not found. Run `claude setup-token` yourself.")
             return False
         # Never stack a second setup-token on top of one that's still waiting on
-        # the browser — that's exactly what caused the process pile-up.
+        # the browser: that's exactly what caused the process pile-up.
         if _setup_token_already_running():
-            _log.info("auth-watchdog: a `claude setup-token` is already running — not starting another")
+            _log.info("auth-watchdog: a `claude setup-token` is already running, not starting another")
             return True
 
         _log.warning(
-            "auth-watchdog: auth failing — running `claude setup-token` (attempt %d/%d) to re-mint a long-lived token",
+            "auth-watchdog: auth failing, running `claude setup-token` (attempt %d/%d) to re-mint a long-lived token",
             self._failed_repairs + 1, self._max_attempts,
         )
-        self._notify("Claude Usage: reconnecting… (a browser may briefly open to approve)")
+        self._notify("Reconnecting to Claude. A browser may open briefly to approve.")
 
         creationflags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
         try:
@@ -187,7 +187,7 @@ class AuthWatchdog:
             )
         except subprocess.TimeoutExpired:
             _log.warning("auth-watchdog: setup-token timed out (browser approval not completed in time)")
-            self._notify("Claude Usage: reconnect needs a browser sign-in — run `claude setup-token`.")
+            self._notify("Reconnecting needs a browser sign-in. Run `claude setup-token`.")
             return True
         except (OSError, subprocess.SubprocessError) as exc:
             _log.warning("auth-watchdog: setup-token failed to launch: %s", exc)
@@ -197,33 +197,25 @@ class AuthWatchdog:
         if token and self._write_token(token):
             self._succeeded = True
             self._consecutive_auth_fails = 0
-            _log.info("auth-watchdog: long-lived token re-minted and saved — auth self-healed")
-            self._notify("Claude Usage: reconnected ✓")
+            _log.info("auth-watchdog: long-lived token re-minted and saved, auth self-healed")
+            self._notify("Reconnected to Claude.")
             return True
 
         # No token: the flow needs an interactive browser sign-in. Count it and,
         # once we hit the cap, GIVE UP auto-repairing and ask the user (no more
-        # auto-spawns — this is what prevents the storm).
+        # auto-spawns; this is what prevents the storm).
         self._failed_repairs += 1
         if self._failed_repairs >= self._max_attempts:
             self._gave_up = True
             _log.warning(
-                "auth-watchdog: giving up auto-repair after %d attempts — manual `claude setup-token` required",
+                "auth-watchdog: giving up auto-repair after %d attempts, manual `claude setup-token` required",
                 self._failed_repairs,
             )
-            self._notify("Claude Usage: can't auto-reconnect — run `claude setup-token` once (or use tray ▸ Reconnect).")
+            self._notify("Can't reconnect on its own. Run `claude setup-token` once.")
         else:
             _log.warning("auth-watchdog: setup-token produced no token (awaiting browser); backing off")
-            self._notify("Claude Usage: reconnect needs a one-time browser sign-in — run `claude setup-token`.")
+            self._notify("Reconnecting needs a one-time browser sign-in. Run `claude setup-token`.")
         return True
-
-    def force_repair(self) -> bool:
-        """Manual trigger (e.g. a tray 'Reconnect' button): bypass backoff/give-up."""
-        import time as _t
-        self._gave_up = False
-        self._failed_repairs = 0
-        self._last_repair_ts = _t.time()
-        return self._attempt_repair()
 
     @staticmethod
     def _extract_token(text: str | None) -> str | None:
