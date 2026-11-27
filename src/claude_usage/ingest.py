@@ -5,9 +5,22 @@ message on several lines while it streams, and early lines can carry a
 partial ``output_tokens``, so each usage field keeps the maximum seen across
 the message's lines (in any file) and the timestamp keeps the earliest; the
 local day and hour follow that timestamp. Subagent and workflow transcripts
-(``<session>/subagents/**``) are included and belong to their parent session.
-A session's calls and turns all count toward the project of its first
-working directory (records follow the shell into subfolders).
+(``<session>/subagents/**``) are included and belong to the session their
+records name (a subagent file can be copied under another session's folder).
+A resumed or forked session starts with a copy of its parent's records, same
+timestamps and all; on such a tie the file created first keeps the call, so
+files are read in creation order (main transcripts before subagent files) and
+a fresh index matches what the live app built. A session's calls and turns
+all count toward the project of its first working directory (records follow
+the shell into subfolders).
+
+``usage.iterations`` is the per-attempt bill. After a server-side fallback the
+top-level usage is only the attempt that produced the message (the last
+entry); otherwise it is the sum of the ``message`` entries, and advisor or
+compaction entries come on top. Every entry the top-level usage does not cover
+gets its own row (``msg_id#n``) at its own model's rates. A refusal before any
+output is billed only in some categories (``pricing.BILLED_REFUSALS``); in the
+others the call is kept with zero tokens.
 
 Turns are human prompts in main transcripts. Agent time per turn is the
 ``system/turn_duration`` record when Claude Code wrote one, else the span from
@@ -27,10 +40,10 @@ import os
 import sqlite3
 import tempfile
 import time
-from datetime import date, datetime, timedelta
+from datetime import datetime
 from typing import Callable, Optional
 
-from claude_usage import store
+from claude_usage import pricing, store
 
 MAX_LINE = 8 << 20  # lines longer than this are skipped (huge pasted payloads)
 SPAN_CAP_MS = 30 * 60 * 1000
@@ -61,7 +74,8 @@ ON CONFLICT(msg_id) DO UPDATE SET
     project = CASE WHEN excluded.ts_ms < ts_ms THEN excluded.project ELSE project END,
     cwd = CASE WHEN excluded.ts_ms < ts_ms THEN excluded.cwd ELSE cwd END,
     model = CASE WHEN excluded.ts_ms < ts_ms THEN excluded.model ELSE model END,
-    speed = CASE WHEN excluded.ts_ms < ts_ms THEN excluded.speed ELSE speed END,
+    -- early streamed lines can lack usage.speed; the fullest line names the price tier
+    speed = CASE WHEN speed IS NULL OR excluded.output > output THEN coalesce(excluded.speed, speed) ELSE speed END,
     ts_ms = min(ts_ms, excluded.ts_ms)
 """
 
@@ -104,13 +118,36 @@ def _epoch_ms(ts: str) -> Optional[int]:
         return None
 
 
+def _born(st: os.stat_result) -> float:
+    return getattr(st, "st_birthtime", st.st_ctime)  # st_ctime is the creation time on Windows before 3.12
+
+
+def _order(rel: str, born: float) -> tuple:
+    """Read order: main transcripts first (they name a session's project; a rewritten one can be newer than
+    its subagent files), each kind in creation order so a forked session's copied calls stay with the
+    session that made them (the upsert keeps the first reader on a timestamp tie)."""
+    return "subagents" in rel.split(os.sep), born, rel
+
+
 def _local(ms: int) -> tuple:
     d = datetime.fromtimestamp(ms / 1000)
     return d.strftime("%Y-%m-%d"), d.hour
 
 
-def _next_day(day: str) -> str:
-    return (date.fromisoformat(day) + timedelta(days=1)).isoformat()
+def _tokens(u: dict) -> tuple:
+    """(input, output, cache read, cache write total, 1-hour write) of a usage dict or one of its iterations."""
+    br = u.get("cache_creation")
+    # Thinking is part of output_tokens; an interrupted stream can leave output at 0 with thinking counted.
+    out = max(int(u.get("output_tokens") or 0), int((u.get("output_tokens_details") or {}).get("thinking_tokens") or 0))
+    return (int(u.get("input_tokens") or 0), out, int(u.get("cache_read_input_tokens") or 0),
+            int(u.get("cache_creation_input_tokens") or 0),
+            int(br.get("ephemeral_1h_input_tokens") or 0) if isinstance(br, dict) else 0)
+
+
+def _split(t: tuple) -> tuple:
+    """_tokens() as stored: input, output, cache read, 5-minute write, 1-hour write."""
+    i, o, r, cc, w1 = t
+    return i, o, r, max(cc - w1, 0), w1  # no breakdown means the default 5-minute TTL
 
 
 def _is_prompt(e: dict) -> bool:
@@ -140,14 +177,16 @@ class Ingestor:
         self._names = {}
         self._cwd_names = {}
         self._sess_proj = {}
-        for (name,) in conn.execute("SELECT DISTINCT project FROM calls WHERE project IS NOT NULL"):
-            self._names.setdefault(name.lower(), name)
         self._dirs = {}  # dir -> mtime_ns as of the last look
         self._hot_dirs = set()
         self._hot_files = set()
         self._last_full = None
         self._known_sessions = set()
+        self._open_turn = {}  # main transcript -> its open turn, so a turn read over two ticks stays one turn
+        self._looked_ns = 0  # wall clock of the last directory look
         store.rollup(conn)  # days left dirty by an interrupted run
+        for (name,) in conn.execute("SELECT DISTINCT project FROM rollup_day"):
+            self._names.setdefault(name.lower(), name)
 
     # ------------------------------------------------------------ public
 
@@ -155,8 +194,9 @@ class Ingestor:
               cancel: Optional[Callable[[], bool]] = None) -> dict:
         """Walk the whole tree and read every new or changed transcript."""
         t0 = time.perf_counter()
+        self._looked_ns = time.time_ns()
         found = self._walk()
-        todo = sorted(p for p, st in found.items() if self._changed(p, st))
+        todo = sorted((p for p, st in found.items() if self._changed(p, st[:2])), key=lambda p: _order(p, found[p][2]))
         calls = done = 0
         cancelled = False
         if progress:
@@ -165,11 +205,12 @@ class Ingestor:
             if cancel and cancel():
                 cancelled = True
                 break
-            calls += self._read(rel, *found[rel], cancel=cancel)
+            calls += self._read(rel, *found[rel][:2], cancel=cancel)
             done += 1
             if progress:
                 progress(done, len(todo))
-            if self._files[rel][0] != found[rel][0] and cancel and cancel():
+            # A file that could not be opened (deleted by cleanup, locked) is not recorded; retried next pass.
+            if self._files.get(rel, found[rel])[0] != found[rel][0] and cancel and cancel():
                 cancelled = True  # stopped inside this file
                 break
         self._last_full = self.clock()
@@ -184,27 +225,33 @@ class Ingestor:
         if self._last_full is None or self.clock() - self._last_full >= FULL_WALK_SECONDS:
             return self.index()
         t0 = time.perf_counter()
+        # Directory mtimes move in clock ticks, so a file created just after our last look can leave the mtime
+        # unchanged: a directory that changed shortly before (or since) that look is scanned again.
+        recent = self._looked_ns - 2_000_000_000
+        self._looked_ns = time.time_ns()
         for d in list(self._hot_dirs):
             try:
                 m = os.stat(d).st_mtime_ns
             except OSError:
                 self._hot_dirs.discard(d)
                 continue
-            if m != self._dirs.get(d):
+            if m != self._dirs.get(d) or m > recent:
                 self._dirs[d] = m
                 self._scan_dir(d)
-        calls = read = 0
-        for rel in sorted(self._hot_files):
+        changed = []
+        for rel in list(self._hot_files):
             try:
                 st = os.stat(os.path.join(self.root, rel))
             except OSError:
                 self._hot_files.discard(rel)
                 continue
             if self._changed(rel, (st.st_size, st.st_mtime_ns)):
-                calls += self._read(rel, st.st_size, st.st_mtime_ns)
-                read += 1
+                changed.append((_order(rel, _born(st)), rel, st.st_size, st.st_mtime_ns))
+        calls = 0
+        for _o, rel, size, mtime in sorted(changed):
+            calls += self._read(rel, size, mtime)
         store.rollup(self.conn)
-        return {"files": len(self._files), "read": read, "calls": calls,
+        return {"files": len(self._files), "read": len(changed), "calls": calls,
                 "ms": round((time.perf_counter() - t0) * 1000, 2), "full": False}
 
     # ------------------------------------------------------------ walking
@@ -232,14 +279,14 @@ class Ingestor:
                             stack.append(e.path)
                         elif e.name.endswith(".jsonl"):
                             st = e.stat(follow_symlinks=False)
-                            found[e.path[cut:]] = (st.st_size, st.st_mtime_ns)
+                            found[e.path[cut:]] = (st.st_size, st.st_mtime_ns, _born(st))
                     except OSError:
                         continue
         return found
 
     def _pick_hot(self, found: dict) -> None:
         cutoff = (self.clock() - HOT_SECONDS) * 1e9
-        self._hot_files = {p for p, (_s, m) in found.items() if m >= cutoff}
+        self._hot_files = {p for p, (_s, m, _b) in found.items() if m >= cutoff}
         # Live sessions add subagent files under <slug>/<session>/ at any time.
         live = {p[:-6] for p in self._hot_files if p.count(os.sep) == 1}
         cut = len(self.root) + 1
@@ -288,10 +335,19 @@ class Ingestor:
         except OSError:
             return 0
         done = True  # False when we stop before the end, so the next pass resumes at pos
+        pos = offset
         with fh:
-            fh.seek(offset)
-            pos = offset
             try:
+                if offset:
+                    # A stored offset always ends a line, so anything else means the file was rewritten (a bulk
+                    # import) and is read again. shortcut: a rewrite with a line end at that byte is missed; store a
+                    # fingerprint of the last line if that ever matters.
+                    fh.seek(offset - 1)
+                    if fh.read(1) != b"\n":
+                        pos = offset = 0
+                if offset and rel in self._open_turn:
+                    ctx.turn = self._open_turn[rel]  # the stored turns miss one whose copy belongs to another session
+                fh.seek(offset)
                 while True:
                     raw = fh.readline(MAX_LINE + 1)
                     if not raw:
@@ -314,12 +370,14 @@ class Ingestor:
                         if cancel and cancel():
                             done = False
                             break
-            except MemoryError:
-                # Low system memory: keep what was read and retry from pos next pass.
+            except (MemoryError, OSError):
+                # Low memory or a failed read (a locked or vanished file): keep what was read, retry from pos.
                 done = False
         seen = size if done else pos
         ctx.flush(rel, seen, mtime, pos, final=True)
         self._files[rel] = (seen, mtime, pos)
+        if not is_sub:
+            self._open_turn[rel] = ctx.turn
         return ctx.n_calls
 
     def _project(self, cwd: Optional[str]) -> Optional[str]:
@@ -351,7 +409,10 @@ class _FileCtx:
         self.n_calls = 0
         self.seen = set()
         self.turn = None
-        self.project = ing._session_project(file_sid) if file_sid else None
+        self.project = None
+        self.looked = set()
+        self.billed = {}  # msg id -> models whose decline before any output is billed
+        self.unbilled = []  # msg ids refused before any output in a category that is not billed
         if not is_sub and file_sid:
             row = ing.conn.execute(
                 "SELECT uuid, ts_ms, day, hour, project, duration_ms, src, model FROM turns WHERE session_id=? "
@@ -361,13 +422,17 @@ class _FileCtx:
                              "rec": row[6] == "record", "dur": row[5], "dirty": False, "model": row[7],
                              "sid": file_sid, "day": row[2], "hour": row[3], "project": row[4]}
         self.turn_rows = []
+        self.copied_turns = []  # turns of another session copied into this file: inserted, never updated
 
-    def _proj(self, cwd: Optional[str]) -> Optional[str]:
+    def _proj(self, cwd: Optional[str], sid: Optional[str]) -> Optional[str]:
         # Records follow the shell into subfolders; a session (with its subagents) belongs where it started.
+        if self.project is None and sid and sid not in self.looked:
+            self.looked.add(sid)
+            self.project = self.ing._session_project(sid)
         if self.project is None and cwd:
             self.project = self.ing._project(cwd)
-            if self.file_sid:
-                self.ing._sess_proj[self.file_sid] = self.project
+            if sid:
+                self.ing._sess_proj.setdefault(sid, self.project)
         return self.project
 
     def line(self, raw: bytes) -> None:
@@ -382,8 +447,8 @@ class _FileCtx:
                 self._turn_duration(raw)
             elif raw.startswith((b'{"type":"custom-title"', b'{"type":"ai-title"')):
                 self._title(raw)
-        except (AttributeError, TypeError, ValueError):
-            pass  # a record of an unexpected shape must not stall the file
+        except (AttributeError, TypeError, ValueError, OverflowError, RecursionError):
+            pass  # a record of an unexpected shape, a 1e999 count or absurd nesting must not stall the file
 
     def _assistant(self, raw: bytes) -> None:
         try:
@@ -400,19 +465,39 @@ class _FileCtx:
         if ts is None:
             return
         day, hour = _local(ts)
-        sid = self.file_sid if self.is_sub else (e.get("sessionId") or self.file_sid)
+        sid = e.get("sessionId") or self.file_sid
         cwd = e.get("cwd")
-        project = self._proj(cwd)
-        cc = int(u.get("cache_creation_input_tokens") or 0)
-        br = u.get("cache_creation")
-        w1 = int(br.get("ephemeral_1h_input_tokens") or 0) if isinstance(br, dict) else 0
-        w5 = max(cc - w1, 0)  # no breakdown means the default 5-minute TTL
+        project = self._proj(cwd, sid)
         web = int((u.get("server_tool_use") or {}).get("web_search_requests") or 0)
-        # Thinking is part of output_tokens; an interrupted stream can leave output at 0 with thinking counted.
-        out = max(int(u.get("output_tokens") or 0), int((u.get("output_tokens_details") or {}).get("thinking_tokens") or 0))
-        self.calls.append((mid, ts, day, hour, sid, e.get("agentId"), int(self.is_sub or bool(e.get("isSidechain"))),
-                           project, cwd, model, u.get("speed"), int(u.get("input_tokens") or 0), out,
-                           int(u.get("cache_read_input_tokens") or 0), w5, w1, web))
+        if b'"type":"fallback"' in raw:
+            # shortcut: kept per file read; a billed decline whose fallback block was read on an earlier tick
+            # than its final usage line is missed. Upgrade if a real one shows up (none so far).
+            for b in msg.get("content") or ():
+                if isinstance(b, dict) and b.get("type") == "fallback" and (
+                        (b.get("trigger") or {}).get("category") in pricing.BILLED_REFUSALS):
+                    self.billed.setdefault(mid, set()).add(pricing.normalize((b.get("from") or {}).get("model")))
+        its = [x for x in u.get("iterations") or () if isinstance(x, dict)]
+        fallback = any(x.get("type") == "fallback_message" for x in its)
+        own = {len(its) - 1} if fallback else {n for n, x in enumerate(its) if x.get("type") in (None, "message")}
+        tok = _tokens(u)
+        if own:
+            # Some streamed lines carry zeroed top-level usage while their attempts hold the counts.
+            tok = tuple(map(max, tok, map(sum, zip(*(_tokens(its[n]) for n in own)))))
+        speed = u.get("speed")
+        if u.get("inference_geo") == "us":
+            speed = (speed or "standard") + "+us"  # billed at 1.1x; pricing reads the suffix
+        row = (ts, day, hour, sid, e.get("agentId"), int(self.is_sub or bool(e.get("isSidechain"))), project, cwd)
+        self.calls.append((mid, *row, model, speed, *_split(tok), web))
+        if msg.get("stop_reason") == "refusal" and not fallback and not tok[1] and (
+                (msg.get("stop_details") or {}).get("category") not in pricing.BILLED_REFUSALS):
+            self.unbilled.append(mid)
+        for n, x in enumerate(its):
+            t, xm = _tokens(x), x.get("model") or model
+            # A fallback attempt declined before any output is billed only in some refusal categories.
+            unbilled = fallback and not t[1] and pricing.normalize(xm) not in self.billed.get(mid, ())
+            if n in own or not any(t) or unbilled:
+                continue
+            self.calls.append((f"{mid}#{n}", *row, xm, speed, *_split(t), 0))
         main = not self.is_sub and not e.get("isSidechain")
         if sid and sid not in self.ing._known_sessions and sid not in self.seen:
             self.seen.add(sid)
@@ -438,7 +523,7 @@ class _FileCtx:
         day, hour = _local(ts)
         self.turn = {"uuid": e["uuid"], "start": ts, "last": ts, "rec": False, "dur": 0, "dirty": True, "model": None,
                      "sid": e.get("sessionId") or self.file_sid, "day": day, "hour": hour,
-                     "project": self._proj(e.get("cwd"))}
+                     "project": self._proj(e.get("cwd"), e.get("sessionId") or self.file_sid)}
 
     def _turn_duration(self, raw: bytes) -> None:
         try:
@@ -458,7 +543,7 @@ class _FileCtx:
             day, hour = _local(ts - dur)
             self.turn = {"uuid": e["uuid"], "start": ts - dur, "last": ts, "rec": True, "dur": dur, "dirty": True,
                          "model": None, "sid": e.get("sessionId") or self.file_sid, "day": day, "hour": hour,
-                         "project": self._proj(e.get("cwd"))}
+                         "project": self._proj(e.get("cwd"), e.get("sessionId") or self.file_sid)}
             return
         t["rec"], t["dur"], t["dirty"] = True, dur, True
 
@@ -477,8 +562,9 @@ class _FileCtx:
         t = self.turn
         if t and t["dirty"]:
             dur = t["dur"] if t["rec"] else min(t["last"] - t["start"], SPAN_CAP_MS)
-            self.turn_rows.append((t["uuid"], t["sid"], t["start"], t["day"], t["hour"], t["project"], dur,
-                                   "record" if t["rec"] else "span", t["model"]))
+            rows = self.turn_rows if t["sid"] == self.file_sid else self.copied_turns
+            rows.append((t["uuid"], t["sid"], t["start"], t["day"], t["hour"], t["project"], dur,
+                         "record" if t["rec"] else "span", t["model"]))
             t["dirty"] = False
 
     def flush(self, rel: str, size: int, mtime: int, offset: int, final: bool) -> None:
@@ -489,16 +575,30 @@ class _FileCtx:
             if self.sessions:
                 conn.executemany(_UPSERT_SESSION, self.sessions)
             if self.calls:
-                conn.executemany(_UPSERT_CALL, self.calls)
-                # An earlier copy can move a call back across midnight, so the next day is touched too.
+                # A line can raise or move a call already stored on another day (its earliest line or an
+                # earlier copy set the day, maybe across midnight), so that day is rebuilt too.
                 days = {c[2] for c in self.calls}
-                days |= {_next_day(d) for d in days}
+                ids = list({c[0] for c in self.calls})
+                for i in range(0, len(ids), 500):
+                    chunk = ids[i:i + 500]
+                    days.update(d for (d,) in conn.execute(
+                        f"SELECT day FROM calls WHERE msg_id IN ({','.join('?' * len(chunk))})", chunk))
+                conn.executemany(_UPSERT_CALL, self.calls)
+                # Earlier streamed lines already stored the prompt's tokens; the max upsert cannot lower them.
+                conn.executemany("UPDATE calls SET input=0, output=0, cache_read=0, cache_write_5m=0, cache_write_1h=0, "
+                                 "web_search=0 WHERE msg_id=? AND output=0", [(m,) for m in self.unbilled])
                 conn.executemany("INSERT OR IGNORE INTO dirty_days VALUES (?)", [(d,) for d in days])
+            # Only a session's own main transcript sets a turn's duration: a resumed or forked file holds
+            # copies of earlier turns (under its own session id or the original's) that end sooner.
             if self.turn_rows:
                 conn.executemany(
                     "INSERT INTO turns(uuid, session_id, ts_ms, day, hour, project, duration_ms, src, model) "
                     "VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(uuid) DO UPDATE SET duration_ms=excluded.duration_ms, "
-                    "src=excluded.src, model=coalesce(excluded.model, model)", self.turn_rows)
+                    "src=excluded.src, model=coalesce(excluded.model, model) "
+                    "WHERE session_id IS excluded.session_id", self.turn_rows)
+            if self.copied_turns:
+                conn.executemany("INSERT OR IGNORE INTO turns(uuid, session_id, ts_ms, day, hour, project, duration_ms, "
+                                 "src, model) VALUES (?,?,?,?,?,?,?,?,?)", self.copied_turns)
             for sid, title, src in self.titles:
                 conn.execute(
                     "INSERT INTO sessions(session_id, title, title_src) VALUES (?,?,?) ON CONFLICT(session_id) DO "
@@ -507,4 +607,4 @@ class _FileCtx:
                     "THEN 'custom' ELSE coalesce(title_src, 'ai') END", (sid, title, src))
             conn.execute("INSERT OR REPLACE INTO files VALUES (?,?,?,?)", (rel, size, mtime, offset))
         self.n_calls += len(self.calls)
-        self.calls, self.turn_rows, self.titles, self.sessions = [], [], [], []
+        self.calls, self.turn_rows, self.copied_turns, self.titles, self.sessions, self.unbilled = [], [], [], [], [], []

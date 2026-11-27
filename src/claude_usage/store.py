@@ -12,9 +12,12 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from datetime import date, timedelta
 from typing import Any, Optional
 
-SCHEMA_VERSION = 1
+from claude_usage import pricing
+
+SCHEMA_VERSION = 2
 
 # Additive only: each entry upgrades the schema from version i to i + 1.
 MIGRATIONS = [
@@ -52,6 +55,8 @@ MIGRATIONS = [
     CREATE TABLE IF NOT EXISTS samples(ts REAL PRIMARY KEY, weekly REAL, session REAL, payload TEXT);
     CREATE TABLE IF NOT EXISTS legacy_days(day TEXT PRIMARY KEY, cost REAL, tokens INTEGER, messages INTEGER, quality TEXT);
     """,
+    # A session's real start for sessions listed in a range that began before it.
+    "CREATE INDEX IF NOT EXISTS rollup_day_session ON rollup_day(session_id, first_ms);",
 ]
 
 # usage-daily.jsonl rows written before the dedupe fix (2026-06-03) counted
@@ -122,10 +127,9 @@ def rollup(conn: sqlite3.Connection) -> int:
     ``rollup`` holds token sums per (local day, hour, session, agent, project,
     model, speed, prompt tier), about a tenth of the calls; ``rollup_day``
     drops hour and agent for the long ranges. Together with calls for a
-    part-hour edge they give any window exactly.
+    part-hour edge they give any window exactly. Each rebuild bumps meta
+    'rollup_gen', which keys the snapshot caches.
     """
-    from claude_usage.pricing import LONG_PROMPT_TOKENS
-
     n = conn.execute("SELECT COUNT(*) FROM dirty_days").fetchone()[0]
     if not n:
         return 0
@@ -136,7 +140,7 @@ def rollup(conn: sqlite3.Connection) -> int:
             "model, coalesce(speed, ''), input + cache_read + cache_write_5m + cache_write_1h > ?, COUNT(*), "
             "SUM(input), SUM(output), SUM(cache_read), SUM(cache_write_5m), SUM(cache_write_1h), SUM(web_search), "
             "MIN(ts_ms), MAX(ts_ms) FROM calls WHERE day IN (SELECT day FROM dirty_days) GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9",
-            (LONG_PROMPT_TOKENS,))
+            (pricing.LONG_PROMPT_TOKENS,))
         conn.execute("DELETE FROM rollup_day WHERE day IN (SELECT day FROM dirty_days)")
         conn.execute(
             "INSERT INTO rollup_day SELECT day, session_id, is_subagent, project, model, speed, long, SUM(calls), "
@@ -144,6 +148,8 @@ def rollup(conn: sqlite3.Connection) -> int:
             "MIN(first_ms), MAX(last_ms) FROM rollup WHERE day IN (SELECT day FROM dirty_days) "
             "GROUP BY 1, 2, 3, 4, 5, 6, 7")
         conn.execute("DELETE FROM dirty_days")
+        conn.execute("INSERT INTO meta VALUES('rollup_gen', '1') "
+                     "ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1")
     return n
 
 
@@ -230,8 +236,6 @@ def update_coverage(conn: sqlite3.Connection) -> Optional[str]:
     latest failing day with at least 3 failures among the last 5 legacy days.
     Earlier days fall back to legacy rows.
     """
-    from claude_usage import pricing
-
     ledger, main = {}, {}
     for day, model, speed, long, sub, n, i, o, r, w5, w1, ws in conn.execute(
         "SELECT day, model, speed, long, is_subagent, SUM(calls), SUM(input), SUM(output), SUM(cache_read), "
@@ -257,6 +261,4 @@ def update_coverage(conn: sqlite3.Connection) -> Optional[str]:
 
 
 def _next_day(day: str) -> str:
-    from datetime import date, timedelta
-
     return (date.fromisoformat(day) + timedelta(days=1)).isoformat()

@@ -6,7 +6,8 @@ Card {
     id: card
     property var w: null           // snapshot.limits.weekly
     property real nowMs: Date.now()
-    readonly property real natural: head.height + 8 + big.height + 8 + verdict.height + 8 + 190 + 16 + facts.height + 2 * padding
+    property bool stale: false
+    readonly property real natural: head.height + 8 + big.height + 8 + verdict.height + 8 + (facts.cols === 4 ? 190 : 160) + 16 + facts.height + 2 * padding
 
     readonly property bool ok: !!w
     readonly property var reset: ok && w.resets_at ? Ui.date(w.resets_at) : null
@@ -29,12 +30,14 @@ Card {
         id: big
         y: head.height + 8
         width: parent.width; height: 52
-        Row {
+        Txt {
+            id: pctText
             anchors.bottom: parent.bottom
-            spacing: 8
-            Txt { text: card.ok ? Ui.pct(card.w.pct) : "n/a"; display: true; font.pixelSize: 44; font.weight: 600; height: 52; font.features: ({}) }
-            Txt { text: "used"; font.pixelSize: 15; color: Ui.p.text_muted; height: 38 }
+            text: card.ok ? Ui.pct(card.w.pct) : "n/a"; display: true; font.pixelSize: 44; font.weight: 600; height: 52
+            // values from an old reading step back; the stale pill says why
+            color: card.stale ? Ui.p.text_muted : Ui.p.text
         }
+        Txt { x: pctText.implicitWidth + 8; anchors.baseline: pctText.baseline; text: "used"; font.pixelSize: 15; color: Ui.p.text_muted; verticalAlignment: Text.AlignTop }
         Column {
             anchors.right: parent.right; anchors.bottom: parent.bottom; anchors.bottomMargin: 4
             visible: !!card.reset
@@ -52,7 +55,7 @@ Card {
         width: parent.width
         wrapMode: Text.WordWrap
         textFormat: Text.StyledText
-        font.family: Ui.fontUi; font.pixelSize: 13
+        font.family: Ui.fontUi; font.pixelSize: 13; font.variableAxes: Ui.axes(false)
         color: Ui.p.text_muted
         linkColor: Ui.p.text
         text: {
@@ -78,11 +81,14 @@ Card {
         w: card.w
     }
     Rectangle { y: facts.y - 16; width: parent.width; height: 1; color: Ui.p.line }
-    Row {
+    Grid {
         id: facts
         y: parent.height - height
         width: parent.width
-        height: 44
+        // four across when there is room, else two by two
+        readonly property int cols: width >= 560 ? 4 : 2
+        columns: cols
+        rowSpacing: 6
         readonly property var items: card.ok ? [
             ["Speed vs an even week", card.w.pace != null ? card.w.pace.toFixed(1) + "x" : "n/a"],
             ["Usual by now", Ui.pct(card.w.usual)],
@@ -92,7 +98,8 @@ Card {
         Repeater {
             model: facts.items
             Column {
-                width: facts.width / 4
+                width: facts.width / facts.cols
+                height: 44
                 spacing: 2
                 Txt { width: parent.width - 8; text: modelData[0]; font.pixelSize: 12; color: Ui.p.text_faint }
                 Txt { width: parent.width - 8; text: modelData[1]; font.pixelSize: 15; font.weight: 600 }

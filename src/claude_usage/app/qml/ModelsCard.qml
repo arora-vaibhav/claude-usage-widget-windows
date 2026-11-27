@@ -47,40 +47,49 @@ Card {
             }
         }
         Repeater {
-            model: card.models
+            model: card.models.length
             Item {
+                id: mrow
+                readonly property var m: card.models[index] || { name: "", id: "", color: -1, priced: "exact", cost: 0, share: 0, output: 0, cache_hit: null, calls: 0 }
+                // the old daily rollup has cost and tokens only, so its output and cache hit are unknown
+                readonly property bool legacy: m.id === "legacy"
                 width: tbl.width; height: 42
                 Rectangle { width: parent.width; height: 1; color: Ui.p.line }
                 Row {
                     height: parent.height
                     spacing: 10
-                    Rectangle { anchors.verticalCenter: parent.verticalCenter; width: 10; height: 10; radius: 3; color: Ui.seriesColor(modelData.color) }
-                    Txt { height: parent.height; text: modelData.name; width: Math.min(implicitWidth, tbl.width - 390 - 80) }
-                    Tag { visible: modelData.priced !== "exact"; anchors.verticalCenter: parent.verticalCenter; text: modelData.priced === "family" ? "estimated" : "no price" }
+                    Rectangle { anchors.verticalCenter: parent.verticalCenter; width: 10; height: 10; radius: 3; color: Ui.seriesColor(mrow.m.color) }
+                    Txt { height: parent.height; text: mrow.m.name; width: Math.min(implicitWidth, tbl.width - 390 - 80) }
+                    Tag { visible: mrow.m.priced !== "exact"; anchors.verticalCenter: parent.verticalCenter; text: mrow.legacy ? "old rollup" : mrow.m.priced === "family" ? "estimated" : "no price" }
                 }
                 Row {
                     anchors.right: parent.right
                     height: parent.height
                     Repeater {
-                        model: [Ui.cents(modelData.cost), Ui.share(modelData.share || (modelData.cost > 0 ? 1e-6 : 0)), Ui.tok(modelData.output), Ui.pct(modelData.cache_hit, 1), Ui.int(modelData.calls)]
+                        model: 5
                         Txt {
                             width: card.cols[index][1]; height: 42
                             horizontalAlignment: Text.AlignRight
-                            text: modelData
+                            text: [Ui.cents(mrow.m.cost), Ui.share(mrow.m.share || (mrow.m.cost > 0 ? 1e-6 : 0)), mrow.legacy ? "-" : Ui.tok(mrow.m.output),
+                                   mrow.legacy ? "-" : Ui.pct(mrow.m.cache_hit, 1), Ui.int(mrow.m.calls)][index]
                             font.weight: index === 0 ? 600 : 400
-                            color: modelData === "n/a" ? Ui.p.text_faint : Ui.p.text
+                            color: text === "n/a" || text === "-" ? Ui.p.text_faint : Ui.p.text
                         }
                     }
                 }
             }
         }
         Txt {
-            visible: card.models.some(function (m) { return m.priced !== "exact" })
+            readonly property var kinds: card.models.map(function (m) { return m.id === "legacy" ? "legacy" : m.priced })
+            visible: text !== ""
             width: parent.width
             topPadding: 10
             wrapMode: Text.WordWrap; elide: Text.ElideNone
             font.pixelSize: 12; color: Ui.p.text_faint
-            text: "Estimated: priced at its model family's published rate. No price: the model is not in the price table yet."
+            text: [kinds.indexOf("family") >= 0 ? "Estimated: priced at its model family's published rate." : "",
+                   kinds.indexOf("unpriced") >= 0 ? "No price: the model is not in the price table yet." : "",
+                   kinds.indexOf("legacy") >= 0 ? "Old rollup: days from the old daily rollup, with cost and tokens only." : ""]
+                  .filter(function (x) { return x }).join(" ")
         }
     }
 
@@ -92,7 +101,7 @@ Card {
         spacing: 12
         Grid {
             id: grid
-            columns: card.wide ? 2 : 4
+            columns: card.wide || width < 900 ? 2 : 4
             columnSpacing: 12; rowSpacing: 12
             width: parent.width
             Repeater {
@@ -110,7 +119,7 @@ Card {
                         Txt {
                             width: parent.width
                             text: Ui.tok(modelData[1].tokens) + " tokens, " + (card.total ? Ui.share(modelData[1].cost / card.total) : "0%") + " of cost"
-                            font.pixelSize: 12; color: Ui.p.text_faint
+                            font.pixelSize: 12; color: Ui.p.text_muted
                         }
                         Item { width: 1; height: 6 }
                         Rectangle {
@@ -136,7 +145,7 @@ Card {
                     anchors.verticalCenter: parent.verticalCenter
                     wrapMode: Text.WordWrap
                     textFormat: Text.StyledText
-                    font.family: Ui.fontUi; font.pixelSize: 13
+                    font.family: Ui.fontUi; font.pixelSize: 13; font.variableAxes: Ui.axes(false)
                     font.features: { "tnum": 1 }
                     color: Ui.p.text
                     text: card.split ? "Prompt caching saved <b><font color='" + Ui.p.ok + "'>" + Ui.money(card.split.caching_saved) + "</font></b> " + Ui.inRange(card.range) + ", at API prices." : ""

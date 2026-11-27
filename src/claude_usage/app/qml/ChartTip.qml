@@ -22,8 +22,8 @@ Rectangle {
     Behavior on x { enabled: tip.visible; NumberAnimation { duration: 90; easing.type: Easing.OutCubic } }
     Behavior on y { enabled: tip.visible; NumberAnimation { duration: 90; easing.type: Easing.OutCubic } }
 
-    FontMetrics { id: fm; font.family: Ui.fontUi; font.pixelSize: 12 }
-    FontMetrics { id: big; font.family: Ui.fontUi; font.pixelSize: 15; font.weight: 600 }
+    FontMetrics { id: fm; font.family: Ui.fontUi; font.pixelSize: 12; font.variableAxes: Ui.axes(false) }
+    FontMetrics { id: big; font.family: Ui.fontUi; font.pixelSize: 15; font.weight: 600; font.variableAxes: Ui.axes(false) }
 
     function rowsWidth() {
         var w = 0

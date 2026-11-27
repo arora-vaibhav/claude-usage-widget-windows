@@ -28,7 +28,7 @@ Item {
         return ({ "cli": "CLI", "sdk-cli": "Automated", "sdk-py": "Automated", "sdk-ts": "Automated", "desktop": "Desktop", "claude-desktop": "Desktop", "claude-vscode": "VS Code", "vscode": "VS Code", "jetbrains": "JetBrains", "web": "Web" })[e] || e
     }
     function cell(s, key) {
-        if (key === "agent_ms") return s.agent_ms || s.turns ? Ui.dur(s.agent_ms) : "n/a"
+        if (key === "agent_ms") return s.agent_ms || s.turns ? Ui.dur(s.agent_ms) : "-"
         if (key === "turns") return Ui.int(s.turns)
         if (key === "tokens") return Ui.tok(s.tokens)
         if (key === "cost") return Ui.cents(s.cost)
@@ -89,11 +89,12 @@ Item {
         y: 34
         width: t.width
         Repeater {
-            model: t.rows
+            // a count, so rows persist across refreshes and only their bindings update
+            model: t.rows.length
             Item {
                 id: row
                 width: t.width; height: t.rowH
-                readonly property var s: modelData
+                readonly property var s: t.rows[index] || { cost: 0, color: -1, project: "", model: "", entrypoint: "", id: "", started: "", ended: "" }
                 readonly property var started: Ui.date(s.started)
                 HoverHandler { id: hh }
                 Rectangle {
@@ -106,24 +107,23 @@ Item {
                     x: Ui.pad; y: 11
                     width: t.nameW - 16
                     spacing: 3
-                    Txt { width: parent.width; height: 18; text: row.s.title || Ui.when(row.started) }
+                    TipTxt { width: parent.width; height: 18; text: row.s.title || (row.started ? Ui.when(row.started) : "") }
                     Row {
                         spacing: 6
                         height: 16
                         Rectangle { anchors.verticalCenter: parent.verticalCenter; width: 6; height: 6; radius: 3; color: Ui.seriesColor(row.s.color) }
-                        Txt {
+                        TipTxt {
                             width: t.nameW - 30; height: 16
                             font.pixelSize: 12; color: Ui.p.text_faint
-                            text: [t.showProject && t.width >= 980 ? null : row.s.project, row.s.title ? Ui.whenShort(row.started) : null, row.s.model, t.entry(row.s.entrypoint),
-                                   "ran " + Ui.span(Date.parse(row.s.ended) - row.started.getTime()), row.s.id.slice(0, 8)].filter(function (x) { return x }).join("  ·  ")
+                            text: [t.showProject && t.width >= 980 ? null : row.s.project, row.s.title && row.started ? Ui.whenShort(row.started) : null, row.s.model, t.entry(row.s.entrypoint),
+                                   row.started && row.s.ended ? "ran " + Ui.span(Date.parse(row.s.ended) - row.started.getTime()) : null, row.s.id.slice(0, 8)].filter(function (x) { return x }).join("  ·  ")
                         }
                     }
                     Rectangle {
-                        // short, so the bar ranks rows without shouting over the text
-                        width: t.maxCost > 0 ? Math.max(3, Math.min(t.nameW - 40, 160) * row.s.cost / t.maxCost) : 0
-                        height: 2; radius: 1
-                        color: Ui.seriesColor(row.s.color)
-                        opacity: 0.85
+                        // cost against the costliest row shown, across the title column
+                        width: t.maxCost > 0 ? Math.max(12, (t.nameW - 40) * row.s.cost / t.maxCost) : 0
+                        height: 3; radius: 1.5
+                        color: Ui.alpha(Ui.seriesColor(row.s.color), 0.6)
                     }
                 }
                 Row {
@@ -136,7 +136,7 @@ Item {
                             leftPadding: modelData[0] === "project" ? 12 : 0
                             horizontalAlignment: modelData[0] === "project" ? Text.AlignLeft : Text.AlignRight
                             text: t.cell(row.s, modelData[0])
-                            color: text === "n/a" ? Ui.p.text_faint : modelData[0] === "project" ? Ui.p.text_muted : Ui.p.text
+                            color: text === "n/a" || text === "-" ? Ui.p.text_faint : modelData[0] === "project" ? Ui.p.text_muted : Ui.p.text
                             font.weight: modelData[0] === "cost" ? 600 : 400
                         }
                     }

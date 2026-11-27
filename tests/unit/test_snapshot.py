@@ -13,7 +13,8 @@ sys.path.insert(0, HERE)
 import make_store  # noqa: E402
 import snapshot_contract  # noqa: E402
 
-from claude_usage import snapshot, store  # noqa: E402
+from claude_usage import ingest, snapshot, store  # noqa: E402
+from test_ingest import _iso, _ts, asst, prompt, write  # noqa: E402
 
 NOW = make_store.NOW
 
@@ -105,6 +106,9 @@ def test_all_range_uses_legacy_days_before_coverage(built):
     legacy = conn.execute("SELECT SUM(cost) FROM legacy_days WHERE quality='legacy' AND day < ?",
                           (snap["status"]["coverage_from"],)).fetchone()[0]
     assert sum(g["values"]["cost"][g["keys"].index("Legacy")]) == pytest.approx(legacy, abs=0.01)
+    # The models card adds up to the Cost KPI: legacy days get their own entry.
+    assert sum(m["cost"] for m in snap["models"]) == pytest.approx(snap["timeline"]["totals"]["cost"], abs=0.05)
+    assert next(m for m in snap["models"] if m["id"] == "legacy")["color"] == snapshot.LEGACY
     # The overnight copy row in the synthetic legacy file is never shown.
     assert conn.execute("SELECT COUNT(*) FROM legacy_days WHERE quality='corrupt'").fetchone()[0] >= 1
 
@@ -167,3 +171,91 @@ def test_kpi_totals_match_the_timeline(built):
         assert sum(kpi["cost"]["series"]) == pytest.approx(kpi["cost"]["value"], abs=0.05)
         assert sum(sum(s) for s in snap["timeline"]["by"]["model"]["values"]["cost"]) == pytest.approx(
             snap["timeline"]["totals"]["cost"], abs=0.05)
+
+
+def test_weekly_meter_without_a_reset_time(built):
+    conn, limits = built
+    lim = dict(limits, weekly={"pct": 0.5, "resets_at": None, "severity": None}, window_started_at=None)
+    snap = snapshot.build(conn, "7d", None, NOW, lim)
+    snapshot_contract.check(snap)
+    assert snap["now"]["weekly"]["pct"] == 0.5 and snap["now"]["weekly"]["forecast"] is None
+    assert snap["limits"]["weekly"]["pct"] == 0.5 and snap["limits"]["weekly"]["pace"] is None
+    # The week in progress is not listed as a finished week; the finished ones still are.
+    cur = limits["weekly"]["resets_at"] - 7 * 86400
+    weeks = snap["limits"]["past_weeks"]
+    assert weeks and all(datetime.fromisoformat(w["start"]).timestamp() < cur for w in weeks)
+    assert snap["limits"]["weeks_counted"] == snapshot.build(conn, "7d", None, NOW, limits)["limits"]["weeks_counted"]
+
+
+def _now_of(minutes):
+    return datetime.fromisoformat(_ts(minutes).replace("Z", "+00:00")).timestamp()
+
+
+def test_caches_follow_each_store_and_every_rollup(tmp_path):
+    now = _now_of(30)
+    stores = {}
+    for name in ("alpha", "beta"):  # same shape, different content
+        root = str(tmp_path / name)
+        write(root, "C--work-x/s1.jsonl", [asst("m1", _ts(0), out=1000, cwd=rf"C:\work\{name}")])
+        write(root, "C--work-x/s1/subagents/agent-a1.jsonl", [asst("m2", _ts(1), agentId="a1")])
+        conn = store.connect(str(tmp_path / (name + ".db")))
+        ing = ingest.Ingestor(conn, root, clock=lambda: now)
+        ing.index()
+        stores[name] = root, conn, ing
+        assert [p["name"] for p in snapshot.build(conn, "7d", None, now, None)["projects"]] == [name]
+    root, conn, ing = stores["beta"]
+    write(root, "C--work-x/s1/subagents/agent-a2.jsonl", [asst("m3", _ts(2), agentId="a2")])
+    ing.tail()  # rebuilds the same rollup rows with new sums
+    assert snapshot.build(conn, "7d", None, now, None)["sessions"][0]["subagents"] == 2
+    write(root, "C--work-y/s2.jsonl", [asst("m4", _ts(3), out=900_000, sid="s2", cwd=r"C:\work\gamma")])
+    ing.tail()
+    assert {p["name"]: p["color"] for p in snapshot.build(conn, "7d", None, now, None)["projects"]} == \
+        {"gamma": 0, "beta": 1}
+
+
+def test_session_started_before_the_range_shows_its_real_start(tmp_path):
+    root = str(tmp_path / "projects")
+    first = datetime(2026, 11, 10, 9, 0)
+    write(root, "C--work-x/s1.jsonl", [asst("m1", _iso(first)), asst("m2", _iso(datetime(2026, 11, 20, 14, 0)))])
+    conn = store.connect(str(tmp_path / "usage.db"))
+    now = datetime(2026, 11, 20, 15, 0).timestamp()
+    ingest.Ingestor(conn, root, clock=lambda: now).index()
+    (s,) = snapshot.build(conn, "7d", None, now, None)["sessions"]
+    assert datetime.fromisoformat(s["started"]).replace(tzinfo=None) == first
+
+
+def test_in_memory_stores_are_not_served_from_the_cache(tmp_path):
+    now = _now_of(30)
+    for name in ("alpha", "beta", "gamma", "delta"):  # a closed store's id(conn) can come back
+        root = str(tmp_path / name)
+        write(root, "C--work-x/s1.jsonl", [asst("m1", _ts(0), cwd=rf"C:\work\{name}")])
+        conn = store.connect(":memory:")
+        ingest.Ingestor(conn, root, clock=lambda: now).index()
+        assert [p["name"] for p in snapshot.build(conn, "7d", None, now, None)["projects"]] == [name]
+        conn.close()
+
+
+def test_a_prompt_without_a_new_call_marks_the_session_interactive(tmp_path):
+    root = str(tmp_path / "projects")
+    path = write(root, "C--work-x/s1.jsonl", [asst("m1", _ts(0))])
+    conn = store.connect(str(tmp_path / "usage.db"))
+    now = _now_of(30)
+    ing = ingest.Ingestor(conn, root, clock=lambda: now)
+    ing.index()
+    assert snapshot.build(conn, "7d", None, now, None)["sessions"][0]["interactive"] is False
+    with open(path, "a", encoding="utf-8", newline="") as fh:
+        fh.write(prompt("p1", _ts(1)) + "\n")
+    ing.tail()  # a turn and no call: the rollups are not rebuilt
+    assert snapshot.build(conn, "7d", None, now, None)["sessions"][0]["interactive"] is True
+
+
+def test_without_a_reset_time_the_week_in_progress_is_not_a_past_week(tmp_path):
+    conn = store.connect(str(tmp_path / "usage.db"))
+    for h in range(7 * 24):  # a finished week that peaked near 66%
+        store.add_sample(conn, NOW - (13 * 24 - h) * 3600, round(0.1 + h / 300, 3), None)
+    for h in range(6 * 24):  # then a reset and six days of the week in progress
+        store.add_sample(conn, NOW - (6 * 24 - h) * 3600, round(0.05 + h / 200, 3), None)
+    lim = {"weekly": {"pct": 0.8, "resets_at": None, "severity": None}, "five_hour": None, "fetched_at": NOW}
+    snap = snapshot.build(conn, "7d", None, NOW, lim)
+    snapshot_contract.check(snap)
+    assert [(round(w["peak"], 2), w["current"]) for w in snap["limits"]["past_weeks"]] == [(0.66, False)]

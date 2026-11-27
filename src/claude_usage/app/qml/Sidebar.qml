@@ -10,18 +10,36 @@ Rectangle {
     property real nowMs: Date.now()
     signal navigate(string page)
 
-    width: 248
     color: Ui.p.sidebar
 
-    readonly property var projects: snap ? snap.projects : []
+    // A scoped snapshot only knows the selected project, so the list comes
+    // from the last unscoped snapshot of the same range, with the selected
+    // project's own row kept current.
+    property var lists: ({})
+    readonly property var projects: {
+        if (!snap) return []
+        var keep = snap.project ? lists[snap.range.key] : null
+        if (!keep) return snap.projects
+        var cur = snap.projects.filter(function (p) { return p.name === snap.project })[0]
+        return cur ? keep.map(function (p) { return p.name === cur.name ? Object.assign({}, cur, { color: p.color }) : p }) : keep
+    }
     readonly property var active: projects.filter(function (p) { return !p.idle }).sort(function (a, b) { return b.cost - a.cost || b.sessions - a.sessions })
     readonly property var idle: projects.filter(function (p) { return p.idle }).sort(function (a, b) { return b.cost - a.cost })
     readonly property string current: snap && snap.project ? snap.project : ""
     // A session that moved between folders counts once per project, so the
-    // unfiltered snapshot's own total is the true "All projects" figure.
-    property int total: 0
-    onSnapChanged: if (snap && !snap.project) total = snap.sessions_total
-                   else if (snap && !total) total = projects.reduce(function (a, p) { return a + p.sessions }, 0)
+    // unfiltered snapshot's own total is the true "All projects" figure. A
+    // scoped snapshot lacks it, so remember it per range and leave it blank
+    // for a range not yet seen unscoped.
+    property var totals: ({})
+    onSnapChanged: if (snap && !snap.project) {
+        var t = totals, l = lists
+        t[snap.range.key] = snap.sessions_total
+        l[snap.range.key] = snap.projects
+        totals = t
+        lists = l
+    }
+    readonly property string total: !snap ? "" : snap.sessions_total_all != null ? Ui.int(snap.sessions_total_all)
+        : snap.range.key in totals ? Ui.int(totals[snap.range.key]) : ""
     readonly property var status: snap ? snap.status : null
     // A busy month can touch a hundred folders; list the biggest and fold the rest.
     readonly property int topN: 8
@@ -79,40 +97,48 @@ Rectangle {
 
     ListView {
         id: list
-        x: 16; width: parent.width - 32
-        anchors.top: head.bottom; anchors.topMargin: 4
-        anchors.bottom: foot.top; anchors.bottomMargin: 12
+        // 3 px margins so a row's keyboard focus ring is not clipped
+        x: 13; width: parent.width - 26
+        leftMargin: 3; rightMargin: 3; topMargin: 3; bottomMargin: 3
+        y: head.y + head.height + 1
+        // as tall as its rows, so "Show more" sits right under the last one
+        height: Math.min(contentHeight + 6, foot.y - 12 - y - (more.visible ? more.height : 0))
         clip: true
         spacing: 2
         boundsBehavior: Flickable.StopAtBounds
         T.ScrollBar.vertical: Bar {}
-        model: side.listed
+        // a count, so rows persist across refreshes and only their bindings update
+        model: side.listed.length
         header: NavItem {
-            width: list.width; text: "All projects"; selected: side.current === ""
-            count: Ui.int(side.total)
+            width: list.width - 6; text: "All projects"; selected: side.current === ""
+            count: side.total
             onClicked: backend.setProject("")
         }
         delegate: NavItem {
-            width: list.width
-            text: modelData.name
+            readonly property var m: side.listed[index]
+            width: list.width - 6
+            text: m ? m.name : ""
             hasDot: true
-            ring: modelData.idle || modelData.color < 0 || modelData.color >= Ui.s.length
-            dot: Ui.seriesColor(modelData.color)
-            dim: modelData.idle
-            selected: side.current === modelData.name
-            count: modelData.sessions ? Ui.int(modelData.sessions) : ""
-            onClicked: backend.setProject(modelData.name)
+            // the band's colour when the chart draws it, "Other" grey when it is
+            // part of Other, and a faint dot when it has no use in this range
+            dot: !m ? "transparent" : m.idle ? Ui.p.line_strong : Ui.seriesColor(m.color)
+            dim: !!m && m.idle
+            selected: !!m && side.current === m.name
+            count: m && m.sessions ? Ui.int(m.sessions) : ""
+            onClicked: backend.setProject(m.name)
         }
-        footer: T.AbstractButton {
-            id: more
-            visible: side.rest.length > 0
-            width: list.width; height: visible ? 34 : 0
-            hoverEnabled: true
-            text: side.showAll ? "Show fewer" : "Show " + Ui.int(side.rest.length) + " more"
-            onClicked: side.showAll = !side.showAll
-            contentItem: Txt { leftPadding: 12; text: more.text; font.pixelSize: 12; color: more.hovered ? Ui.p.text : Ui.p.text_muted }
-            background: Rectangle { radius: 10; color: more.hovered ? Ui.alpha(Ui.p.text, 0.05) : "transparent"; Focus { show: more.visualFocus } }
-        }
+    }
+    // outside the list, so Tab reaches it after the last project
+    T.AbstractButton {
+        id: more
+        visible: side.rest.length > 0
+        x: 16; y: list.y + list.height
+        width: list.width - 6; height: 34
+        hoverEnabled: true
+        text: side.showAll ? "Show fewer" : "Show " + Ui.int(side.rest.length) + " more"
+        onClicked: side.showAll = !side.showAll
+        contentItem: Txt { leftPadding: 12; text: more.text; font.pixelSize: 12; color: more.hovered ? Ui.p.text : Ui.p.text_muted }
+        background: Rectangle { radius: 10; color: more.hovered ? Ui.alpha(Ui.p.text, 0.05) : "transparent"; Focus { show: more.visualFocus } }
     }
 
     Column {
@@ -163,7 +189,7 @@ Rectangle {
                     var st = side.status
                     if (!st) return "Loading"
                     if (st.state === "signed_out") return "Signed out"
-                    var u = Ui.date(st.updated_at)
+                    var u = Ui.date(backend.updatedAt || st.updated_at)
                     return u ? "Updated " + Ui.ago(side.nowMs - u.getTime()) : "Waiting for data"
                 }
             }

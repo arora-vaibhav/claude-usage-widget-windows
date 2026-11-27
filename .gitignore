@@ -23,7 +23,7 @@ Desktop.ini
 .omc/
 .pytest_cache/
 
-# Secrets / credentials – never commit these
+# Secrets and credentials: never commit these
 .env
 .env.*
 *.credentials.json
@@ -31,7 +31,6 @@ credentials.json
 # Claude auth tokens (the widget reads these from ~/.claude; never vendor them)
 claude-usage-token
 *-token
-.usage-token-scan.json
 # Anthropic OAuth/API token files
 *.pem
 *.key

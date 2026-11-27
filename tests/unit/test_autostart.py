@@ -1,4 +1,4 @@
-"""Launch-at-startup management — file lifecycle + VBS content safety."""
+"""Launch-at-startup management: file lifecycle and VBS content safety."""
 
 from claude_usage import autostart
 
@@ -29,7 +29,7 @@ def test_vbs_is_ascii_no_bom_and_hidden_launch(tmp_path, monkeypatch):
     monkeypatch.setattr(autostart, "_exe_path", lambda: r"C:\fake\claude-usage.exe")
     assert autostart.enable(sd) is True
     raw = (tmp_path / "claude-usage-widget.vbs").read_bytes()
-    # A UTF-8 BOM breaks the Windows script host — must be plain ASCII.
+    # A UTF-8 BOM breaks the Windows script host, so it must be plain ASCII.
     assert not raw.startswith(b"\xef\xbb\xbf")
     text = raw.decode("ascii")  # raises if any non-ASCII slipped in
     assert '"""C:\\fake\\claude-usage.exe"""' in text  # quoted exe path

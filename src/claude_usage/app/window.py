@@ -26,6 +26,7 @@ log = logging.getLogger(__name__)
 QML_MAIN = Path(__file__).with_name("qml") / "Main.qml"
 RANGES = ("24h", "7d", "30d", "90d", "all")
 PAGES = ("overview", "sessions", "settings")
+VARIABLE_FONT = "Segoe UI Variable"
 
 Provider = Callable[[str, Optional[str]], dict]
 OnSetting = Callable[[str, Any], None]
@@ -39,6 +40,7 @@ class Backend(QObject):
     themeChanged = Signal()
     settingsChanged = Signal()
     busyChanged = Signal()
+    updatedChanged = Signal()
     pageRequested = Signal(str)
     appearanceChanged = Signal()
 
@@ -54,6 +56,8 @@ class Backend(QObject):
         self._range = self._settings.get("app_range") if self._settings.get("app_range") in RANGES else "7d"
         self._project = ""
         self._json = "null"
+        self._last: Optional[dict] = None
+        self._updated = ""
         self._dark = False
         self._busy = False
         self._quitting = False
@@ -67,6 +71,9 @@ class Backend(QObject):
 
     def _project_name(self) -> str:
         return self._project
+
+    def _updated_at(self) -> str:
+        return self._updated
 
     def _is_dark(self) -> bool:
         return self._dark
@@ -87,15 +94,19 @@ class Backend(QObject):
         dark = self._dark
         # shortcut: the offscreen platform renders Segoe UI Variable through
         # FreeType with the wrong axes, so test renders use static Segoe UI.
-        offscreen = QGuiApplication.platformName() == "offscreen"
+        variable = QGuiApplication.platformName() != "offscreen"
         th = self._settings.get("notify_thresholds") or [tokens.CAUTION, tokens.CRITICAL]
         return {
             "dark": dark,
             "p": tokens.palette(dark),
             "s": tokens.series(dark),
             "other": tokens.OTHER_DARK if dark else tokens.OTHER_LIGHT,
-            "fontUi": "Segoe UI" if offscreen else tokens.FONT_UI,
-            "fontDisplay": "Segoe UI" if offscreen else tokens.FONT_DISPLAY,
+            # The "Segoe UI Variable Text" and "Display" families only list
+            # Regular and Bold, so 600 rendered Bold; QML picks the size with
+            # the opsz axis instead (Ui.axes).
+            "fontUi": VARIABLE_FONT if variable else "Segoe UI",
+            "fontDisplay": VARIABLE_FONT if variable else "Segoe UI",
+            "opsz": variable,
             "caution": float(th[0]),
             "critical": float(th[1]),
         }
@@ -103,6 +114,7 @@ class Backend(QObject):
     snapshotJson = Property(str, _snapshot_json, notify=snapshotChanged)
     rangeKey = Property(str, _range_key, notify=snapshotChanged)
     project = Property(str, _project_name, notify=snapshotChanged)
+    updatedAt = Property(str, _updated_at, notify=updatedChanged)
     dark = Property(bool, _is_dark, notify=themeChanged)
     theme = Property("QVariantMap", _theme, notify=themeChanged)
     settings = Property("QVariantMap", _settings_map, notify=settingsChanged)
@@ -170,8 +182,19 @@ class Backend(QObject):
             self.update_snapshot(snap)
 
     def update_snapshot(self, snap: dict) -> None:
+        status = snap.get("status") or {}
+        if status.get("updated_at") != (self._updated or None):
+            self._updated = status.get("updated_at") or ""
+            self.updatedChanged.emit()
+        # A refresh where only the clock moved skips the QML rebuild.
+        same = dict(snap, generated_at=None, status=dict(status, updated_at=None))
+        key = (snap.get("range") or {}).get("key", self._range)
+        if same == self._last and key == self._range and (snap.get("project") or "") == self._project:
+            self._set_busy(False)
+            return
+        self._last = same
         # The header controls show what the data actually covers.
-        self._range = (snap.get("range") or {}).get("key", self._range)
+        self._range = key
         self._project = snap.get("project") or ""
         self._json = json.dumps(snap, separators=(",", ":"))
         self.snapshotChanged.emit()

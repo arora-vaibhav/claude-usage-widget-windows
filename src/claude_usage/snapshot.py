@@ -1,9 +1,15 @@
-"""Snapshots for every UI surface: pure functions of the store, the latest limits and the clock.
+"""Snapshots for every UI surface, computed from the store, the latest limits and the clock.
 
 ``build`` returns the whole app view for one range and project filter;
 ``now_state`` returns the small range-independent part the OSD needs. Both
 follow tests/unit/snapshot_contract.py. Times are ISO 8601 with the local
 offset, money is API-equivalent USD computed from tokens at read time.
+
+``now`` must be the current time: the current range counts every stored call
+from its start on, so a ``now`` in the past would also count later calls
+(the previous-period comparison is exact either way). Module caches are
+keyed on the store file and its rollup generation, so they are safe to share
+between the worker and the GUI thread; in-memory stores are not cached.
 """
 
 from __future__ import annotations
@@ -14,7 +20,7 @@ import sqlite3
 import statistics
 import time as _time
 from datetime import date, datetime, time, timedelta
-from typing import Any, Optional
+from typing import Optional
 
 from claude_usage import pricing, store, tokens
 
@@ -39,8 +45,12 @@ HIT = 0.995  # utilization is reported in whole percents; 100% reads as 1.0
 USUAL_STEPS = 56  # one usual-week point every 3 hours
 COST_NOTE = ("Cost is API-equivalent: every API call in your local Claude Code transcripts, subagents included, "
              "priced at Anthropic's published per-token rates (as of {as_of}), with 5-minute and 1-hour cache "
-             "writes priced separately. It is not a bill. Claude Code's own /cost can read a few percent higher "
-             "because it also counts requests it does not write to transcripts.")
+             "writes priced separately. It is not a bill. Claude Code's own /cost also counts side requests it "
+             "does not save in transcripts, such as web searches and title or summary calls, and for a session "
+             "older than its cleanup period it can read much higher because older transcript files are gone. "
+             "Subagent transcripts written by Claude Code builds before about October 2026 often kept only the "
+             "first streamed line of a reply, so their output reads low. In the all-time range, days before full transcript coverage show the old widget's own daily "
+             "totals, which were estimated differently and usually read lower.")
 
 _SUMS = "COUNT(*), SUM(input), SUM(output), SUM(cache_read), SUM(cache_write_5m), SUM(cache_write_1h), SUM(web_search)"
 _PROJ = "coalesce(project, 'Unknown')"
@@ -93,26 +103,14 @@ def model_name(cid: str) -> str:
     return parts[1].capitalize() + (" " + ".".join(nums) if nums else "")
 
 
-_RATES: dict = {}
-
-
-def _rate(model: str, speed: str, long: int) -> tuple:
-    """(canonical id, priced, ri, ro, rr, r5, r1) with the call's multiplier folded in, per MTok."""
-    key = (model, speed, long)
-    r = _RATES.get(key)
-    if r is None:
-        cid, rates, priced = pricing.resolve(model)
-        k = pricing.multiplier(model, bool(long), speed or None) / 1e6
-        r = (cid, priced) + tuple(x * k for x in (rates or (0, 0, 0, 0, 0)))
-        _RATES[key] = r
-    return r
+_rate = pricing.scaled_rates  # (canonical id, priced, ri, ro, rr, r5, r1) per MTok
 
 
 def _price(model, speed, long, i, o, r, w5, w1, ws) -> tuple:
     """Cost parts (input incl. web search, output, cache read, cache write) and caching savings."""
     _, _, ri, ro, rr, r5, r1 = _rate(model, speed, long)
-    saved = r * (ri - rr) - w5 * (r5 - ri) - w1 * (r1 - ri)
-    return i * ri + ws * pricing.WEB_SEARCH_USD, o * ro, r * rr, w5 * r5 + w1 * r1, saved
+    saved = (r * (ri - rr) - w5 * (r5 - ri) - w1 * (r1 - ri)) / 1e6
+    return i * ri / 1e6 + ws * pricing.WEB_SEARCH_USD, o * ro / 1e6, r * rr / 1e6, (w5 * r5 + w1 * r1) / 1e6, saved
 
 
 def _pfilter(project: Optional[str]) -> tuple:
@@ -171,17 +169,34 @@ def _span(conn, t0: float, t1: float, project: Optional[str]) -> list:
             + _rollup_rows(conn, d0.date().isoformat(), (d1.date() - timedelta(days=1)).isoformat(), project, False))
 
 
-_AGENTS: dict = {}
+def _db(conn) -> Optional[str]:
+    # None for an in-memory store: those are not cached, since a closed one's id(conn) can come back.
+    return conn.execute("PRAGMA database_list").fetchone()[2] or None
 
 
-def _agents(conn) -> dict:
-    """Distinct subagents per session, over the whole session (cached like _alltime)."""
-    key = conn.execute("SELECT MAX(rowid), COUNT(*) FROM rollup_day").fetchone()
-    if key not in _AGENTS:
-        _AGENTS.clear()
-        _AGENTS[key] = dict(conn.execute(
-            "SELECT session_id, COUNT(DISTINCT agent_id) FROM rollup WHERE agent_id IS NOT NULL GROUP BY session_id"))
-    return _AGENTS[key]
+def _gen(conn) -> Optional[tuple]:
+    """Changes whenever the rollups do: the store, and how many times its rollups were rebuilt."""
+    db = _db(conn)
+    return (db, store.get_meta(conn, "rollup_gen", 0)) if db else None
+
+
+_SESS: dict = {}
+
+
+def _session_facts(conn) -> tuple:
+    """Distinct subagents per session over the whole session, and the sessions with human turns."""
+    key = _gen(conn)
+    if key:  # a prompt can land without a call, so new turns count too
+        key += (conn.execute("SELECT MAX(rowid) FROM turns").fetchone()[0],)
+    hit = _SESS.get(key) if key else None  # .get: the other thread may clear the dict between a test and a read
+    if hit is None:
+        hit = (dict(conn.execute("SELECT session_id, COUNT(DISTINCT agent_id) FROM rollup "
+                                 "WHERE agent_id IS NOT NULL GROUP BY session_id")),
+               {sid for (sid,) in conn.execute("SELECT DISTINCT session_id FROM turns")})
+        if key:
+            _SESS.clear()
+            _SESS[key] = hit
+    return hit
 
 
 def _turn_rows(conn, t0_ms: int, t1_ms: int, project: Optional[str], hourly: bool) -> list:
@@ -206,10 +221,10 @@ _ALLTIME: dict = {}
 
 def _alltime(conn) -> tuple:
     """All-time cost per project and per canonical model, and their colour ranks."""
-    # Every rollup rebuild inserts rows with new rowids, so the top rowid tells when to recompute.
-    key = conn.execute("SELECT MAX(rowid), COUNT(*) FROM rollup_day").fetchone()
-    if key in _ALLTIME:
-        return _ALLTIME[key]
+    key = _gen(conn)
+    hit = _ALLTIME.get(key) if key else None
+    if hit is not None:
+        return hit
     pc: dict = {}
     mc: dict = {}
     for project, model, speed, long, *s in conn.execute(
@@ -223,8 +238,10 @@ def _alltime(conn) -> tuple:
     def rank(d):
         return {k: i for i, k in enumerate(sorted(d, key=lambda k: (-d[k], k)))}
 
-    _ALLTIME.clear()
-    _ALLTIME[key] = out = (pc, rank(pc), mc, rank(mc))
+    out = (pc, rank(pc), mc, rank(mc))
+    if key:
+        _ALLTIME.clear()
+        _ALLTIME[key] = out
     return out
 
 
@@ -234,6 +251,8 @@ def _buckets(kind: str, n_days: Optional[int], now: float, first_day: date) -> t
     """Bucket starts (naive local datetimes) and a mapper from (day, hour) to bucket index."""
     nd = datetime.fromtimestamp(now)
     if kind == "hour":
+        # shortcut: on DST fall-back the repeated local hour is one (day, hour) rollup bucket, so for about a day
+        # the 24h view spans 25 real hours; read that hour from calls by ts_ms if it ever matters.
         b = nd.replace(minute=0, second=0, microsecond=0)
         starts = [b - timedelta(hours=23 - i) for i in range(24)]
         idx = {(s.date().isoformat(), s.hour): i for i, s in enumerate(starts)}
@@ -284,13 +303,17 @@ def _past_windows(conn, reset: Optional[float], now: float) -> tuple:
 
     Windows are split where utilization drops (a reset), because resets have
     moved and come early. A reset seen across a sampling gap is placed on the
-    current reset schedule when that falls inside the gap.
+    current reset schedule when that falls inside the gap. With no reset time
+    the samples run up to now, so a last window that began within a week is
+    the current one and is left out.
     """
     cur_start = reset - WEEK_S if reset else now // 3600 * 3600  # hourly steps keep the cache warm
     last = conn.execute("SELECT MAX(ts) FROM samples WHERE ts < ?", (cur_start,)).fetchone()[0]
-    key = (round(cur_start), last)
-    if key in _PAST:
-        return _PAST[key]
+    db = _db(conn)
+    key = (db, bool(reset), round(cur_start), last)
+    hit = _PAST.get(key) if db else None
+    if hit is not None:
+        return hit
     wins: list = []
     last5 = None
     prev = None
@@ -314,13 +337,16 @@ def _past_windows(conn, reset: Optional[float], now: float) -> tuple:
         if u >= HIT and w["hit"] is None:
             w["hit"] = t
         prev = (t, u)
+    if not reset and wins and wins[-1]["start"] > cur_start - WEEK_S:
+        wins.pop()
     out = []
     for w in wins:
         w["seen"] = w["ts"][-1] - w["ts"][0]
         if w["seen"] >= 4 * 86400 or w["hit"] is not None:
             out.append(w)
-    _PAST.clear()
-    _PAST[key] = (out, last5)
+    if db:
+        _PAST.clear()
+        _PAST[key] = (out, last5)
     return out, last5
 
 
@@ -389,6 +415,13 @@ def _limits(conn, limits: Optional[dict], now: float, thresholds: tuple) -> tupl
         }
         at_reset = min(u + rate * max(reset - now, 0) / 3600, 9.99)
         proj["weekly"] = {"pct": u, "reset": reset, "eta": eta if hits else None, "at_reset": at_reset}
+    elif wk and wk.get("pct") is not None:
+        # No reset time (a header fallback, or a null right after a reset): show the meter, skip the pace.
+        u = float(wk["pct"])
+        weekly = {"pct": u, "resets_at": None, "window_start": _iso(start), "level": tokens.level(u, *thresholds),
+                  "elapsed": 0.0, "pace": None, "usual": None, "eta": None, "hits_before_reset": False,
+                  "locked_hours": None, "daily_budget": None, "hourly_rate": None, "series": [], "usual_series": []}
+        proj["weekly"] = {"pct": u, "reset": None, "eta": None, "at_reset": None}
 
     five = lim.get("five_hour") or None
     session = None
@@ -433,7 +466,7 @@ def _limits(conn, limits: Optional[dict], now: float, thresholds: tuple) -> tupl
                       "hours_at_limit": round(hours_at, 1), "current": False})
     counted = len(weeks)
     hit = sum(1 for w in weeks if w["peak"] >= HIT)
-    if weekly is not None:
+    if weekly is not None and weekly["window_start"]:
         cur_hit = next((t for t, w in cur_pts if w >= HIT), None)
         weeks.append({"start": weekly["window_start"], "peak": round(max([w for _t, w in cur_pts] + [weekly["pct"]]), 4),
                       "hours_at_limit": round((now - cur_hit) / 3600, 1) if cur_hit else 0.0, "current": True})
@@ -443,11 +476,11 @@ def _limits(conn, limits: Optional[dict], now: float, thresholds: tuple) -> tupl
 
 
 def _forecast(p: Optional[dict], now: float) -> tuple:
-    if not p:
+    if not p or not p["reset"]:
         return None, None
     if p["eta"] is not None:
         if p["pct"] >= HIT:
-            return f"Limited until {_clock(p['reset'], now)}" if p["reset"] else "Limited", _iso(p["eta"])
+            return f"Limited until {_clock(p['reset'], now)}", _iso(p["eta"])
         return f"Limit {_clock(p['eta'], now)}", _iso(p["eta"])
     return f"About {round(min(p['at_reset'], 1.0) * 100)}% at reset", None
 
@@ -483,14 +516,14 @@ def now_state(conn: sqlite3.Connection, limits: Optional[dict], now: Optional[fl
 def _now(conn, limits, now, thresholds, proj) -> dict:
     lim = limits or {}
 
-    def meter(key, p):
+    def meter(p):
         if not p:
             return None
         forecast, eta = _forecast(p, now)
         return {"pct": p["pct"], "resets_at": _iso(p["reset"]), "level": tokens.level(p["pct"], *thresholds),
                 "forecast": forecast, "eta": eta}
 
-    weekly, session = meter("weekly", proj["weekly"]), meter("session", proj["session"])
+    weekly, session = meter(proj["weekly"]), meter(proj["session"])
     primary = "weekly"
     pw, ps = proj["weekly"], proj["session"]
     if ps and (ps["eta"] is not None and (not pw or pw["eta"] is None or ps["eta"] <= pw["eta"])
@@ -555,7 +588,10 @@ class _Tot:
 def build(conn: sqlite3.Connection, range_key: str = "7d", project: Optional[str] = None,
           now: Optional[float] = None, limits: Optional[dict] = None, *, indexing: Optional[dict] = None,
           updated_at: Optional[float] = None, thresholds: Optional[tuple] = None) -> dict:
-    """The whole app view. ``project`` filters everything except ``limits`` and ``now``."""
+    """The whole app view. ``project`` filters everything except ``limits`` and ``now``.
+
+    Takes 50-300 ms on a large store: call it off the GUI thread, on a connection of that thread.
+    """
     now = _time.time() if now is None else now
     thresholds = thresholds or (tokens.CAUTION, tokens.CRITICAL)
     n_days, kind, label = RANGES[range_key]
@@ -661,6 +697,7 @@ def build(conn: sqlite3.Connection, range_key: str = "7d", project: Optional[str
             sessions[sid]["turns"] += nt
 
     leg_series = None
+    leg_cost = leg_msgs = 0
     if legacy_used:
         leg_series = {m: [0.0] * nb for m in ("cost", "tokens", "messages", "agent_time")}
         for d, (c, t, msg) in legacy_used.items():
@@ -674,6 +711,8 @@ def build(conn: sqlite3.Connection, range_key: str = "7d", project: Optional[str
             leg_series["cost"][b] += c
             leg_series["tokens"][b] += t
             leg_series["messages"][b] += msg
+            leg_cost += c
+            leg_msgs += msg
 
     # ---- timeline groups: top five by cost in range, coloured by all-time rank
     def group(grp, ranks, name):
@@ -763,12 +802,15 @@ def build(conn: sqlite3.Connection, range_key: str = "7d", project: Optional[str
     meta = {}
     for i in range(0, len(sids), 500):
         chunk = sids[i:i + 500]
+        marks = ",".join("?" * len(chunk))
         for sid, title, entry in conn.execute(
-                f"SELECT session_id, title, entrypoint FROM sessions WHERE session_id IN ({','.join('?' * len(chunk))})",
-                chunk):
+                f"SELECT session_id, title, entrypoint FROM sessions WHERE session_id IN ({marks})", chunk):
             meta[sid] = (title, entry)
-    has_turns = {sid for (sid,) in conn.execute("SELECT DISTINCT session_id FROM turns")}
-    agents = _agents(conn)
+        # A session can start before the range: 'started' is its first call ever.
+        for sid, f_ms in conn.execute(
+                f"SELECT session_id, MIN(first_ms) FROM rollup_day WHERE session_id IN ({marks}) GROUP BY 1", chunk):
+            sessions[sid]["first"] = min(sessions[sid]["first"], f_ms)
+    agents, has_turns = _session_facts(conn)
     sess_out, first_of = [], {}
     for sid in sids:
         s = sessions[sid]
@@ -795,10 +837,15 @@ def build(conn: sqlite3.Connection, range_key: str = "7d", project: Optional[str
         })
 
     # ---- models and cost split
-    model_out = [{"name": model_name(cid), "id": cid, "cost": round(m["cost"], 4),
-                  "share": round(m["cost"] / total_ledger, 4) if (total_ledger := sum(x["cost"] for x in models.values())) else 0.0,
+    # Legacy days have no per-model split; one 'legacy' entry keeps the models adding up to the Cost KPI.
+    if leg_cost:
+        models["legacy"] = {"cost": leg_cost, "output": 0, "calls": leg_msgs, "cr": 0, "prompt": 0, "priced": "family"}
+    all_cost = sum(x["cost"] for x in models.values())
+    model_out = [{"name": "Legacy" if cid == "legacy" else model_name(cid), "id": cid, "cost": round(m["cost"], 4),
+                  "share": round(m["cost"] / all_cost, 4) if all_cost else 0.0,
                   "output": int(m["output"]), "cache_hit": round(m["cr"] / m["prompt"], 4) if m["prompt"] else None,
-                  "calls": int(m["calls"]), "color": mrank.get(cid, OTHER), "priced": m["priced"]}
+                  "calls": int(m["calls"]), "color": LEGACY if cid == "legacy" else mrank.get(cid, OTHER),
+                  "priced": m["priced"]}
                  for cid, m in sorted(models.items(), key=lambda kv: -kv[1]["cost"])]
     cost_split = {k: {"cost": round(split[i][0], 4), "tokens": int(split[i][1])}
                   for i, k in enumerate(("input", "output", "cache_read", "cache_write"))}

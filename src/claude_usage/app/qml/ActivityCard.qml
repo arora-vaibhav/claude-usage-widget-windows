@@ -6,16 +6,17 @@ import QtQuick.Shapes
 Card {
     id: card
     property var act: null           // snapshot.activity
-    readonly property bool wide: width >= 760
+    readonly property bool wide: width >= 700
     implicitHeight: 2 * padding + (wide ? Math.max(lcol.height, rcol.height) : lcol.height + 24 + rcol.height)
 
     readonly property var days: act ? act.days : []
-    readonly property bool anyPartial: days.some(function (d) { return d.partial })
+    // today is always in progress; only earlier days can be partial from cleanup
+    readonly property bool anyPartial: days.slice(0, -1).some(function (d) { return d.partial })
 
-    function heat(level) {
-        if (level <= 0) return Ui.p.track
-        return Ui.mix(Ui.p.track, Ui.p.accent, [0, 0.34, 0.58, 0.8, 1][Math.min(4, level)])
-    }
+    // A warm ramp (plum to amber); busier days gain contrast against the card
+    // in both modes, so dark runs toward light and light toward deep.
+    readonly property var ramp: Ui.dark ? ["#7f2e72", "#c93d50", "#fa7b3c", "#ffd666"] : ["#f0b85a", "#ef8a3f", "#d2443c", "#8a2a6c"]
+    function heat(level) { return level <= 0 ? Ui.p.track : ramp[Math.min(4, level) - 1] }
 
     Column {
         id: lcol
@@ -26,7 +27,7 @@ Card {
             width: parent.width
             wrapMode: Text.WordWrap; elide: Text.ElideNone
             font.pixelSize: 12; color: Ui.p.text_muted
-            text: "Agent time per day, last " + Math.round(card.days.length / 7) + " weeks." + (card.anyPartial ? " Faded days are partial: older transcripts were cleaned up." : "")
+            text: "Agent time per day, last " + Math.round(card.days.length / 7) + " weeks." + (card.anyPartial ? " Outlined days are partial: older transcripts were cleaned up." : "")
         }
         Item { width: 1; height: 12 }
         Item {
@@ -46,25 +47,58 @@ Card {
                 model: ["Mon", "Wed", "Fri", "Sun"]
                 Txt { x: 0; y: grid.r + 1 + index * 3 * grid.r - 8; height: 16; text: modelData; font.pixelSize: 11; color: Ui.p.text_faint }
             }
-            Repeater {
-                model: grid.cells
-                Shape {
-                    anchors.fill: parent
-                    preferredRendererType: Shape.CurveRenderer
-                    opacity: modelData.d.partial ? 0.45 : 1
-                    ShapePath {
-                        strokeColor: modelData.last ? Ui.p.text : "transparent"
-                        strokeWidth: modelData.last ? 1.5 : 0
-                        fillColor: card.heat(modelData.d.level)
-                        PathSvg { path: Ui.hexPath(modelData.cx, modelData.cy, grid.r - 1.6) }
+            // One path per shade, so 84 days are a dozen paths rather than 84
+            // items. Partial days (transcripts cleaned up) are an outline in
+            // their shade; today is filled and ringed. The glow under the
+            // busiest days is one path, so where halos meet they do not stack.
+            readonly property var paths: {
+                var fill = ["", "", "", "", ""], ring = ["", "", "", "", ""], glow = "", today = ""
+                cells.forEach(function (c) {
+                    var lv = Math.max(0, Math.min(4, c.d.level)), part = c.d.partial && !c.last && lv > 0
+                    if (part) {
+                        fill[0] += Ui.hexPath(c.cx, c.cy, r - 2.4)
+                        ring[lv] += Ui.hexPath(c.cx, c.cy, r - 2.4)
+                    } else {
+                        fill[lv] += Ui.hexPath(c.cx, c.cy, r - 1.6)
+                        if (lv === 4) glow += Ui.hexPath(c.cx, c.cy, r * 1.3)
                     }
+                    if (c.last) today = Ui.hexPath(c.cx, c.cy, r - 1.6)
+                })
+                return { fill: fill, ring: ring, glow: glow, today: today }
+            }
+            Shape {
+                anchors.fill: parent
+                preferredRendererType: Shape.CurveRenderer
+                ShapePath {
+                    strokeColor: "transparent"; fillRule: ShapePath.WindingFill
+                    fillColor: Ui.alpha(card.heat(4), Ui.dark ? 0.12 : 0.08)
+                    PathSvg { path: grid.paths.glow }
+                }
+                ShapePath { strokeColor: "transparent"; fillColor: card.heat(0); PathSvg { path: grid.paths.fill[0] } }
+                ShapePath { strokeColor: "transparent"; fillColor: card.heat(1); PathSvg { path: grid.paths.fill[1] } }
+                ShapePath { strokeColor: "transparent"; fillColor: card.heat(2); PathSvg { path: grid.paths.fill[2] } }
+                ShapePath { strokeColor: "transparent"; fillColor: card.heat(3); PathSvg { path: grid.paths.fill[3] } }
+                ShapePath { strokeColor: "transparent"; fillColor: card.heat(4); PathSvg { path: grid.paths.fill[4] } }
+                ShapePath { strokeColor: card.heat(1); strokeWidth: 1.5; fillColor: "transparent"; PathSvg { path: grid.paths.ring[1] } }
+                ShapePath { strokeColor: card.heat(2); strokeWidth: 1.5; fillColor: "transparent"; PathSvg { path: grid.paths.ring[2] } }
+                ShapePath { strokeColor: card.heat(3); strokeWidth: 1.5; fillColor: "transparent"; PathSvg { path: grid.paths.ring[3] } }
+                ShapePath { strokeColor: card.heat(4); strokeWidth: 1.5; fillColor: "transparent"; PathSvg { path: grid.paths.ring[4] } }
+                ShapePath {
+                    strokeColor: Ui.p.text; strokeWidth: 1.5; fillColor: "transparent"; joinStyle: ShapePath.RoundJoin
+                    PathSvg { path: grid.paths.today }
                 }
             }
-            Rectangle {
+            Shape {
                 id: hl
                 visible: false
-                width: grid.r * 1.6; height: width; radius: width / 2
-                color: "transparent"; border.width: 2; border.color: Ui.p.text
+                property real cx: 0
+                property real cy: 0
+                anchors.fill: parent
+                preferredRendererType: Shape.CurveRenderer
+                ShapePath {
+                    strokeColor: Ui.p.text; strokeWidth: 2; fillColor: "transparent"; joinStyle: ShapePath.RoundJoin
+                    PathSvg { path: Ui.hexPath(hl.cx, hl.cy, grid.r + 0.6) }
+                }
             }
             Row {
                 anchors.right: parent.right; anchors.rightMargin: 4
@@ -93,8 +127,8 @@ Card {
                     tip.title = Ui.wmd(dt) + ", " + dt.getFullYear()
                     tip.value = d.agent_ms ? Ui.dur(d.agent_ms) + " agent time" : "No agent time"
                     tip.rows = d.cost ? [{ c: Ui.p.text_faint, name: "Cost", v: Ui.cents(d.cost) }] : []
-                    tip.note = d.partial ? "Partial: transcripts for this day were cleaned up, so this is a lower bound." : best.last ? "Today so far." : ""
-                    hl.x = best.cx - hl.width / 2; hl.y = best.cy - hl.height / 2; hl.visible = true
+                    tip.note = best.last ? "Today so far." : d.partial ? "Partial: transcripts for this day were cleaned up, so this is a lower bound." : ""
+                    hl.cx = best.cx; hl.cy = best.cy; hl.visible = true
                     tip.showAt(grid, best.cx, best.cy - grid.r)
                 }
             }
@@ -121,25 +155,27 @@ Card {
                     width: parent.width / 2
                     spacing: 2
                     Txt { text: modelData[0]; color: Ui.p.text_muted }
-                    Txt { text: modelData[1]; display: true; font.pixelSize: 28; font.weight: 600; height: 38; font.features: ({}) }
+                    Txt { text: modelData[1]; display: true; font.pixelSize: 28; font.weight: 600; height: 38 }
                     Txt { text: modelData[2]; font.pixelSize: 12; color: Ui.p.text_faint; width: parent.width - 8 }
                 }
             }
         }
         Item { width: 1; height: 16 }
         Repeater {
-            model: card.act ? card.act.facts : []
+            model: card.act ? card.act.facts.length : 0
             Item {
-                width: rcol.width; height: modelData.detail ? 52 : 40
+                id: fact
+                readonly property var f: card.act && card.act.facts[index] || { label: "", value: "", detail: null }
+                width: rcol.width; height: fact.f.detail ? 52 : 40
                 Rectangle { width: parent.width; height: 1; color: Ui.p.line }
                 Column {
                     anchors.verticalCenter: parent.verticalCenter
                     width: parent.width - val.implicitWidth - 16
                     spacing: 1
-                    Txt { width: parent.width; height: 18; text: modelData.label; color: Ui.p.text_muted }
-                    Txt { visible: !!modelData.detail; width: parent.width; height: 16; text: modelData.detail || ""; font.pixelSize: 12; color: Ui.p.text_faint }
+                    Txt { width: parent.width; height: 18; text: fact.f.label; color: Ui.p.text_muted }
+                    Txt { visible: !!fact.f.detail; width: parent.width; height: 16; text: fact.f.detail || ""; font.pixelSize: 12; color: Ui.p.text_faint }
                 }
-                Txt { id: val; anchors.right: parent.right; height: parent.height; text: modelData.value; font.weight: 600 }
+                Txt { id: val; anchors.right: parent.right; height: parent.height; text: fact.f.value; font.weight: 600 }
             }
         }
         Rectangle { width: parent.width; height: 1; color: Ui.p.line }

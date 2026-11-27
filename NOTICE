@@ -7,6 +7,6 @@ licensed under the MIT License (see LICENSE).
   Upstream: https://github.com/bozdemir/claude-usage-widget
 
 Fork maintained by Vaibhav Arora (https://github.com/arora-vaibhav). Changes
-include Windows compatibility (OAuth token refresh, memory-safe scans, BOM
-handling, backoff/retry, exception logging), a full-source build, a usage
-history store + dashboard, and UI modernization.
+include Windows compatibility (OAuth token refresh, BOM handling, backoff and
+retry, exception logging), a full-source build, a SQLite usage store fed from
+Claude Code transcripts, a native Qt Quick app window and a rebuilt overlay.

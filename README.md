@@ -1,83 +1,60 @@
-# Claude Usage Widget — Windows Edition
+# Claude Usage for Windows
 
-A Windows-native desktop overlay that shows your [Claude Code](https://docs.anthropic.com/en/docs/claude-code) usage in real time — session %, weekly %, reset timers, cost breakdown, a full usage-history dashboard, and a weekly AI summary.
+A small Windows app that shows how much of your Claude plan limits you have used, and what your [Claude Code](https://docs.anthropic.com/en/docs/claude-code) usage would cost at API prices. It reads the transcripts Claude Code keeps on your machine and the usage endpoint Claude Code itself calls.
 
-This is a **full-source, Windows-focused fork** of [`claude-usage-widget`](https://github.com/bozdemir/claude-usage-widget) by Burak (MIT). The complete application source lives in [`src/claude_usage/`](src/claude_usage) and is installed directly from this repo — there is no separate PyPI download or patch-overlay step.
+This is a full-source, Windows-focused fork of [`claude-usage-widget`](https://github.com/bozdemir/claude-usage-widget) by Burak (MIT). The whole app lives in [`src/claude_usage/`](src/claude_usage) and installs straight from this repo.
 
----
+## What you get
 
-## What's new in v1.4
+**The overlay.** A small always-on-top pill or card. It leads with the limit that will run out first and shows when it resets. It shows only the limits your plan reports: Ultra has weekly limits and no 5-hour limit, so you see the weekly limit and never a 5-hour 0%; on a plan with a 5-hour limit, the card shows both. The card also shows today's cost. Meters turn amber at 75% and red at 90% (you can change both). When the numbers are old they are dimmed with an "as of" time, and when you are signed out it says so instead of showing numbers. Click it to open the app, right-click for the menu, drag it anywhere (over the taskbar is fine); the position is remembered.
 
-- **🪟 Windows 11 look:** native dark title bars and rounded corners on every window, pill-style tabs and range buttons, slim rounded scrollbars, themed menus and tooltips.
-- **🚀 Launch at startup:** a toggle right in the OSD/tray menu (no script needed). It drops a tiny launcher in your Startup folder and removes it when switched off.
-- **📍 The OSD stays where you put it:** position (even parked on the taskbar) and minimized state are remembered across restarts.
-- **🎨 Theme switching fixed:** changing themes no longer blanks the Details window; the tabbed window, History charts, menus and tooltips all retint live. Verified across all 11 themes.
-- **⚡ Much lighter when idle:** history pruning runs once a day instead of rewriting a file every 30 seconds, scanner state saves at most every 5 minutes, and hidden windows skip their rebuild work entirely.
-- **🔢 Fable 5 priced correctly:** the newest frontier model previously fell back to Sonnet rates, undercounting today's cost.
+**The app**, with three pages:
 
-(Earlier highlights: v1.1 added the history dashboard, tray icon, accurate local-day cost and always-on-top fixes; v1.2-1.3 added the unified tabbed window, message dedup accuracy fixes, interactive charts, near-limit pulse and hover tooltip. Full history on the [releases page](../../releases).)
+- **Overview**: your plan limits (weekly pace and projection, past weeks, other limits and extra usage), cost, tokens, sessions, agent time and cache hit rate with the change from the previous period, a timeline by project or by model, top sessions, an activity heatmap, and the cost split by model. Pick 24 hours, 7, 30 or 90 days, or all time, and narrow everything to one project from the sidebar.
+- **Sessions**: every session in the range, with search, an Interactive or Automated filter and sortable columns.
+- **Settings**: appearance (System, Light, Dark), overlay style, opacity and keep on top, launch at startup, limit alerts and their thresholds, the data store and re-index, version and update check.
 
----
+**The tray icon** opens the app on click. The tray and the overlay share one menu: Open Claude Usage, Refresh now, Pill or Card, Settings, Quit. Its first line, like the tray tooltip, sums up the limits your plan reports, the one that will run out first leading as on the overlay (for example "Weekly 67%, resets Tue 8:00 PM"), the weekly Fable limit while you use it, and the live token rate. When the numbers are old, the tooltip also says why. Limit alerts arrive as tray notifications, once per crossing in each limit window, for the weekly limit, the 5-hour limit when your plan has one, and the Fable limit while it is active.
 
-## What's different from upstream
+## How cost is computed
 
-| Area | Change |
-|---|---|
-| **Packaging** | Full source vendored in `src/`; installs from this repo via `uv tool install .` (no PyPI + patch overlay) |
-| **Encoding** | File reads use `encoding="utf-8"` / `utf-8-sig` to avoid `UnicodeDecodeError` and BOM issues on Windows (cp1252 default) |
-| **OAuth auto-refresh** | Expired tokens refresh automatically from the stored `refreshToken` — no manual re-auth |
-| **Rate limiting** | Token refresh has a cooldown so a broken endpoint isn't hammered |
-| **Memory-safe scans** | Conversation/cache/ticker scans use byte budgets + `MemoryError` guards for large `~/.claude/projects` trees |
-| **No terminal required** | A VBScript launcher runs the widget without a console window |
-| **Desktop shortcut** | Setup creates a one-click `.lnk` on your Desktop |
-| **Position memory** | Drag the widget anywhere; position is saved and restored on next launch |
-| **Details panel** | Wider (680 px), auto-fits height to content, positions next to the OSD widget |
+Cost is API-equivalent: every API call in your local Claude Code transcripts, subagents included, priced at Anthropic's published per-token rates, with 5-minute and 1-hour cache writes priced separately. It is what those tokens would cost on the API, not your bill. Claude Code's own `/cost` can read a few percent higher because it also counts requests it does not write to transcripts.
 
----
+## Where your data lives
+
+- **Usage store**: `%LOCALAPPDATA%\claude-usage\usage.db`, a SQLite file with one row per API call (tokens, model, time, working folder and project name), session titles that Claude Code wrote, turn times and the limit readings over time. Cost is not stored; it is worked out from tokens when shown, so a price fix corrects all history.
+- **Settings**: `%USERPROFILE%\.config\claude-usage\config.json`, holding only what you changed. Settings from older versions (theme, minimized overlay) are carried over. A file that does not parse is kept as `config.json.bad` and the app starts on defaults. A file that is locked at start (by a sync tool, say) is left as it is: that run uses the defaults, and your changes are added to the file once it can be read.
+- **Log**: `%USERPROFILE%\.claude\claude-usage.log`.
+
+Claude Code deletes old transcripts after `cleanupPeriodDays` (a Claude Code setting). The store keeps every call it has read, so your history stays after the transcripts are gone. Days from before the store existed come from the older `usage-daily.jsonl` totals (cost and tokens only) and are marked as such in the app.
+
+The first start reads all your transcripts. On a large history that takes 10 to 40 minutes; the app shows the progress and the totals fill in as it goes. Re-index (Settings, or `claude-usage --reindex`) reads everything again and never drops history that is already in the store.
+
+## Privacy
+
+- The only network requests go to Anthropic, for your plan limits with your Claude Code sign-in, and to GitHub, for this repo's latest release. No telemetry.
+- The store holds counts and metadata, not the text of your prompts or replies.
+- In `~/.claude` the app writes its log and lock file. If the limits request keeps failing to sign in, it runs `claude setup-token` (a few times at most) to make a long-lived token in `~/.claude/claude-usage-token`. Without that token it refreshes Claude Code's sign-in in `~/.claude/.credentials.json` when it is about to expire, as Claude Code does.
 
 ## Requirements
 
 | Requirement | Notes |
 |---|---|
-| Windows 10 / 11 | 64-bit |
-| Python 3.10+ | Via [uv](https://docs.astral.sh/uv/) — installer handles this |
-| [uv](https://docs.astral.sh/uv/) | Installed automatically if missing |
-| Claude CLI | For initial authentication — [install guide](https://docs.anthropic.com/en/docs/claude-code) |
-| Claude subscription | Pro / Max / Team / Enterprise or API key |
+| Windows 10 or 11 | 64-bit; built for Windows 11 |
+| Python 3.10+ | Through [uv](https://docs.astral.sh/uv/); the setup script handles it |
+| Claude Code | Signed in at least once (`claude` in a terminal) |
 
----
-
-## Quick start
+## Install
 
 ```powershell
-# 1. Clone this repo
 git clone https://github.com/arora-vaibhav/claude-usage-widget-windows.git
 cd claude-usage-widget-windows
-
-# 2. Run the setup script (installs from source, one time)
-powershell -ExecutionPolicy Bypass -File setup.ps1
-
-# 3. Authenticate Claude CLI (if not done already)
-claude   # follow the browser auth flow
-
-# 4. Double-click "Claude Usage" on your Desktop
+powershell -ExecutionPolicy Bypass -File setup.ps1        # add -Autostart to start at sign-in
 ```
 
-The widget appears as a small translucent overlay — drag it wherever you want.
+Then double-click "Claude Usage" on your desktop. Starting it again while it runs opens the app window.
 
----
-
-## How to use
-
-| Action | Result |
-|---|---|
-| **Click** the widget | Opens the details panel |
-| **Drag** the widget | Moves it; position is saved automatically |
-| **Right-click** | Context menu: **Dashboard…**, details, refresh, settings, theme, quit |
-| **Tray icon** | Click to open the dashboard; right-click for the full menu |
-| **Close** details panel | Just close the window; the OSD stays |
-
----
+To update: `git pull`, then run `setup.ps1` again.
 
 ## Uninstall
 
@@ -85,51 +62,41 @@ The widget appears as a small translucent overlay — drag it wherever you want.
 powershell -ExecutionPolicy Bypass -File setup.ps1 -Uninstall
 ```
 
-Removes the launcher, desktop shortcut, and the `claude-usage-widget` uv tool.
+This removes the launcher, the desktop shortcut, the autostart entry and the `claude-usage-widget` uv tool. Your store and settings stay; delete `%LOCALAPPDATA%\claude-usage` and `%USERPROFILE%\.config\claude-usage` to remove them too.
 
----
+## Command line
 
-## How it works
-
-- `setup.ps1` installs the widget straight from this repo's source with `uv tool install .` — the code in `src/claude_usage/` *is* the app, so nothing can drift out of sync.
-- The VBScript launcher in `launcher/` calls the installed `claude-usage.exe` with `WindowStyle=0`, keeping the GUI visible while hiding the console.
-- Token refresh runs inside the widget process using the `refreshToken` already stored in `~/.claude/.credentials.json` — no credentials are transmitted to this repo or any third party.
-- Usage data comes only from local `~/.claude/` files and the Anthropic rate-limit API.
-
----
+| Command | What it does |
+|---|---|
+| `claude-usage` | Starts the app (or opens its window if it is already running) |
+| `claude-usage --version` | Prints the version |
+| `claude-usage --json [--range 24h\|7d\|30d\|90d\|all]` | Updates the store, fetches the limits and prints the snapshot the app shows, as JSON (default range 7d) |
+| `claude-usage --reindex` | Reads every transcript again |
 
 ## Development
 
 ```powershell
-# Editable install for development
-uv tool install -e .
+uv tool install -e .     # editable install
 
-# Run the test suite (headless, pure-logic tests)
-uv run --extra dev pytest
-# or, against the source tree without installing:
-#   $env:PYTHONPATH="src"; uv run --no-project --with pytest python -m pytest tests
+# tests, headless
+$env:PYTHONPATH="src"; $env:QT_QPA_PLATFORM="offscreen"
+uv run --no-project --with pytest --with PySide6-Essentials python -m pytest tests
 ```
 
-- **Layout:** `src/claude_usage/` (package), `tests/unit/` (tests), `launcher/`, `setup.ps1`.
-- **Build:** setuptools (`pyproject.toml`), single runtime dependency `PySide6-Essentials`.
-- **Design & roadmap:** see [`docs/superpowers/specs/`](docs/superpowers/specs) for the modernization plan (stabilization, a usage-history store + dashboard, and UI work).
-
----
+- Layout: `src/claude_usage/` (the package; `app/qml/` holds the app window), `tests/unit/`, `tests/fixtures/` (synthetic data only), `launcher/`, `setup.ps1`.
+- One runtime dependency: `PySide6-Essentials` (Qt Quick for the app, a QWidget for the overlay, SQLite from the standard library).
+- Design: [`docs/superpowers/specs/2026-11-26-native-app-design.md`](docs/superpowers/specs/2026-11-26-native-app-design.md).
 
 ## Contributing
 
-PRs welcome. For a Windows-specific bug, open an issue with your Python version, uv version, and console output — run `claude-usage` directly in a terminal to see logs.
-
----
+PRs welcome. For a Windows bug, open an issue with your Python and uv versions and the relevant lines of `~/.claude/claude-usage.log`.
 
 ## License
 
-MIT. This fork vendors the full upstream source under the same MIT License — see [`LICENSE`](LICENSE) (© 2026 Burak) and [`NOTICE`](NOTICE) for attribution and a summary of fork changes.
+MIT. This fork vendors the upstream source under the same license; see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
 
----
+## Support the project
 
-## Support the Project
-
-If this saves you time or tokens — buy me a matcha. ☕
+If this saves you time or tokens, buy me a matcha.
 
 **BTC:** `bc1qk437xlm0rl8pdq6akhy543j66urqscg7ntx39470dgxm5gc7zudqypcfz6`

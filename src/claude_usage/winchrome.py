@@ -1,6 +1,6 @@
 """Windows 11 native chrome (DWM) helpers. Silent no-ops elsewhere.
 
-Qt windows on Windows 11 dark mode default to a WHITE title bar — the single
+Qt windows on Windows 11 dark mode default to a WHITE title bar, the single
 biggest "not a native app" tell. ``DwmSetWindowAttribute`` fixes that
 (immersive dark mode) and lets us opt in to rounded window corners.
 """
@@ -14,10 +14,10 @@ def apply_win11_chrome(widget, dark: bool = True, corner: int = 2) -> None:
     """Dark immersive title bar + corner preference on a top-level window.
 
     ``corner``: 0=default, 1=square, 2=DWMWCP_ROUND, 3=DWMWCP_ROUNDSMALL.
-    Must be called AFTER the last ``setWindowFlags`` on the widget — changing
+    Must be called AFTER the last ``setWindowFlags`` on the widget: changing
     flags recreates the native window and drops these attributes. Safe under
     ``QT_QPA_PLATFORM=offscreen`` and on non-Windows (silent no-op; DWM errors
-    are swallowed — Windows 10 ignores the corner attribute, for example).
+    are swallowed; Windows 10 ignores the corner attribute, for example).
     """
     if sys.platform != "win32":
         return

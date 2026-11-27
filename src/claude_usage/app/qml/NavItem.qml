@@ -8,7 +8,6 @@ T.AbstractButton {
     property string count: ""
     property color dot: "transparent"
     property bool hasDot: false
-    property bool ring: false
     property bool selected: false
     property bool dim: false
     implicitHeight: 34
@@ -26,7 +25,7 @@ T.AbstractButton {
             visible: n.selected
             x: 0; width: 3; radius: 1.5
             y: 9; height: parent.height - 18
-            color: Ui.p.brand
+            color: Ui.p.accent
         }
         Focus { show: n.visualFocus; r: 10 }
     }
@@ -43,11 +42,9 @@ T.AbstractButton {
             visible: n.hasDot
             x: 14; anchors.verticalCenter: parent.verticalCenter
             width: 8; height: 8; radius: 4
-            color: n.ring ? "transparent" : n.dot
-            border.width: n.ring ? 1.5 : 0
-            border.color: Ui.p.text_faint
+            color: n.dot
         }
-        Txt {
+        TipTxt {
             x: n.glyph !== "" ? 42 : n.hasDot ? 32 : 12
             width: parent.width - x - cnt.implicitWidth - 20
             height: parent.height

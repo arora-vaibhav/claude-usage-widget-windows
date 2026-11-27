@@ -4,6 +4,7 @@ import QtQuick
 Page {
     id: page
     property real nowMs: Date.now()
+    property real viewH: height      // the visible height, for the hero chart
     signal openSessions()
 
     readonly property var st: snap ? snap.status : null
@@ -77,7 +78,7 @@ Page {
     Eyebrow {
         width: page.cw
         title: "PLAN LIMITS"
-        sub: page.signedOut ? "" : "Account-wide" + (page.limitsAsOf ? ", as of " + Ui.clock(page.limitsAsOf) : "") + (page.snap && page.snap.project ? ". Limits are not split by project." : ".")
+        sub: page.signedOut ? "" : "Account-wide" + (page.limitsAsOf && !page.stale ? ", as of " + Ui.clock(page.limitsAsOf) : "") + (page.snap && page.snap.project ? ". Limits are not split by project." : ".")
         pill: page.stale ? "Not refreshed since " + (page.limitsAsOf ? Ui.whenShort(page.limitsAsOf) : "a while") : ""
         pillKind: "warn"
     }
@@ -109,16 +110,16 @@ Page {
         id: limitsRow
         visible: !page.signedOut && !!page.snap
         width: page.cw
-        readonly property bool wide: page.cw >= 1120
-        readonly property real colW: (page.cw - 2 * Ui.gap) / 3.75
+        readonly property bool wide: page.cw >= 900
+        readonly property real colW: (page.cw - 2 * Ui.gap) / 3.6   // split 1.55 : 0.95 : 1.1
         readonly property real rowH: Math.max(week.natural, past.natural, other.natural)
         height: wide ? rowH : week.natural + Ui.gap + Math.max(past.natural, other.natural)
-        opacity: page.stale ? 0.62 : 1
         WeekCard {
             id: week
             w: page.snap ? page.snap.limits.weekly : null
             nowMs: page.nowMs
-            width: limitsRow.wide ? limitsRow.colW * 1.75 : page.cw
+            stale: page.stale
+            width: limitsRow.wide ? limitsRow.colW * 1.55 : page.cw
             height: limitsRow.wide ? limitsRow.rowH : natural
         }
         PastWeeksCard {
@@ -126,7 +127,7 @@ Page {
             limits: page.snap ? page.snap.limits : null
             x: limitsRow.wide ? week.width + Ui.gap : 0
             y: limitsRow.wide ? 0 : week.height + Ui.gap
-            width: limitsRow.wide ? limitsRow.colW : (page.cw - Ui.gap) / 2
+            width: limitsRow.wide ? limitsRow.colW * 0.95 : (page.cw - Ui.gap) / 2
             height: limitsRow.wide ? limitsRow.rowH : Math.max(natural, other.natural)
         }
         OtherLimitsCard {
@@ -134,7 +135,7 @@ Page {
             limits: page.snap ? page.snap.limits : null
             x: past.x + past.width + Ui.gap
             y: past.y
-            width: limitsRow.wide ? limitsRow.colW : (page.cw - Ui.gap) / 2
+            width: limitsRow.wide ? page.cw - week.width - past.width - 2 * Ui.gap : (page.cw - Ui.gap) / 2
             height: past.height
         }
     }
@@ -168,21 +169,29 @@ Page {
             }
         }
     }
-    Row {
+    Flow {
         id: kpis
         visible: !page.empty && !!page.snap
         width: page.cw
         spacing: Ui.gap
+        // five across down to a 700 px page (smaller numbers, no note), then three and two
+        readonly property int columns: page.cw >= 700 ? 5 : 3
+        function cardW(i) { var c = columns === 5 || i < 3 ? columns : 2; return (page.cw - Ui.gap * (c - 1)) / c - 0.01 }  // a hair short so rounding never wraps a row
         readonly property var hues: ({ cost: Ui.seriesColor(1), tokens: Ui.seriesColor(6), sessions: Ui.seriesColor(0), agent_time: Ui.seriesColor(2), cache_hit: Ui.seriesColor(4) })
         Repeater {
-            model: page.snap ? page.snap.kpis : []
+            // a count, not the array, so cards persist across snapshots and their values animate
+            model: page.snap ? page.snap.kpis.length : 0
             KpiCard {
-                width: (page.cw - Ui.gap * (page.snap.kpis.length - 1)) / page.snap.kpis.length
+                readonly property var raw: page.snap && page.snap.kpis[index] ? page.snap.kpis[index] : null
+                // Cost KPIs come rounded to cents, which can round a dollar
+                // differently than the timeline total; show both from one number.
+                readonly property var kk: raw && raw.key === "cost" ? Object.assign({}, raw, { value: page.snap.timeline.totals.cost }) : raw
+                width: kpis.cardW(index)
                 height: 180
-                k: modelData
-                hue: kpis.hues[modelData.key] || Ui.p.accent
-                dropLast: page.snap.timeline.partial_last && modelData.series.length === page.snap.timeline.starts.length
-                smoothing: page.snap.timeline.bucket === "6h" || page.snap.timeline.bucket === "hour" ? 1 : modelData.series.length > 40 ? 2 : 0
+                k: kk
+                hue: kk ? kpis.hues[kk.key] || Ui.p.accent : Ui.p.accent
+                dropLast: !!kk && page.snap.timeline.partial_last && kk.series.length === page.snap.timeline.starts.length
+                smoothing: kk && kk.series.length > 20 ? 1 : 0
             }
         }
     }
@@ -192,6 +201,8 @@ Page {
         height: implicitHeight
         tl: page.snap ? page.snap.timeline : null
         range: page.range
+        chartH: Math.max(300, Math.min(440, page.viewH * 0.36))
+        dataKey: page.snap ? page.snap.range.key + "|" + (page.snap.project || "") : ""
         scoped: !!(page.snap && page.snap.project)
     }
     Item {
@@ -205,7 +216,10 @@ Page {
             padding: 0
             width: lower.wide ? (page.cw - Ui.gap) * 0.6 : page.cw
             height: 24 + 40 + 12 + top.implicitHeight + 56
-            readonly property var rows: page.snap ? page.snap.sessions.slice().sort(function (a, b) { return b.cost - a.cost }).slice(0, 10) : []
+            // top_sessions ranks the whole range; sessions is capped to the most recent
+            readonly property bool ranked: !!(page.snap && page.snap.top_sessions)
+            readonly property var rows: !page.snap ? [] : ranked ? page.snap.top_sessions.slice(0, 10)
+                : page.snap.sessions.slice().sort(function (a, b) { return b.cost - a.cost }).slice(0, 10)
             Item {
                 x: Ui.pad; y: 24
                 width: parent.width - 2 * Ui.pad; height: 40
@@ -228,7 +242,10 @@ Page {
                 Rectangle { width: parent.width; height: 1; color: Ui.p.line; y: -1 }
                 Txt {
                     height: 40
-                    text: page.snap ? "Showing " + sessCard.rows.length + " of " + Ui.plural(page.snap.sessions_total, "session") + " " + Ui.inRange(page.snap.range) + "." : ""
+                    text: !page.snap ? ""
+                        : !sessCard.ranked && page.snap.sessions_total > page.snap.sessions.length
+                        ? "Top " + sessCard.rows.length + " by cost among the " + Ui.int(page.snap.sessions.length) + " most recent sessions."
+                        : "Showing " + sessCard.rows.length + " of " + Ui.plural(page.snap.sessions_total, "session") + " " + Ui.inRange(page.snap.range) + "."
                     font.pixelSize: 12; color: Ui.p.text_faint
                 }
                 Btn { anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; text: "All sessions"; glyph: ""; onClicked: page.openSessions() }

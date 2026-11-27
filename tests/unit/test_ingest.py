@@ -1,10 +1,11 @@
 import json
 import os
+import time
 from datetime import datetime, timezone
 
 import pytest
 
-from claude_usage import ingest, store
+from claude_usage import ingest, pricing, store
 
 
 def _iso(local_dt: datetime) -> str:
@@ -315,3 +316,301 @@ def test_interrupted_message_counts_its_thinking_as_output(env):
     write(root, "C--work-acme-api/s1.jsonl", [json.dumps(rec, separators=(",", ":"))])
     ingest.Ingestor(conn, root).index()
     assert rows(conn)[0][1] == 900
+
+
+def test_file_deleted_between_walk_and_read_is_skipped(env, monkeypatch):
+    root, conn = env
+    write(root, "C--work-acme-api/s1.jsonl", [asst("m1", _ts(0))])
+    gone = write(root, "C--work-acme-api/s2.jsonl", [asst("m2", _ts(1), sid="s2")])
+    ing = ingest.Ingestor(conn, root)
+    walk = ing._walk
+
+    def walk_then_cleanup():
+        found = walk()
+        os.remove(gone)  # Claude Code's cleanup can delete old transcripts during the first long index
+        return found
+
+    monkeypatch.setattr(ing, "_walk", walk_then_cleanup)
+    result = ing.index(cancel=lambda: False)
+    assert not result["cancelled"] and [r[0] for r in rows(conn)] == ["m1"]
+
+
+def test_streamed_message_across_midnight_read_in_two_ticks(env):
+    root, conn = env
+    path = write(root, "C--work-acme-api/s1.jsonl", [asst("m1", _iso(datetime(2026, 11, 20, 23, 59, 58)), out=5)])
+    ing = ingest.Ingestor(conn, root, clock=lambda: datetime(2026, 11, 21, 0, 0, 10).timestamp())
+    ing.index()
+    with open(path, "a", encoding="utf-8", newline="") as fh:
+        fh.write(asst("m1", _iso(datetime(2026, 11, 21, 0, 0, 4)), out=500) + "\n")
+    ing.tail()
+    assert rows(conn, "SELECT day, output FROM calls") == [("2026-11-20", 500)]
+    assert rows(conn, "SELECT day, SUM(output) FROM rollup_day GROUP BY day") == [("2026-11-20", 500)]
+
+
+def test_subagent_copy_under_another_session_folder_keeps_its_session(env):
+    root, conn = env
+    write(root, "C--work-acme-api/s1.jsonl", [asst("m1", _ts(0))])
+    agent = [asst("m2", _ts(1), agentId="a1", isSidechain=True), asst("m3", _ts(2), agentId="a1", isSidechain=True)]
+    write(root, "C--work-acme-api/s1/subagents/agent-a1.jsonl", agent)
+    write(root, "C--work-acme-api/s2/subagents/agent-a1.jsonl", agent)  # the same file copied under s2
+    ingest.Ingestor(conn, root).index()
+    assert rows(conn, "SELECT session_id, COUNT(*) FROM calls GROUP BY 1") == [("s1", 3)]
+    assert rows(conn, "SELECT session_id FROM sessions") == [("s1",)]
+
+
+def test_every_attempt_of_a_fallback_response_is_billed(env):
+    root, conn = env
+    rec = json.loads(asst("m1", _ts(0), out=264, inp=412, model="claude-opus-4-8"))
+    rec["message"]["usage"]["iterations"] = [
+        {"type": "message", "model": "claude-fable-5-2", "input_tokens": 535, "output_tokens": 40},  # declined mid-stream
+        {"type": "message", "model": "claude-fable-5-2", "input_tokens": 535, "output_tokens": 0},  # declined at once
+        {"type": "fallback_message", "model": "claude-opus-4-8", "input_tokens": 412, "output_tokens": 264},
+    ]
+    write(root, "C--work-acme-api/s1.jsonl", [json.dumps(rec, separators=(",", ":"))])
+    ingest.Ingestor(conn, root).index()
+    assert rows(conn, "SELECT msg_id, model, input, output FROM calls ORDER BY msg_id") == [
+        ("m1", "claude-opus-4-8", 412, 264), ("m1#0", "claude-fable-5-2", 535, 40)]
+
+
+def test_single_attempt_fills_a_zeroed_top_level_usage(env):
+    root, conn = env
+    rec = json.loads(asst("m1", _ts(0), out=0, inp=0))
+    rec["message"]["usage"]["iterations"] = [{"type": "message", "input_tokens": 7, "output_tokens": 90,
+                                              "cache_read_input_tokens": 300, "cache_creation_input_tokens": 0}]
+    write(root, "C--work-acme-api/s1.jsonl", [json.dumps(rec, separators=(",", ":"))])
+    ingest.Ingestor(conn, root).index()
+    assert rows(conn, "SELECT input, output, cache_read FROM calls") == [(7, 90, 300)]
+
+
+def test_us_only_inference_is_kept_as_a_price_tier(env):
+    root, conn = env
+    rec = json.loads(asst("m1", _ts(0)))
+    rec["message"]["usage"]["inference_geo"] = "us"
+    write(root, "C--work-acme-api/s1.jsonl", [json.dumps(rec, separators=(",", ":")), asst("m2", _ts(1))])
+    ingest.Ingestor(conn, root).index()
+    assert rows(conn, "SELECT msg_id, speed FROM calls ORDER BY msg_id") == [("m1", "standard+us"), ("m2", "standard")]
+
+
+def test_fork_copy_keeps_the_session_that_made_the_call(tmp_path):
+    # A resumed or forked session starts with a copy of its parent's records, timestamps and all.
+    orig = [asst("m1", _ts(0), sid="zz-orig")]
+    fork = [asst("m1", _ts(0), sid="aa-fork"), asst("m2", _iso(datetime(2026, 11, 21, 10, 0)), sid="aa-fork")]
+    got = []
+    for live in (False, True):
+        root = str(tmp_path / f"projects-{live}")
+        conn = store.connect(str(tmp_path / f"usage-{live}.db"))
+        ing = ingest.Ingestor(conn, root)
+        write(root, "C--work-acme-api/zz-orig.jsonl", orig)
+        if live:
+            ing.index()  # the live app read the original before the fork existed
+        time.sleep(0.05)  # the fork's file is created later, though its name sorts first
+        write(root, "C--work-acme-api/aa-fork.jsonl", fork)
+        ing.index()
+        got.append(rows(conn, "SELECT day, session_id FROM rollup_day ORDER BY day"))
+    assert got[0] == got[1] == [("2026-11-20", "zz-orig"), ("2026-11-21", "aa-fork")]
+
+
+class _Unreadable:
+    def __init__(self, fh):
+        self.fh = fh
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.fh.close()
+
+    def seek(self, n):
+        self.fh.seek(n)
+
+    def readline(self, n=-1):
+        raise OSError(22, "Invalid argument")
+
+    read = readline
+
+
+def test_a_read_error_does_not_hold_up_later_files(env, monkeypatch):
+    root, conn = env
+    for i in (1, 2, 3):
+        write(root, f"C--work-acme-api/s{i}.jsonl", [asst(f"m{i}", _ts(i), sid=f"s{i}")])
+    real_open = open
+    monkeypatch.setattr(ingest, "open", lambda path, *a, **k: _Unreadable(real_open(path, *a, **k))
+                        if path.endswith("s2.jsonl") else real_open(path, *a, **k), raising=False)
+    ing = ingest.Ingestor(conn, root)
+    for _ in range(3):  # what the worker does every tick
+        ing.tail()
+    assert [r[0] for r in rows(conn)] == ["m1", "m3"]
+    monkeypatch.undo()
+    ing.index()
+    assert [r[0] for r in rows(conn)] == ["m1", "m2", "m3"]
+
+
+def test_absurd_numbers_and_nesting_are_skipped(env):
+    root, conn = env
+    huge = asst("m1", _ts(0)).replace('"output_tokens":10', '"output_tokens":1e999')
+    deep = '{"type":"assistant","usage":' + "[" * 100_000 + "]" * 100_000 + "}"
+    write(root, "C--work-acme-api/s1.jsonl", [huge, deep, asst("m2", _ts(1))])
+    ingest.Ingestor(conn, root).index()
+    assert [r[0] for r in rows(conn)] == ["m2"]
+
+
+def _with(line, usage=None, content=None):
+    rec = json.loads(line)
+    if usage is not None:
+        rec["message"]["usage"] = usage
+    if content is not None:
+        rec["message"]["content"] = content
+    return json.dumps(rec, separators=(",", ":"))
+
+
+def _it(kind, inp, out, read=0, model=None):
+    x = {"type": kind, "input_tokens": inp, "output_tokens": out, "cache_read_input_tokens": read,
+         "cache_creation_input_tokens": 0}
+    return dict(x, model=model) if model else x
+
+
+def test_advisor_calls_are_billed_on_top_of_the_executor(env):
+    # The advisor tool docs' example: top-level usage is the sum of the executor's 'message' entries.
+    root, conn = env
+    final = {"input_tokens": 1760, "output_tokens": 531, "cache_read_input_tokens": 412,
+             "cache_creation_input_tokens": 0, "iterations": [
+                 _it("message", 412, 89), _it("advisor_message", 823, 1612, model="claude-opus-5-5"),
+                 _it("message", 1348, 442, 412)]}
+    early = {"input_tokens": 412, "output_tokens": 5, "cache_read_input_tokens": 0}  # an earlier streamed line
+    line = asst("m1", _ts(0), model="claude-sonnet-5-5")
+    write(root, "C--work-acme-api/s1.jsonl", [_with(line, early), _with(line, final)])
+    ingest.Ingestor(conn, root).index()
+    assert rows(conn, "SELECT model, SUM(input), SUM(output), SUM(cache_read) FROM calls GROUP BY 1 ORDER BY 1") == [
+        ("claude-opus-5-5", 823, 1612, 0), ("claude-sonnet-5-5", 412 + 1348, 89 + 442, 412)]
+
+
+@pytest.mark.parametrize("its,top,want", [
+    ([_it("compaction", 180_000, 3500), _it("message", 23_000, 1000)], (23_000, 1000), (203_000, 4500)),
+    ([_it("message", 5000, 200), _it("compaction", 180_000, 3500), _it("message", 23_000, 1000)], (28_000, 1200),
+     (208_000, 4700)),
+])
+def test_compaction_inside_a_response_is_billed_once(env, its, top, want):
+    root, conn = env
+    usage = {"input_tokens": top[0], "output_tokens": top[1], "iterations": its}
+    write(root, "C--work-acme-api/s1.jsonl", [_with(asst("m1", _ts(0)), usage)])
+    ingest.Ingestor(conn, root).index()
+    assert rows(conn, "SELECT SUM(input), SUM(output) FROM calls") == [want]
+
+
+def test_a_decline_before_any_output_is_billed_only_in_billed_categories(env):
+    root, conn = env
+    lines = []
+    for mid, category in (("m1", "bio"), ("m2", "cyber")):
+        line = asst(mid, _ts(0), model="claude-opus-4-8")
+        block = {"type": "fallback", "from": {"model": "claude-fable-5"}, "to": {"model": "claude-opus-4-8"},
+                 "trigger": {"type": "refusal", "category": category}}
+        final = {"input_tokens": 412, "output_tokens": 264, "iterations": [
+            _it("message", 535, 0, model="claude-fable-5"), _it("fallback_message", 412, 264, model="claude-opus-4-8")]}
+        lines += [_with(line, {"input_tokens": 412, "output_tokens": 1}, [block]),
+                  _with(line, final, [{"type": "text", "text": "ok"}])]
+    write(root, "C--work-acme-api/s1.jsonl", lines)
+    ingest.Ingestor(conn, root).index()
+    assert rows(conn, "SELECT msg_id, model, input, output FROM calls ORDER BY msg_id") == [
+        ("m1", "claude-opus-4-8", 412, 264), ("m1#0", "claude-fable-5", 535, 0), ("m2", "claude-opus-4-8", 412, 264)]
+
+
+def test_a_main_transcript_newer_than_its_subagent_file_still_names_the_project(env):
+    root, conn = env
+    write(root, "C--work-acme-api/s1/subagents/agent-a1.jsonl",
+          [asst("m2", _ts(1), agentId="a1", isSidechain=True, cwd=r"C:\work\acme-api\site")])
+    time.sleep(0.05)  # the main file was rewritten later (a copy, an import), so it is the newer file
+    write(root, "C--work-acme-api/s1.jsonl", [asst("m1", _ts(0))])
+    ingest.Ingestor(conn, root).index()
+    assert rows(conn, "SELECT DISTINCT project FROM calls") == [("acme-api",)]
+
+
+@pytest.mark.parametrize("copy_sid", ["aa-fork", "zz-orig"])  # copies carry the fork's id, or keep the original's
+def test_a_copied_turn_does_not_rewrite_the_original(env, copy_sid):
+    root, conn = env
+    write(root, "C--work-acme-api/zz-orig.jsonl", [prompt("p1", _ts(0), sid="zz-orig"), asst("m1", _ts(1), sid="zz-orig"),
+                                                   asst("m2", _ts(5), sid="zz-orig")])
+    time.sleep(0.05)  # a later file copied the turn before its last reply, then had a turn of its own
+    write(root, "C--work-acme-api/aa-fork.jsonl", [prompt("p1", _ts(0), sid=copy_sid), asst("m1", _ts(1), sid=copy_sid),
+                                                   prompt("p2", _ts(60), sid="aa-fork"), asst("m3", _ts(61), sid="aa-fork")])
+    ingest.Ingestor(conn, root).index()
+    assert rows(conn, "SELECT uuid, session_id, duration_ms FROM turns ORDER BY uuid") == [
+        ("p1", "zz-orig", 5 * 60_000), ("p2", "aa-fork", 60_000)]
+
+
+@pytest.mark.parametrize("fast_first", [False, True])
+def test_the_fullest_line_names_the_price_tier(env, fast_first):
+    # Early streamed lines can lack usage.speed; the final line says the call ran in fast mode.
+    root, conn = env
+    line = asst("m1", _ts(0), model="claude-opus-5-5")
+    early = _with(line, {"input_tokens": 100, "output_tokens": 3})
+    final = _with(line, {"input_tokens": 100, "output_tokens": 4000, "speed": "fast"})
+    write(root, "C--work-acme-api/s1.jsonl", [final, early] if fast_first else [early, final])
+    ingest.Ingestor(conn, root).index()
+    (model, speed, i, o), = rows(conn, "SELECT model, speed, input, output FROM calls")
+    assert (speed, i, o) == ("fast", 100, 4000)
+    assert pricing.call_cost(model, i, o, speed=speed) == pytest.approx(2 * pricing.call_cost(model, i, o))
+
+
+def test_a_refusal_before_any_output_is_billed_only_in_billed_categories(env):
+    root, conn = env
+    lines = []
+    for mid, category in (("m1", "cyber"), ("m2", None), ("m3", "bio")):
+        line = asst(mid, _ts(0))
+        refused = json.loads(_with(line, {"input_tokens": 900, "output_tokens": 0, "cache_read_input_tokens": 5000}))
+        refused["message"]["stop_reason"] = "refusal"
+        refused["message"]["stop_details"] = {"type": "refusal", "category": category}
+        # an earlier streamed line already stored the prompt's tokens
+        lines += [_with(line, {"input_tokens": 900, "output_tokens": 0, "cache_read_input_tokens": 5000}),
+                  json.dumps(refused, separators=(",", ":"))]
+    write(root, "C--work-acme-api/s1.jsonl", lines)
+    ingest.Ingestor(conn, root).index()
+    assert rows(conn, "SELECT msg_id, input, cache_read FROM calls ORDER BY msg_id") == [
+        ("m1", 0, 0), ("m2", 0, 0), ("m3", 900, 5000)]
+    assert rows(conn, "SELECT SUM(calls), SUM(input) FROM rollup_day") == [(3, 900)]
+
+
+@pytest.mark.parametrize("copy_sid", ["aa-fork", "zz-orig"])
+def test_a_fork_copy_read_over_two_ticks_adds_no_turn(env, copy_sid):
+    root, conn = env
+    orig = [prompt("p1", _ts(0), sid="zz-orig"), asst("m1", _ts(1), sid="zz-orig"),
+            turn_duration("d1", _ts(2), 120_000, sid="zz-orig")]
+    write(root, "C--work-acme-api/zz-orig.jsonl", orig)
+    ing = ingest.Ingestor(conn, root)
+    ing.index()
+    time.sleep(0.05)
+    copied = [ln.replace('"sessionId":"zz-orig"', f'"sessionId":"{copy_sid}"') for ln in orig]
+    fork = write(root, "C--work-acme-api/aa-fork.jsonl", copied[:2])  # a tick lands inside the copied history
+    ing.tail()
+    with open(fork, "a", encoding="utf-8", newline="") as fh:
+        fh.write(copied[2] + "\n")
+    ing.tail()
+    fresh = store.connect(":memory:")
+    ingest.Ingestor(fresh, root).index()
+    sql = "SELECT uuid, session_id, duration_ms FROM turns ORDER BY uuid"
+    assert rows(conn, sql) == rows(fresh, sql) == [("p1", "zz-orig", 120_000)]
+
+
+def test_a_transcript_rewritten_to_a_larger_size_is_read_again(env):
+    root, conn = env
+    write(root, "C--work-acme-api/s1.jsonl", [asst("m1", _ts(1)), asst("m2", _ts(2))])
+    ing = ingest.Ingestor(conn, root)
+    ing.index()
+    # A bulk import rewrote it with earlier history in front; lines of uneven length, so the old end is mid-line.
+    write(root, "C--work-acme-api/s1.jsonl", [asst("m0", _ts(0), out=12345), asst("m1", _ts(1)), asst("m2", _ts(2)),
+                                              asst("m3", _ts(3))])
+    ing.index()
+    assert [r[0] for r in rows(conn)] == ["m0", "m1", "m2", "m3"]
+
+
+def test_a_file_created_in_the_clock_tick_of_the_last_look_is_found(env):
+    root, conn = env
+    write(root, "C--work-acme-api/s1.jsonl", [asst("m1", _ts(0))])
+    ing = ingest.Ingestor(conn, root)
+    ing.index()
+    write(root, "C--work-acme-api/s1/subagents/agent-a1.jsonl", [asst("m2", _ts(1), agentId="a1")])
+    ing.tail()
+    d = os.path.join(root, "C--work-acme-api", "s1", "subagents")
+    write(root, "C--work-acme-api/s1/subagents/agent-a2.jsonl", [asst("m3", _ts(2), agentId="a2")])
+    os.utime(d, ns=(ing._dirs[d], ing._dirs[d]))  # parallel subagents: the directory mtime did not move
+    ing.tail()
+    assert [r[0] for r in rows(conn)] == ["m1", "m2", "m3"]

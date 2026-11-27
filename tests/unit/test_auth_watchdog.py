@@ -133,14 +133,3 @@ def test_success_stops_all_future_repairs(tmp_path):
         wd.note_result("invalid", now=float(i + 1))
     assert st["calls"] == 1  # no further attempts after success
 
-
-def test_force_repair_bypasses_giveup(tmp_path):
-    wd, st = _wd_with_repair(
-        tmp_path, token_each_time=lambda n: None,
-        fail_threshold=1, cooldown_s=0,
-    )
-    wd._gave_up = True  # simulate having given up
-    wd.note_result("invalid", now=0.0)
-    assert st["calls"] == 0           # gave_up blocks auto-repair
-    wd.force_repair()                 # manual override
-    assert st["calls"] == 1

@@ -79,3 +79,36 @@ def test_old_api_still_works():
     b = calculate_cost("claude-opus-5-5", 0, 0, cache_read=M, cache_creation=M)
     assert b["cache_creation"] == pytest.approx(5.0) and b["cache_savings"] == pytest.approx(3.8)
     assert pricing.MODEL_PRICING["claude-sonnet-4-6"]["input"] == 3.0
+
+
+@pytest.mark.parametrize("model,canonical", [
+    ("us.anthropic.claude-sonnet-4-5-20250929-v1:0", "claude-sonnet-4-5"),  # Bedrock cross-region
+    ("anthropic.claude-opus-5-5", "claude-opus-5-5"),  # Bedrock
+    ("claude-opus-4-5@20251101", "claude-opus-4-5"),  # Vertex
+    ("claude-opus-4-1-20250805", "claude-opus-4-1"),
+])
+def test_platform_and_dated_ids_resolve_exactly(model, canonical):
+    assert resolve(model) == (canonical, pricing.PRICES[canonical], "exact")
+
+
+def test_retired_models_keep_their_own_rates():
+    assert call_cost("claude-opus-4-20250514", 0, M, 0, 0, 0) == pytest.approx(75.0)
+    assert call_cost("claude-sonnet-4-20250514", M, 0, 0, 0, 0) == pytest.approx(3.0)
+
+
+def test_us_only_inference_costs_a_tenth_more():
+    assert call_cost("claude-opus-5-5", 0, M, 0, 0, 0, speed="standard+us") == pytest.approx(22.0)
+    assert call_cost("claude-opus-5-5", 0, M, M, 0, 0, speed="fast+us") == pytest.approx(2 * 1.1 * (20 + 0.20))
+
+
+@pytest.mark.parametrize("model", ["claude-3-5-haiku-20241022", "claude-3-7-sonnet-20250219", "claude-3-opus-20240229"])
+def test_claude_3_ids_are_flagged_not_priced_at_todays_cards(model):
+    assert resolve(model)[1:] == (None, "unpriced")
+
+
+@pytest.mark.parametrize("model", [
+    "claude-opus-5-5-fast", "claude-opus-5-5-fast-20261101", "claude-opus-5-5-20261101-fast"])
+def test_fast_deployment_names_bill_fast_mode_once(model):
+    assert resolve(model) == ("claude-opus-5-5", pricing.PRICES["claude-opus-5-5"], "exact")
+    assert call_cost(model, 0, M, 0, 0, 0) == pytest.approx(40.0)
+    assert call_cost(model, 0, M, 0, 0, 0, speed="fast") == pytest.approx(40.0)

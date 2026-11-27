@@ -12,6 +12,18 @@ Card {
     padding: 0
     implicitHeight: 180
 
+    // the headline counts to a new value when the range or project changes
+    property real shown: k ? k.value : 0
+    Behavior on shown { id: countUp; NumberAnimation { duration: 300; easing.type: Easing.OutCubic } }
+    property string shownKey: ""
+    onKChanged: {
+        if (!k) return
+        countUp.enabled = shownKey === k.key
+        shown = k.value
+        countUp.enabled = true
+        shownKey = k.key
+    }
+
     readonly property var delta: {
         if (!k || k.delta == null || k.prev == null) return null
         var d, txt
@@ -37,6 +49,15 @@ Card {
             // a rate of 0 means no calls in that bucket, not a 0% rate: hold the last known value
             var seen = v.filter(function (x) { return x > 0 }), last = seen.length ? seen[0] : 0
             v = v.map(function (x) { if (x > 0) last = x; return last })
+        }
+        // 90 daily points in a 240 px card read as noise; average them in pairs or threes
+        if (v.length > 60) {
+            var step = Math.ceil(v.length / 45), out = []
+            for (var i = 0; i < v.length; i += step) {
+                var part = v.slice(i, i + step)
+                out.push(part.reduce(function (a, b) { return a + b }, 0) / part.length)
+            }
+            v = out
         }
         return Ui.smooth(v, smoothing)
     }
@@ -71,11 +92,12 @@ Card {
         Txt {
             width: parent.width
             height: 38
-            text: card.k ? Ui.fmt(card.k.format, card.k.value) : ""
+            text: card.k ? Ui.fmt(card.k.format, card.shown) : ""
             display: true
-            font.pixelSize: 28
+            fontSizeMode: Text.HorizontalFit
+            minimumPixelSize: 18
+            font.pixelSize: card.width < 180 ? 22 : 28
             font.weight: 600
-            font.features: ({})
         }
         Row {
             spacing: 6
@@ -94,6 +116,7 @@ Card {
                 }
             }
             Txt {
+                visible: card.width >= 150
                 height: 20
                 width: Math.min(implicitWidth, card.width - 40 - (card.delta ? dl.implicitWidth + 18 : 0))
                 text: card.k ? card.k.note : ""

@@ -12,6 +12,7 @@ T.TextField {
     selectionColor: Ui.alpha(Ui.p.accent, 0.35)
     selectedTextColor: Ui.p.text
     font.family: Ui.fontUi
+    font.variableAxes: Ui.axes(false)
     font.pixelSize: 13
     verticalAlignment: TextInput.AlignVCenter
     selectByMouse: true

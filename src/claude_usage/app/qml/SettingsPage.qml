@@ -91,7 +91,7 @@ Page {
 
     SettingsGroup {
         width: page.colW
-        title: "Notifications"
+        title: "Alerts and thresholds"
         SettingRow {
             first: true
             label: "Limit alerts"
@@ -102,11 +102,10 @@ Page {
                 onToggled: backend.setSetting("notifications_enabled", checked)
             }
         }
+        // the thresholds also colour the meters, so they stay live with alerts off
         SettingRow {
             label: "Caution at"
-            hint: "The overlay meter turns amber."
-            enabled: page.s.notifications_enabled !== false
-            opacity: enabled ? 1 : 0.5
+            hint: "Meters turn amber, and an alert fires if alerts are on."
             Txt { height: 24; width: 44; horizontalAlignment: Text.AlignRight; text: Ui.pct(ca.value) }
             SliderX {
                 id: ca
@@ -119,9 +118,7 @@ Page {
         }
         SettingRow {
             label: "Critical at"
-            hint: "The overlay meter turns red."
-            enabled: page.s.notifications_enabled !== false
-            opacity: enabled ? 1 : 0.5
+            hint: "Meters turn red, and an alert fires if alerts are on."
             Txt { height: 24; width: 44; horizontalAlignment: Text.AlignRight; text: Ui.pct(cr.value) }
             SliderX {
                 id: cr
