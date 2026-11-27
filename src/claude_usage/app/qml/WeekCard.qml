@@ -8,7 +8,7 @@ Card {
     property real nowMs: Date.now()
     property bool stale: false
     // kept short so the KPI row still shows below the limits at 1280x820
-    readonly property real natural: head.height + 8 + big.height + 8 + verdict.height + 8 + 140 + 16 + facts.height + 2 * padding
+    readonly property real natural: head.height + 8 + big.height + 8 + verdict.height + 8 + 112 + 16 + facts.height + 2 * padding
 
     readonly property bool ok: !!w
     readonly property var reset: ok && w.resets_at ? Ui.date(w.resets_at) : null
@@ -78,7 +78,7 @@ Card {
         id: chart
         y: verdict.y + verdict.height + 8
         width: parent.width
-        height: Math.max(120, facts.y - y - 16)
+        height: Math.max(104, facts.y - y - 16)
         w: card.w
     }
     Rectangle { y: facts.y - 16; width: parent.width; height: 1; color: Ui.p.line }

@@ -115,23 +115,34 @@ Card {
                 }
                 Txt { height: 16; text: "More"; font.pixelSize: 11; color: Ui.p.text_faint; leftPadding: 4 }
             }
+            function showCell(c) {
+                var d = c.d, dt = Ui.date(d.date + "T12:00:00")
+                tip.title = Ui.wmd(dt) + ", " + dt.getFullYear()
+                tip.value = d.agent_ms ? Ui.dur(d.agent_ms) + " agent time" : "No agent time"
+                tip.rows = d.cost ? [{ c: Ui.p.text_faint, name: "Cost", v: Ui.cents(d.cost) }] : []
+                tip.note = c.last ? "Today so far." : d.partial ? "Partial: transcripts for this day were cleaned up, so this is a lower bound." : ""
+                hl.cx = c.cx; hl.cy = c.cy; hl.visible = true
+                tip.showAt(grid, c.cx, c.cy - grid.r)
+            }
+            function clear() { tip.hide(); hl.visible = false }
             MouseArea {
                 width: parent.width; height: parent.height - 24
                 hoverEnabled: true
-                onExited: { tip.hide(); hl.visible = false }
+                onExited: grid.clear()
                 onPositionChanged: function (m) {
                     var best = null, bd = 1e9
                     grid.cells.forEach(function (c) { var d = Math.hypot(c.cx - m.x, c.cy - m.y); if (d < bd) { bd = d; best = c } })
-                    if (!best || bd > grid.r) { tip.hide(); hl.visible = false; return }
-                    var d = best.d, dt = Ui.date(d.date + "T12:00:00")
-                    tip.title = Ui.wmd(dt) + ", " + dt.getFullYear()
-                    tip.value = d.agent_ms ? Ui.dur(d.agent_ms) + " agent time" : "No agent time"
-                    tip.rows = d.cost ? [{ c: Ui.p.text_faint, name: "Cost", v: Ui.cents(d.cost) }] : []
-                    tip.note = best.last ? "Today so far." : d.partial ? "Partial: transcripts for this day were cleaned up, so this is a lower bound." : ""
-                    hl.cx = best.cx; hl.cy = best.cy; hl.visible = true
-                    tip.showAt(grid, best.cx, best.cy - grid.r)
+                    if (!best || bd > grid.r) grid.clear()
+                    else grid.showCell(best)
                 }
             }
+            // Left and Right step through the days, starting from today
+            activeFocusOnTab: cells.length > 0
+            property int kb: -1
+            Keys.onLeftPressed: { kb = kb < 0 ? cells.length - 1 : Math.max(0, kb - 1); showCell(cells[kb]) }
+            Keys.onRightPressed: { kb = kb < 0 ? cells.length - 1 : Math.min(cells.length - 1, kb + 1); showCell(cells[kb]) }
+            onActiveFocusChanged: if (!activeFocus) { kb = -1; clear() }
+            Focus { show: grid.activeFocus; r: 8 }
             ChartTip { id: tip }
             Accessible.role: Accessible.Chart
             Accessible.name: "Agent time per day: " + (card.act ? card.act.active_days + " active days of " + card.act.span_days : "")

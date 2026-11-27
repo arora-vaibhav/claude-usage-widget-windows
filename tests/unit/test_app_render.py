@@ -104,6 +104,12 @@ STATES = {
     "error": lambda s: s["status"].update(state="error", message="Could not read the usage store."),
     "no_weekly": lambda s: s["limits"].update(weekly=None, past_weeks=[], weeks_hit=0, weeks_counted=0),
     "with_5h": lambda s: s["limits"].update(session={"pct": 0.4, "resets_at": s["range"]["to"], "level": "normal"}),
+    "5h_not_started": lambda s: s["limits"].update(session={"pct": 0.0, "resets_at": None, "level": "normal"}),
+    "ultra": lambda s: (s["status"].update(plan="Ultra"),
+                        s["limits"].update(session=None, session_note="Ultra has a weekly limit and no 5-hour limit.")),
+    "limits_failed": lambda s: (s["status"].update(state="error", message="Can't reach the usage API. Check your network."),
+                                s["limits"].update(weekly=None, session=None, past_weeks=[], weeks_hit=0, weeks_counted=0)),
+    "limits_pending": lambda s: (s["status"].update(state="loading"), s["limits"].update(weekly=None, session=None)),
     "empty": lambda s: (s.update(sessions=[], sessions_total=0, project="nothing-here"),
                         [g["values"][m].__setitem__(i, [0] * len(g["values"][m][i]))
                          for g in s["timeline"]["by"].values() for m in g["values"] for i in range(len(g["values"][m]))]),
@@ -200,25 +206,6 @@ def test_first_snapshot_loads_fast():
         win.window.close()
 
 
-def test_series_past_the_palette_get_their_own_colour(h):
-    snap = copy.deepcopy(h.snap)
-    g = snap["timeline"]["by"]["project"]
-    named = [k for k, c in zip(g["keys"], g["colors"]) if c >= 0][:5]
-    g["colors"] = [[2, 16, 4, 0, 15][named.index(k)] if k in named else -1 for k in g["keys"]]
-    for p in snap["projects"]:
-        if p["name"] == named[1]:
-            p["color"] = 16
-    h.win.update_snapshot(snap)
-    pump(60)
-    shown = js(h.win.window.property("snap"))
-    colors = [c for c in shown["timeline"]["by"]["project"]["colors"] if c != -1]
-    assert len(set(colors)) == len(colors) and all(0 <= c < 8 for c in colors)
-    sidebar = {p["name"]: p["color"] for p in shown["projects"]}
-    assert sidebar[named[1]] == colors[named.index(named[1])]
-    h.win.update_snapshot(h.snap)
-    pump(60)
-
-
 def test_legend_click_leaves_the_rest_of_the_chart_at_full_strength(h):
     from PySide6.QtCore import QPoint, QPointF, Qt
     from PySide6.QtTest import QTest
@@ -256,7 +243,7 @@ def test_pace_charts_always_label_this_week(h):
 
 
 def test_top_sessions_come_from_the_whole_range(h):
-    # sessions is capped to the most recent; top_sessions ranks the whole range
+    # the table shows top_sessions, not the first rows of the capped sessions list
     snap = copy.deepcopy(h.snap)
     top = copy.deepcopy(snap["sessions"][0])
     top.update(id="the-costliest", cost=10 ** 6)
@@ -354,35 +341,6 @@ def test_past_weeks_quote_the_weekly_card_for_this_week(h):
     finally:
         h.win.update_snapshot(h.snap)
         pump(60)
-
-
-def test_colours_past_the_palette_stick_across_ranges(h):
-    base = copy.deepcopy(h.snap)
-    g = base["timeline"]["by"]["project"]
-    named = [k for k, c in zip(g["keys"], g["colors"]) if c >= 0][:5]
-
-    def shown(colors, key):
-        snap = copy.deepcopy(base)
-        snap["range"]["key"] = key
-        gg = snap["timeline"]["by"]["project"]
-        gg["colors"] = [colors[named.index(k)] if k in named else -1 for k in gg["keys"]]
-        h.win.update_snapshot(snap)
-        pump(30)
-        out = js(h.win.window.property("snap"))["timeline"]["by"]["project"]
-        return dict(zip(out["keys"], out["colors"]))
-
-    # Real ranks are all-time, so they do not move between snapshots like
-    # this; forget what the earlier tests' made-up ranks left behind.
-    qml_eval(h, "(Ui.slots = ({}), 0)")
-    try:
-        first = shown([0, 1, 12, 2, 3], "7d")[named[2]]
-        # a higher-ranked newcomer must not take the slot named[2] already has
-        again = shown([0, 9, 12, 2, 3], "24h")
-        assert again[named[2]] == first and again[named[1]] not in (first, 0, 2, 3)
-        assert json.loads(h.settings["series_slots"])["p:" + named[2]] == first
-    finally:
-        h.win.update_snapshot(h.snap)
-        pump(30)
 
 
 def test_a_refresh_that_changed_nothing_skips_the_rebuild(h):
@@ -618,6 +576,142 @@ def test_the_kpi_row_is_in_the_first_screen(h):
     pump()
     bottoms = [k.mapToItem(page, QPointF(0, k.height())).y() for k in find_in(page, "KpiCard") if k.isVisible()]
     assert len(bottoms) == 5 and max(bottoms) <= page.height(), (bottoms, page.height())
+    # and the head of the timeline: its label and the range total
+    tl = find_in(page, "TimelineCard")[0]
+    total = [t for t in find_in(tl, "Txt") if t.property("display")][0]
+    assert total.mapToItem(page, QPointF(0, total.height())).y() <= page.height()
+
+
+def visible_texts(win, cls="OverviewPage"):
+    return [t.property("text") for t in find_in(find(win, cls)[0]) if "Txt" in t.metaObject().className()
+            and t.isVisible() and t.property("text")]
+
+
+def show_state(h, state):
+    snap = copy.deepcopy(h.snap)
+    STATES[state](snap)
+    h.win.update_snapshot(snap)
+    h.win.backend.pageRequested.emit("overview")
+    pump(60)
+    return visible_texts(h.win)
+
+
+def test_a_failed_limits_fetch_says_what_failed_not_plan_facts(h):
+    try:
+        texts = show_state(h, "limits_failed")
+        assert "Couldn't load your plan limits" in texts
+        assert any(t.startswith("Can't reach the usage API. Check your network.") for t in texts), texts
+        assert not any("has not reported" in t or "does not report" in t for t in texts), texts
+    finally:
+        h.win.update_snapshot(h.snap)
+        pump(30)
+
+
+def test_pending_limits_show_placeholders_not_missing_limits(h):
+    try:
+        texts = show_state(h, "limits_pending")
+        assert "Checking your plan limits." in texts
+        assert not any("has not reported" in t or "Not reported" in t for t in texts), texts
+    finally:
+        h.win.update_snapshot(h.snap)
+        pump(30)
+
+
+def test_a_5_hour_window_that_has_not_started_is_not_0_percent(h):
+    try:
+        texts = show_state(h, "5h_not_started")
+        card = find(h.win, "OtherLimitsCard")[0]
+        rows = js(card.property("rows"))
+        assert rows[0]["pill"] == "Not started" and "value" not in rows[0], rows[0]
+        assert "Starts on your next prompt." in texts
+    finally:
+        h.win.update_snapshot(h.snap)
+        pump(30)
+
+
+def test_ultra_has_no_5_hour_limit_and_weekly_leads(h):
+    try:
+        texts = show_state(h, "ultra")
+        rows = js(find(h.win, "OtherLimitsCard")[0].property("rows"))
+        assert rows[0]["pill"] == "None on Ultra" and rows[0]["sub"] == "Ultra has a weekly limit and no 5-hour limit."
+        assert any(t.startswith("Ultra plan, account-wide") for t in texts), texts
+        assert not any(t.endswith("0%") and "5-hour" in t for t in texts)
+    finally:
+        h.win.update_snapshot(h.snap)
+        pump(30)
+
+
+def test_messages_read_as_sentences(h):
+    got = qml_eval(h, '[Ui.sentence("The usage API sent no limits"), Ui.sentence("Rate limited."), Ui.sentence("")]')
+    assert got == ["The usage API sent no limits.", "Rate limited.", ""]
+
+
+def test_settings_show_the_stored_values(h):
+    # an older config: thresholds under the old slider minimums, opacity under the overlay's floor
+    h.win.set_settings({"appearance": "dark", "notify_thresholds": [0.4, 0.6], "osd_opacity": 0.5})
+    h.win.backend.pageRequested.emit("settings")
+    pump(80)
+    try:
+        page = find(h.win, "SettingsPage")[0]
+        values = [round(s.property("value"), 2) for s in find_in(page, "SliderX")]
+        froms = [round(s.property("from"), 2) for s in find_in(page, "SliderX")]
+        texts = visible_texts(h.win, "SettingsPage")
+        assert "40%" in texts and "60%" in texts and "85%" in texts, texts
+        assert 0.4 in values and 0.6 in values and 0.85 in values, values
+        assert 0.85 in froms and min(froms) <= 0.1, froms
+    finally:
+        h.win.set_settings({"appearance": "light"})
+        h.win.backend.pageRequested.emit("overview")
+        pump(60)
+
+
+def test_hero_numbers_keep_tabular_figures(h):
+    from PySide6.QtGui import QFont
+    h.win.backend.pageRequested.emit("overview")
+    pump(30)
+    heroes = [t for c in ("KpiCard", "TimelineCard", "WeekCard") for k in find(h.win, c) for t in find_in(k, "Txt")
+              if t.property("display")]
+    assert heroes and all(t.property("font").featureValue(QFont.Tag("tnum")) == 1 for t in heroes)
+
+
+def test_quitting_leaves_no_binding_errors():
+    from PySide6.QtCore import QObject, qInstallMessageHandler
+    seen = []
+    old = qInstallMessageHandler(lambda kind, ctx, msg: seen.append(msg))
+    try:
+        holder = QObject()
+        win = AppWindow(lambda r, p: None, settings={"appearance": "light"}, parent=holder)
+        win.update_snapshot(load(SNAPS[0]))
+        win.show()
+        pump(100)
+        win.prepare_quit()
+        win.window.close()
+        del win
+        import shiboken6
+        shiboken6.delete(holder)
+        pump(30)
+    finally:
+        qInstallMessageHandler(old)
+    assert not [m for m in seen if "of null" in m or "TypeError" in m], seen
+
+
+def test_series_palette_is_distinct_and_readable():
+    from claude_usage import tokens
+
+    def lum(h):
+        c = [int(h[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+        r, g, b = [x / 12.92 if x <= 0.04045 else ((x + 0.055) / 1.055) ** 2.4 for x in c]
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+    def contrast(a, b):
+        x, y = sorted((lum(a), lum(b)))
+        return (y + 0.05) / (x + 0.05)
+
+    for series, pal in ((tokens.SERIES_LIGHT, tokens.LIGHT), (tokens.SERIES_DARK, tokens.DARK)):
+        assert len(series) == len(set(series)) == 8
+        assert pal["bad_fill"] not in series and pal["warn_fill"] not in series
+        assert all(contrast(c, pal["surface"]) >= 3 for c in series), [(c, round(contrast(c, pal["surface"]), 2)) for c in series]
+    assert contrast(tokens.OTHER_LIGHT, tokens.LIGHT["surface"]) >= 3
 
 
 def test_turns_without_records_read_as_unknown(h):
@@ -661,6 +755,7 @@ def test_windows_animation_setting_turns_motion_off(h, monkeypatch):
 def run_child(code, *args):
     import subprocess
     env = {k: v for k, v in os.environ.items() if k != "QT_QPA_PLATFORM"}
+    env["QT_ENABLE_HIGHDPI_SCALING"] = "0"  # one image pixel per item pixel on every backend
     src = str(Path(__file__).parents[2] / "src")
     r = subprocess.run([sys.executable, "-c", code, src, *args], env=env, capture_output=True, text=True, timeout=120)
     if r.returncode == 77:
@@ -697,14 +792,16 @@ def test_semibold_renders_semibold_on_windows():
     assert run_child(FONT_CHILD) == [["Semibold", 600, 10.5], ["Semibold", 600, 36.0]]
 
 
-# Every other test renders on the software scene graph. This one draws the
-# Overview through QQuickRenderControl on Direct3D 11 (the real GPU path,
-# never shown on screen), dark, and checks the stacked timeline column by
-# column: no background showing inside the stack, no fill above it.
-GPU_CHILD = r"""
-import json, random, re, sys, time
+# The real GPU path: the timeline drawn through QQuickRenderControl on
+# Direct3D 11 (never shown on screen) must match the software scene graph
+# across the whole chart, apart from antialiased edges. The curve renderer
+# once dropped whole bands of real data on the GPU while the software render
+# was complete.
+TIMELINE_CHILD = r"""
+import json, sys, time
 from pathlib import Path
-sys.path.insert(0, sys.argv[1])
+src, api, snap_path, cases_path, out = sys.argv[1:6]
+sys.path.insert(0, src)
 from PySide6.QtCore import QPointF, QSize, QUrl
 from PySide6.QtGui import (QGuiApplication, QImage, QRhiColorAttachment, QRhiReadbackDescription,
                            QRhiReadbackResult, QRhiRenderBuffer, QRhiTexture, QRhiTextureRenderTargetDescription)
@@ -713,33 +810,20 @@ from PySide6.QtQuick import QQuickRenderControl, QQuickRenderTarget, QQuickWindo
 from PySide6.QtQuickControls2 import QQuickStyle
 app = QGuiApplication([])
 from claude_usage.app.window import QML_MAIN, Backend
-QQuickWindow.setGraphicsApi(QSGRendererInterface.GraphicsApi.Direct3D11)
+gpu = api == "d3d11"
+QQuickWindow.setGraphicsApi(QSGRendererInterface.GraphicsApi.Direct3D11 if gpu else QSGRendererInterface.GraphicsApi.Software)
 QQuickStyle.setStyle("FluentWinUI3")
-W, H = 1280, 2400
-text = Path(sys.argv[2]).read_text(encoding="utf-8")
-snap = json.loads(text)
-n, K = len(snap["timeline"]["starts"]), len(snap["timeline"]["by"]["project"]["keys"])
-cases = {
-    # Spikes that alternate between series: band edges interpolated separately
-    # cross between buckets, and the curve renderer filled them as shards.
-    "spikes": [[40.0 if (k + i) % 3 == 0 else 0.0 for k in range(n)] for i in range(K)],
-}
-for seed in range(4):
-    # Like real use: one large project, the rest a few cents in most buckets
-    # with the odd burst. Sub-pixel slivers made whole bands drop out.
-    rnd = random.Random(seed)
-    rows = [[rnd.uniform(50, 400) for _ in range(n)]]
-    rows += [[rnd.uniform(5, 150) if rnd.random() < 0.15 else rnd.uniform(0.02, 1.5) if rnd.random() < 0.8 else 0.0
-              for _ in range(n)] for _ in range(K - 1)]
-    rnd.shuffle(rows)
-    cases["slivers%d" % seed] = rows
+W, H = 1280, 1300
+text = Path(snap_path).read_text(encoding="utf-8")
+cases = json.loads(Path(cases_path).read_text(encoding="utf-8"))
 be = Backend(lambda r, p: None, {})
-be.set_dark(True)
-be.update_snapshot(snap)
-rc = QQuickRenderControl(); win = QQuickWindow(rc)
+be.update_snapshot(json.loads(text))
+rc = QQuickRenderControl() if gpu else None
+win = QQuickWindow(rc) if gpu else QQuickWindow()
 eng = QQmlEngine(); eng.rootContext().setContextProperty("backend", be)
 comp = QQmlComponent(eng)
 comp.setData(b'import QtQuick\nItem { property var snap: Ui.fixColors(JSON.parse(backend.snapshotJson))\n'
+             b'Connections { target: backend; function onSnapshotChanged() { snap = Ui.fixColors(JSON.parse(backend.snapshotJson)) } }\n'
              b'Rectangle { anchors.fill: parent; color: Ui.p.bg }\n'
              b'OverviewPage { anchors.fill: parent; snap: parent.snap; viewH: 820 } }',
              QUrl.fromLocalFile(str(QML_MAIN.with_name("GpuHost.qml"))))
@@ -747,67 +831,161 @@ root = comp.create()
 if root is None:
     print(json.dumps({"error": [e.toString() for e in comp.errors()]})); sys.exit(1)
 root.setParentItem(win.contentItem()); root.setWidth(W); root.setHeight(H); win.setGeometry(0, 0, W, H)
-if not rc.initialize():
-    sys.exit(77)
-rhi = rc.rhi()
-tex = rhi.newTexture(QRhiTexture.Format.RGBA8, QSize(W, H), 1, QRhiTexture.Flag.RenderTarget | QRhiTexture.Flag.UsedAsTransferSource); tex.create()
-ds = rhi.newRenderBuffer(QRhiRenderBuffer.Type.DepthStencil, QSize(W, H), 1); ds.create()
-desc = QRhiTextureRenderTargetDescription(QRhiColorAttachment(tex)); desc.setDepthStencilBuffer(ds)
-rt = rhi.newTextureRenderTarget(desc); rp = rt.newCompatibleRenderPassDescriptor(); rt.setRenderPassDescriptor(rp); rt.create()
-win.setRenderTarget(QQuickRenderTarget.fromRhiRenderTarget(rt))
-js = lambda v: v.toVariant() if hasattr(v, "toVariant") else v
+if gpu:
+    if not rc.initialize():
+        sys.exit(77)
+    rhi = rc.rhi()
+    tex = rhi.newTexture(QRhiTexture.Format.RGBA8, QSize(W, H), 1, QRhiTexture.Flag.RenderTarget | QRhiTexture.Flag.UsedAsTransferSource); tex.create()
+    ds = rhi.newRenderBuffer(QRhiRenderBuffer.Type.DepthStencil, QSize(W, H), 1); ds.create()
+    desc = QRhiTextureRenderTargetDescription(QRhiColorAttachment(tex)); desc.setDepthStencilBuffer(ds)
+    rt = rhi.newTextureRenderTarget(desc); rp = rt.newCompatibleRenderPassDescriptor(); rt.setRenderPassDescriptor(rp); rt.create()
+    win.setRenderTarget(QQuickRenderTarget.fromRhiRenderTarget(rt))
 def frame():
     for _ in range(5):  # past the 300 ms entrance and count-up animations
         end = time.perf_counter() + 0.1
         while time.perf_counter() < end: app.processEvents(); time.sleep(0.005)
-        rc.polishItems(); rc.beginFrame(); rc.sync(); rc.render()
-        res = QRhiReadbackResult(); b = rhi.nextResourceUpdateBatch(); b.readBackTexture(QRhiReadbackDescription(tex), res)
-        rc.commandBuffer().resourceUpdate(b); rc.endFrame()
-    return QImage(bytes(res.data), res.pixelSize.width(), res.pixelSize.height(), QImage.Format.Format_RGBA8888).copy()
-def check(img):
-    chart, stack = None, [root]
-    while stack:
-        it = stack.pop()
-        if it.property("bands") is not None and it.property("xL") is not None:
-            chart = it
-        stack.extend(it.childItems())
-    card = chart.parentItem().parentItem()
-    xL, xR, base, ytop = (chart.property(x) for x in ("xL", "xR", "base", "yTop"))
-    last, cnt = card.property("lastFull"), card.property("n")
-    top = [(float(a), float(b)) for a, b in re.findall(r"(-?[\d.]+),(-?[\d.]+)", js(chart.property("stack"))["top"])]
-    labels = [(d["x"] - 3, d["y"] - 3, d["x"] + d["w"] + 3, d["y"] + 25) for d in js(chart.property("direct"))]
-    o = chart.mapToScene(QPointF(0, 0))
-    rgb = lambda x, y: img.pixelColor(int(o.x() + x), int(o.y() + y)).getRgb()[:3]
-    dist = lambda a, b: sum(abs(p - q) for p, q in zip(a, b))
-    def edge(x):
-        j = max(0, min(len(top) - 2, next((i for i in range(len(top) - 1) if top[i + 1][0] >= x), len(top) - 2)))
-        (ax, ay), (bx, by) = top[j], top[j + 1]
-        return ay + (by - ay) * (x - ax) / max(1e-6, bx - ax)
-    holes = spikes = cols = 0
-    for x in range(int(xL) + 2, int(xL + (xR - xL) * last / (cnt - 1)) - 2):
-        # the outline stroke spans more than one row on a steep slope
-        near = [edge(x + dx) for dx in (-2, -1, 0, 1, 2)]
-        lo, hi = min(near) - 3, max(near) + 3
-        cols += 1
-        for y in range(int(ytop), int(base) - 3):
-            if lo <= y <= hi or any(l[0] <= x <= l[2] and l[1] <= y <= l[3] for l in labels):
-                continue
-            d = dist(rgb(x, y), rgb(xL - 6, y))  # the card behind, left of the plot
-            holes += y > hi and d < 30
-            spikes += y < lo and d > 150
-    return {"holes": holes, "spikes": spikes, "cols": cols}
-out = {}
-for name, rows in cases.items():
+        if gpu:
+            rc.polishItems(); rc.beginFrame(); rc.sync(); rc.render()
+            res = QRhiReadbackResult(); b = rhi.nextResourceUpdateBatch(); b.readBackTexture(QRhiReadbackDescription(tex), res)
+            rc.commandBuffer().resourceUpdate(b); rc.endFrame()
+    if gpu:
+        return QImage(bytes(res.data), res.pixelSize.width(), res.pixelSize.height(), QImage.Format.Format_RGBA8888).copy()
+    return win.grabWindow()  # a hidden window renders offscreen
+def find(pred):
+    st = [root]
+    while st:
+        it = st.pop()
+        if pred(it): return it
+        st.extend(it.childItems())
+card = find(lambda it: it.metaObject().className().startswith("TimelineCard"))
+chart = find(lambda it: it.property("bands") is not None and it.property("xL") is not None)
+js = lambda v: v.toVariant() if hasattr(v, "toVariant") else v
+meta = {}
+for name, c in cases.items():
     snap = json.loads(text)
-    snap["timeline"]["by"]["project"]["values"]["cost"] = rows
-    be.update_snapshot(snap)
-    out[name] = check(frame())
-print(json.dumps(out))
+    if c.get("rows") is not None:
+        snap["timeline"]["by"][c["group"]]["values"][c["metric"]] = c["rows"]
+    be.set_dark(c["dark"]); be.update_snapshot(snap)
+    card.setProperty("metric", c["metric"]); card.setProperty("group", c["group"])
+    img = frame()
+    o = chart.mapToScene(QPointF(0, 0))
+    png = str(Path(out) / (name + "_" + api + ".png"))
+    img.copy(int(o.x()), int(o.y()), int(chart.width()), int(chart.height())).save(png)
+    meta[name] = {"png": png, "xL": chart.property("xL"), "n": card.property("n"),
+                  "labels": [[d["x"], d["y"], d["x"] + d["w"], d["y"] + 22] for d in js(chart.property("direct"))]}
+print(json.dumps(meta))
 """
 
 
+def ink_rows(path, ref_x):
+    """Per row, a bitmask of the pixels that differ from the card behind the plot (column *ref_x*)."""
+    from PySide6.QtGui import QImage, QPainter
+    img = QImage(path).convertToFormat(QImage.Format.Format_RGB32)
+    w, h = img.width(), img.height()
+    diff = img.copy(ref_x, 0, 1, h).scaled(w, h)
+    p = QPainter(diff)
+    p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Difference)
+    p.drawImage(0, 0, img)
+    p.end()
+    g = diff.convertToFormat(QImage.Format.Format_Grayscale8)
+    bpl, data = g.bytesPerLine(), bytes(g.constBits())
+    table = bytes(48 + (v > 12) for v in range(256))  # "0" or "1"
+    return [int(data[y * bpl:y * bpl + w].translate(table)[::-1], 2) for y in range(h)], w
+
+
+def missing_pixels(sw, gpu, ref_x, boxes):
+    """(holes, spikes): ink only in the software render, and ink only on the
+    GPU, away from antialiased edges and the direct labels."""
+    a, w = ink_rows(sw, ref_x)
+    b, _ = ink_rows(gpu, ref_x)
+    full = (1 << w) - 1
+
+    def grow(rows):  # 2 px each way
+        hz = [(m | m << 1 | m >> 1 | m << 2 | m >> 2) & full for m in rows]
+        return [hz[max(0, y - 2)] | hz[max(0, y - 1)] | hz[y] | hz[min(len(hz) - 1, y + 1)] | hz[min(len(hz) - 1, y + 2)]
+                for y in range(len(hz))]
+
+    skip = [p & q for p, q in zip(grow(a), grow([~m & full for m in a]))]
+    for x0, y0, x1, y1 in boxes:
+        cols = ((1 << int(x1) + 4) - 1) ^ ((1 << max(0, int(x0) - 3)) - 1)
+        for y in range(max(0, int(y0) - 3), min(len(a), int(y1) + 4)):
+            skip[y] |= cols
+
+    def tall(m):  # a 1.5 px rim can land a row apart; a missing band is taller
+        return sum((m[y] & m[y - 1] & m[y + 1]).bit_count() for y in range(1, len(m) - 1))
+    return (tall([a[y] & ~b[y] & ~skip[y] & full for y in range(len(a))]),
+            tall([b[y] & ~a[y] & ~skip[y] & full for y in range(len(a))]))
+
+
+def test_the_gpu_comparison_sees_a_missing_band(tmp_path):
+    # the check itself: a band painted over with the card colour must count
+    from PySide6.QtGui import QColor, QImage, QPainter
+    img = QImage(400, 200, QImage.Format.Format_RGB32)
+    img.fill(QColor("#1A1A19"))
+    p = QPainter(img)
+    p.fillRect(60, 120, 300, 60, QColor("#466EDD"))
+    p.fillRect(60, 80, 300, 40, QColor("#E27100"))
+    p.end()
+    img.save(str(tmp_path / "a.png"))
+    p = QPainter(img)
+    p.fillRect(100, 85, 200, 30, QColor("#1A1A19"))
+    p.end()
+    img.save(str(tmp_path / "b.png"))
+    assert missing_pixels(str(tmp_path / "a.png"), str(tmp_path / "a.png"), 40, []) == (0, 0)
+    holes, spikes = missing_pixels(str(tmp_path / "a.png"), str(tmp_path / "b.png"), 40, [])
+    assert holes > 4000 and spikes == 0
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Direct3D 11 is Windows only")
-def test_timeline_bands_fill_cleanly_on_the_gpu_path():
-    r = run_child(GPU_CHILD, str(SNAPS[0]))
-    assert all(c["cols"] > 500 for c in r.values()), r
-    assert {k: (c["holes"], c["spikes"]) for k, c in r.items() if c["holes"] or c["spikes"]} == {}, r
+def test_timeline_on_the_gpu_matches_the_software_render(tmp_path):
+    import random
+    snap = load(SNAPS[0])
+    n, k = len(snap["timeline"]["starts"]), len(snap["timeline"]["by"]["project"]["keys"])
+    data = {
+        # Spikes that alternate between series: band edges interpolated separately
+        # cross between buckets, and the curve renderer filled them as shards.
+        "spikes": [[40.0 if (j + i) % 3 == 0 else 0.0 for j in range(n)] for i in range(k)],
+    }
+    for seed in range(4):
+        # Like real use: one large project, the rest a few cents in most buckets
+        # with the odd burst. Sub-pixel slivers made whole bands drop out.
+        rnd = random.Random(seed)
+        rows = [[rnd.uniform(50, 400) for _ in range(n)]]
+        rows += [[rnd.uniform(5, 150) if rnd.random() < 0.15 else rnd.uniform(0.02, 1.5) if rnd.random() < 0.8 else 0.0
+                  for _ in range(n)] for _ in range(k - 1)]
+        rnd.shuffle(rows)
+        data[f"slivers{seed}"] = rows
+    cases = {f"{name}_{mode}": {"dark": mode == "dark", "metric": "cost", "group": "project", "rows": rows}
+             for name, rows in data.items() for mode in ("dark", "light")}
+    spec = tmp_path / "cases.json"
+    spec.write_text(json.dumps(cases), encoding="utf-8")
+    soft, hard = (run_child(TIMELINE_CHILD, api, str(SNAPS[0]), str(spec), str(tmp_path)) for api in ("software", "d3d11"))
+    found = {}
+    for name in cases:
+        s, g = soft[name], hard[name]
+        assert s["n"] == n and Path(s["png"]).exists() and Path(g["png"]).exists()
+        found[name] = missing_pixels(s["png"], g["png"], int(s["xL"]) - 6, s["labels"] + g["labels"])
+    assert {k: v for k, v in found.items() if v != (0, 0)} == {}, found
+
+
+def test_kpi_and_heatmap_readouts_work_from_the_keyboard(h):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    h.win.backend.pageRequested.emit("overview")
+    pump(30)
+
+    def tips():
+        return [t for t in find(h.win, "ChartTip") if t.isVisible()]
+
+    kpi = [k for k in find(h.win, "KpiCard") if k.property("activeFocusOnTab")][0]
+    kpi.forceActiveFocus(Qt.TabFocusReason)
+    pump(30)
+    assert len(tips()) == 1 and tips()[0].property("title") == js(kpi.property("k"))["label"]
+    grid = [g for g in find_in(find(h.win, "ActivityCard")[0]) if g.property("cells") is not None][0]
+    grid.forceActiveFocus(Qt.TabFocusReason)
+    QTest.keyClick(h.win.window, Qt.Key_Left)
+    pump(30)
+    assert grid.property("kb") == len(js(grid.property("cells"))) - 1 and len(tips()) == 1
+    find(h.win, "OverviewPage")[0].forceActiveFocus()
+    pump(30)
+    assert tips() == []

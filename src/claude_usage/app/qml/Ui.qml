@@ -33,51 +33,20 @@ QtObject {
 
     // -1 is "Other", -2 the days that only have the old daily totals.
     function seriesColor(i) { return i >= 0 && i < s.length ? s[i] : i === -2 ? mix(other, p.surface || "#888", 0.45) : other }
-    // Colour index = all-time cost rank, so a series ranked past the palette
-    // would draw grey like "Other". Each such entity gets a palette slot that
-    // it keeps across ranges and restarts (saved as the series_slots setting)
-    // unless another series in the same chart already shows it; a new slot
-    // prefers colours no other entity remembers. Lists (sidebar, sessions,
-    // models) then colour only what the chart draws, and everything else in
-    // the colour of "Other", so a colour always means the same band.
-    property var slots: null
+    // Slots come from the data layer and stay with an entity across ranges.
+    // Lists (sidebar, sessions, models) colour only what the chart draws and
+    // everything else in the colour of "Other", so a colour always means one band.
     function fixColors(snap) {
         if (!snap || !snap.timeline) return snap
-        if (!slots) {
-            try { slots = JSON.parse(backend.settings.series_slots || "{}") } catch (e) { slots = {} }
-        }
-        var n = s.length || 8, changed = false, inChart = {}
-        function remap(g, pre) {
-            var used = {}, taken = {}, map = {}
-            g.colors.forEach(function (c) { if (c >= 0 && c < n) used[c] = true })
-            for (var k in slots) if (k.indexOf(pre) === 0 && g.keys.indexOf(k.slice(pre.length)) < 0) taken[slots[k]] = true
-            var past = g.keys.map(function (k, i) { return [g.colors[i], k] }).filter(function (x) { return x[0] >= n })
-                .sort(function (a, b) { return a[0] - b[0] })
-            past.forEach(function (x) {
-                var m = slots[pre + x[1]]
-                if (m >= 0 && m < n && !used[m]) { map[x[1]] = m; used[m] = true }
-            })
-            past.forEach(function (x) {
-                if (x[1] in map) return
-                var pick = -1
-                for (var i = 0; i < n; i++) if (!used[i] && (pick < 0 || taken[pick] && !taken[i])) pick = i
-                if (pick < 0) return
-                map[x[1]] = pick
-                used[pick] = true
-                slots[pre + x[1]] = pick
-                changed = true
-            })
-            g.colors = g.keys.map(function (k, i) { return k in map ? map[k] : g.colors[i] })
-            g.keys.forEach(function (k, i) { inChart[pre + k] = g.colors[i] })
-        }
-        remap(snap.timeline.by.project, "p:")
-        remap(snap.timeline.by.model, "m:")
+        var inChart = {}
+        function mark(g, pre) { g.keys.forEach(function (k, i) { inChart[pre + k] = g.colors[i] }) }
+        mark(snap.timeline.by.project, "p:")
+        mark(snap.timeline.by.model, "m:")
         function carry(list, field, pre) {
             (list || []).forEach(function (o) { var c = inChart[pre + o[field]]; o.color = c === undefined ? -1 : c })
         }
         carry(snap.projects, "name", "p:"); carry(snap.sessions, "project", "p:"); carry(snap.top_sessions, "project", "p:")
         carry(snap.models, "name", "m:")
-        if (changed) backend.setSetting("series_slots", JSON.stringify(slots))
         return snap
     }
     function alpha(c, a) { var q = Qt.darker(c, 1.0); return Qt.rgba(q.r, q.g, q.b, a) }
@@ -130,6 +99,11 @@ QtObject {
     // "in the last 7 days", or "over all time" for the all range.
     function inRange(r) { return !r ? "in this range" : r.key === "all" ? "over all time" : "in the " + r.label }
     function plural(n, w) { return int(n) + " " + w + (n === 1 ? "" : "s") }
+    // A status message ends as a sentence, so copy can follow it.
+    function sentence(m) {
+        var s = String(m || "").trim()
+        return s && !/[.!?]$/.test(s) ? s + "." : s
+    }
 
     // ---- time
     function date(iso) { return iso ? new Date(iso) : null }

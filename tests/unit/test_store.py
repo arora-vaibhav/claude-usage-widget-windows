@@ -101,6 +101,25 @@ def test_legacy_import_flags_copies_and_pre_dedupe_rows(conn, tmp_path):
     assert before == {f: open(os.path.join(d, f), "rb").read() for f in before}  # read-only
 
 
+def test_legacy_rows_with_unreadable_numbers_are_skipped_and_logged_once(conn, tmp_path, monkeypatch):
+    d = str(tmp_path)
+    _legacy_files(d, [
+        _day("2026-07-01", 100.0, 500),
+        _day("2026-07-02", "a lot", 500),
+        _day("2026-07-03", 80.0, {"n": 1}),
+        _day("2026-07-04", "nan", 10),
+        _day("2026-13-45", 10.0, 10),  # not a date
+        dict(_day("2026-07-05", 70.0, 300), tokens={"input": "x"}),
+        _day("2026-07-06", 60.0, 200),
+    ], [])
+    logged = []
+    monkeypatch.setattr(store._log, "warning", lambda msg, *args: logged.append(msg % args))
+    assert store.import_legacy(conn, d) == {"days": 2, "samples": 0, "corrupt": 0}
+    assert [r[0] for r in conn.execute("SELECT day FROM legacy_days ORDER BY day")] == ["2026-07-01", "2026-07-06"]
+    assert logged == [f"skipped 5 unreadable rows of {os.path.join(d, 'usage-daily.jsonl')}, the first dated '2026-07-02'"]
+    assert store.import_legacy(conn, d) == {"skipped": True}  # imported once, so not logged again
+
+
 def _ledger_day(conn, day, cost_usd):
     # Opus 5.5 output at $20/MTok makes the token count easy to pick.
     out = int(cost_usd / 20 * 1e6)

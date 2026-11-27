@@ -196,7 +196,7 @@ Rectangle {
         }
         Txt {
             x: 8; width: parent.width - 16
-            visible: !!side.status
+            visible: !!side.status && !side.status.indexing
             text: side.status ? "From " + Ui.int(side.status.transcripts) + " local transcripts" : ""
             font.pixelSize: 12; color: Ui.p.text_faint
         }

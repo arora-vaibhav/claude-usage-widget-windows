@@ -1,14 +1,14 @@
 import pytest
 
 from claude_usage import pricing
-from claude_usage.pricing import calculate_cost, call_cost, cost_parts, resolve
+from claude_usage.pricing import call_cost, cost_parts, resolve
 
 M = 1_000_000
 
 
 def _output_rate(model: str) -> float:
     # Cost of exactly 1,000,000 output tokens == the model's output $/M rate.
-    return calculate_cost(model, input_tokens=0, output_tokens=M)["output"]
+    return call_cost(model, 0, M, 0, 0, 0)
 
 
 # Published first-party rates (USD per MTok): input, output, cache read.
@@ -71,14 +71,6 @@ def test_unknown_release_is_priced_by_family_and_marked():
 def test_unknown_model_is_unpriced():
     assert resolve("gpt-4o") == ("gpt-4o", None, "unpriced")
     assert call_cost("gpt-4o", M, M, M, M, M) == 0.0
-
-
-def test_old_api_still_works():
-    assert _output_rate("claude-opus-4-8") == 25.0
-    assert _output_rate("claude-haiku-4-5-20251001") == 5.0
-    b = calculate_cost("claude-opus-5-5", 0, 0, cache_read=M, cache_creation=M)
-    assert b["cache_creation"] == pytest.approx(5.0) and b["cache_savings"] == pytest.approx(3.8)
-    assert pricing.MODEL_PRICING["claude-sonnet-4-6"]["input"] == 3.0
 
 
 @pytest.mark.parametrize("model,canonical", [

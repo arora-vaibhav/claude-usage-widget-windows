@@ -10,7 +10,7 @@ Card {
     property bool dropLast: false    // the bucket still filling is left out of the trend
     property int smoothing: 0
     padding: 0
-    implicitHeight: 180
+    implicitHeight: 156
 
     // the headline counts to a new value when the range or project changes
     property real shown: k ? k.value : 0
@@ -128,7 +128,7 @@ Card {
 
     Item {
         id: spark
-        width: card.width; height: 70
+        width: card.width; height: 56
         y: card.height - height
         readonly property var pts: {
             var v = card.values, n = v.length
@@ -175,20 +175,26 @@ Card {
         }
     }
 
+    function showTip() {
+        if (!k || !(k.hint || k.prev != null)) return
+        tip.title = k.label
+        tip.value = Ui.fmt(k.format, k.value)
+        tip.rows = k.prev != null ? [{ c: Ui.p.text_faint, name: "Previous period", v: Ui.fmt(k.format, k.prev) }] : []
+        tip.note = k.hint || ""
+        tip.showAt(card, card.width / 2, 12)
+    }
     MouseArea {
         id: hov
         anchors.fill: parent
         hoverEnabled: true
         acceptedButtons: Qt.NoButton
-        onEntered: if (card.k && (card.k.hint || card.k.prev != null)) {
-            tip.title = card.k.label
-            tip.value = Ui.fmt(card.k.format, card.k.value)
-            tip.rows = card.k.prev != null ? [{ c: Ui.p.text_faint, name: "Previous period", v: Ui.fmt(card.k.format, card.k.prev) }] : []
-            tip.note = card.k.hint || ""
-            tip.showAt(card, card.width / 2, 12)
-        }
-        onExited: tip.hide()
+        onEntered: card.showTip()
+        onExited: if (!card.activeFocus) tip.hide()
     }
+    // the readout is reachable from the keyboard too
+    activeFocusOnTab: !!k && !!(k.hint || k.prev != null)
+    onActiveFocusChanged: activeFocus ? showTip() : tip.hide()
+    Focus { show: card.activeFocus; r: Ui.radius }
     ChartTip { id: tip }
     Accessible.role: Accessible.StaticText
     Accessible.name: k ? k.label + " " + Ui.fmt(k.format, k.value) + (delta ? ", " + delta.text + " " + k.note : "") : ""

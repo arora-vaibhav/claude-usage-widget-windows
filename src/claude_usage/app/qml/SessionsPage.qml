@@ -35,7 +35,7 @@ Page {
 
     title: "Sessions"
     subtitle: snap ? Ui.plural(snap.sessions_total, "session") + " " + Ui.inRange(snap.range) + (snap.project ? ", " + snap.project : "")
-                     + (snap.sessions.length < snap.sessions_total ? ". Showing the " + Ui.int(snap.sessions.length) + " most recent." : "") : ""
+                     + (snap.sessions.length < snap.sessions_total ? ". Showing the " + Ui.int(snap.sessions.length) + " costliest." : "") : ""
     tools: [
         Seg {
             name: "Range"

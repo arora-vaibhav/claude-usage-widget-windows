@@ -11,14 +11,14 @@ This is a full-source, Windows-focused fork of [`claude-usage-widget`](https://g
 **The app**, with three pages:
 
 - **Overview**: your plan limits (weekly pace and projection, past weeks, other limits and extra usage), cost, tokens, sessions, agent time and cache hit rate with the change from the previous period, a timeline by project or by model, top sessions, an activity heatmap, and the cost split by model. Pick 24 hours, 7, 30 or 90 days, or all time, and narrow everything to one project from the sidebar.
-- **Sessions**: every session in the range, with search, an Interactive or Automated filter and sortable columns.
+- **Sessions**: the sessions in the range (the 2,000 costliest when there are more), with search, an Interactive or Automated filter and sortable columns.
 - **Settings**: appearance (System, Light, Dark), overlay style, opacity and keep on top, launch at startup, limit alerts and their thresholds, the data store and re-index, version and update check.
 
 **The tray icon** opens the app on click. The tray and the overlay share one menu: Open Claude Usage, Refresh now, Pill or Card, Settings, Quit. Its first line, like the tray tooltip, sums up the limits your plan reports, the one that will run out first leading as on the overlay (for example "Weekly 67%, resets Tue 8:00 PM"), the weekly Fable limit while you use it, and the live token rate. When the numbers are old, the tooltip also says why. Limit alerts arrive as tray notifications, once per crossing in each limit window, for the weekly limit, the 5-hour limit when your plan has one, and the Fable limit while it is active.
 
 ## How cost is computed
 
-Cost is API-equivalent: every API call in your local Claude Code transcripts, subagents included, priced at Anthropic's published per-token rates, with 5-minute and 1-hour cache writes priced separately. It is what those tokens would cost on the API, not your bill. Claude Code's own `/cost` can read a few percent higher because it also counts requests it does not write to transcripts.
+Cost is API-equivalent: every API call in your local Claude Code transcripts, subagents included, priced at Anthropic's published per-token rates, with 5-minute and 1-hour cache writes priced separately. It is what those tokens would cost on the API, not your bill. Claude Code's own `/cost` can read a few percent higher because it also counts requests it does not write to transcripts, such as web searches and title calls. Subagent transcripts written by Claude Code builds before about October 2026 often kept only the first streamed line of each reply, so their output tokens, and the cost of those days, read low; the app does not guess the missing part.
 
 ## Where your data lives
 
@@ -28,7 +28,7 @@ Cost is API-equivalent: every API call in your local Claude Code transcripts, su
 
 Claude Code deletes old transcripts after `cleanupPeriodDays` (a Claude Code setting). The store keeps every call it has read, so your history stays after the transcripts are gone. Days from before the store existed come from the older `usage-daily.jsonl` totals (cost and tokens only) and are marked as such in the app.
 
-The first start reads all your transcripts. On a large history that takes 10 to 40 minutes; the app shows the progress and the totals fill in as it goes. Re-index (Settings, or `claude-usage --reindex`) reads everything again and never drops history that is already in the store.
+The first start reads all your transcripts. On a large history (tens of GB) that takes several minutes; the app shows the progress and the totals fill in as it goes. Re-index (Settings, or `claude-usage --reindex`) reads everything again and never drops history that is already in the store.
 
 ## Privacy
 
@@ -84,7 +84,7 @@ uv run --no-project --with pytest --with PySide6-Essentials python -m pytest tes
 ```
 
 - Layout: `src/claude_usage/` (the package; `app/qml/` holds the app window), `tests/unit/`, `tests/fixtures/` (synthetic data only), `launcher/`, `setup.ps1`.
-- One runtime dependency: `PySide6-Essentials` (Qt Quick for the app, a QWidget for the overlay, SQLite from the standard library).
+- One runtime dependency: `PySide6-Essentials` 6.7 or later (Qt Quick for the app, a QWidget for the overlay, SQLite from the standard library).
 - Design: [`docs/superpowers/specs/2026-11-26-native-app-design.md`](docs/superpowers/specs/2026-11-26-native-app-design.md).
 
 ## Contributing

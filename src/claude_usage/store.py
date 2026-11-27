@@ -10,12 +10,16 @@ read while the worker writes.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 from datetime import date, timedelta
 from typing import Any, Optional
 
 from claude_usage import pricing
+from claude_usage.logging_setup import get_logger
+
+_log = get_logger()
 
 SCHEMA_VERSION = 2
 
@@ -179,16 +183,25 @@ def import_legacy(conn: sqlite3.Connection, claude_dir: str, force: bool = False
 
 def _legacy_days(path: str) -> list:
     rows = sorted((r for r in _jsonl(path) if isinstance(r.get("date"), str)), key=lambda r: r["date"])
-    out, prev = [], None
+    out, prev, bad_rows = [], None, []
     for r in rows:
         t = r.get("tokens") if isinstance(r.get("tokens"), dict) else {}
-        tokens = sum(int(t.get(k) or 0) for k in ("input", "output", "cache_read", "cache_creation"))
-        cost, msgs = float(r.get("cost") or 0), int(r.get("messages") or 0)
+        try:
+            date.fromisoformat(r["date"])
+            tokens = sum(int(t.get(k) or 0) for k in ("input", "output", "cache_read", "cache_creation"))
+            cost, msgs = float(r.get("cost") or 0), int(r.get("messages") or 0)
+            if not math.isfinite(cost):
+                raise ValueError(cost)
+        except (TypeError, ValueError, OverflowError):
+            bad_rows.append(r["date"])
+            continue
         # The backfill flagged these rows too, so the date alone decides.
         pre_dedupe = r["date"] < _PRE_DEDUPE_BEFORE and cost > 0
         bad = pre_dedupe or (cost > 0 and prev is not None and _copied(cost, msgs, *prev))
         out.append((r["date"], cost, tokens, msgs, "corrupt" if bad else "legacy"))
         prev = (cost, msgs)
+    if bad_rows:
+        _log.warning("skipped %d unreadable rows of %s, the first dated %r", len(bad_rows), path, bad_rows[0][:40])
     return out
 
 

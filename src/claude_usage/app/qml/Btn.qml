@@ -24,7 +24,7 @@ T.Button {
                 font.pixelSize: 14
                 height: 20
                 color: b.primary ? Ui.p.on_accent : b.hovered ? Ui.p.text : Ui.p.text_muted
-                RotationAnimator on rotation { running: b.spin; from: 0; to: 360; duration: 900; loops: Animation.Infinite }
+                RotationAnimator on rotation { running: b.spin && Ui.motion; from: 0; to: 360; duration: 900; loops: Animation.Infinite }
             }
             Txt {
                 visible: b.text !== ""

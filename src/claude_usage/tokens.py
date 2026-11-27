@@ -1,4 +1,4 @@
-"""Design tokens: the one source of colour, type and spacing for every surface.
+"""Design tokens: the one source of colour for every surface.
 
 The OSD painter reads these through :func:`palette`; the Qt Quick app gets the
 same dicts as a context property. Values were checked for WCAG contrast in
@@ -63,32 +63,17 @@ DARK: dict[str, str] = {
     "brand": "#D97757",
 }
 
-# Categorical chart colours, validated for adjacent-pair distinctness.
-# Index i is the colour of the entity ranked i by all-time cost, so a
-# project keeps its colour across ranges; "Other" uses OTHER.
-SERIES_LIGHT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
-SERIES_DARK = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#0ca30c", "#9085e9", "#e66767"]
-OTHER_LIGHT = "#9A9891"
+# Categorical chart colours. snapshot.py gives each project and model a slot
+# that it keeps across ranges and days (stored in the store's meta); "Other"
+# uses OTHER. Checked with the dataviz validator: adjacent pairs and the first five
+# as all pairs stay apart under protan and deutan (OKLab dE >= 9) and in normal
+# vision (>= 15), light slots are 3:1 or better on white, dark slots sit in the
+# dark lightness band. One green (teal), and no slot reads as bad_fill or
+# warn_fill. Order: blue, orange, sky, pink, bronze, violet, teal, orchid.
+SERIES_LIGHT = ["#3461C9", "#E26B1B", "#2E9FC9", "#C94B87", "#895709", "#9267CA", "#148C66", "#882B7F"]
+SERIES_DARK = ["#466EDD", "#E27100", "#27A5C0", "#D14184", "#90601F", "#A67CE0", "#31AC81", "#A044AE"]
+OTHER_LIGHT = "#858379"
 OTHER_DARK = "#6B6A66"
-
-FONT_UI = "Segoe UI Variable Text"
-FONT_DISPLAY = "Segoe UI Variable Display"
-FONT_MONO = "Cascadia Mono"  # code-like strings only; numerals use FONT_UI/DISPLAY with tnum
-
-# Type ramp in logical px: (size, weight). Nothing below 11px.
-TYPE = {
-    "caption": (11, 400),
-    "label": (12, 400),
-    "body": (13, 400),
-    "body_strong": (14, 600),
-    "title": (15, 600),
-    "h1": (26, 650),
-    "kpi": (28, 600),
-    "hero": (36, 600),
-}
-
-RADIUS = {"sm": 6, "md": 10, "lg": 16, "pill": 999}
-SPACE = [4, 8, 12, 16, 24, 32]
 
 # Usage severity thresholds (fractions). Shared by the OSD, the app and the
 # notifier; config "notify_thresholds" overrides the first two.

@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import functools
 import re
-from typing import Dict, Mapping, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 PRICES_AS_OF = "2026-11-26"
 
@@ -170,47 +170,3 @@ def cost_parts(
 def call_cost(model: str, *tokens: int, web_search: int = 0, speed: Optional[str] = None) -> float:
     """Total USD for one call: call_cost(model, input, output, cache_read, write_5m, write_1h)."""
     return sum(cost_parts(model, *tokens, web_search=web_search, speed=speed))
-
-
-# ---------------------------------------------------------------- old API
-# widget.py, ticker.py and daily.py still use these until the integration step
-# removes them. They only know one cache-write number, priced at the 5m rate.
-
-MODEL_PRICING: Dict[str, Dict[str, float]] = {
-    m: {"input": r[0], "output": r[1], "cache_read": r[2], "cache_creation": r[3]} for m, r in PRICES.items()
-}
-
-
-def calculate_cost(
-    model: str,
-    input_tokens: int,
-    output_tokens: int,
-    cache_read: int = 0,
-    cache_creation: int = 0,
-) -> Dict[str, float]:
-    i, o, r, w = cost_parts(
-        model, max(int(input_tokens), 0), max(int(output_tokens), 0), max(int(cache_read), 0), max(int(cache_creation), 0)
-    )
-    _, rates, _ = resolve(model)
-    savings = max(int(cache_read), 0) * (rates[0] - rates[2]) / 1e6 if rates else 0.0
-    return {"total": i + o + r + w, "input": i, "output": o, "cache_read": r, "cache_creation": w, "cache_savings": savings}
-
-
-def calculate_stats_cost(by_model: Mapping[str, Mapping[str, int]]) -> Dict[str, object]:
-    keys = ("total", "input", "output", "cache_read", "cache_creation", "cache_savings")
-    totals = dict.fromkeys(keys, 0.0)
-    per_model: Dict[str, Dict[str, float]] = {}
-    for model, c in by_model.items():
-        b = calculate_cost(
-            model,
-            int(c.get("input", 0) or 0),
-            int(c.get("output", 0) or 0),
-            int(c.get("cache_read", 0) or 0),
-            int(c.get("cache_creation", 0) or 0),
-        )
-        per_model[model] = b
-        for k in keys:
-            totals[k] += b[k]
-    result: Dict[str, object] = dict(totals)
-    result["by_model"] = per_model
-    return result

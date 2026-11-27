@@ -1,10 +1,12 @@
-# Claude Usage Widget → Modern App — Design Spec
+# Claude Usage Widget to Modern App: Design Spec
+
+Superseded by [2026-11-26-native-app-design.md](2026-11-26-native-app-design.md).
 
 - **Date:** 2026-05-29
 - **Status:** Approved (design); pending spec review → implementation plan
 - **Owner:** Vaibhav (arora-vaibhav)
 - **Repo (source of truth):** https://github.com/arora-vaibhav/claude-usage-widget-windows
-- **Upstream:** `claude-usage-widget` v0.6.6 by Burak — https://github.com/bozdemir/claude-usage-widget (MIT)
+- **Upstream:** `claude-usage-widget` v0.6.6 by Burak, https://github.com/bozdemir/claude-usage-widget (MIT)
 
 ---
 
@@ -28,24 +30,24 @@ installed `site-packages`.
 
 ### Problems found in the current workflow
 1. **`setup.ps1` patch-drift:** the script only copies `collector.py, overlay.py,
-   widget.py` — but `patches/` also contains `cache_analyzer.py` and `ticker.py`, which
+   widget.py`, but `patches/` also contains `cache_analyzer.py` and `ticker.py`, which
    are never applied. A fresh install silently misses two fixes.
-2. **No full source under version control** — only 5 of ~25 modules. Real feature/UI
+2. **No full source under version control**: only 5 of ~25 modules. Real feature/UI
    work means editing installed `site-packages` directly, which `uv tool upgrade` wipes,
    can't be diffed/reviewed, and has no test harness.
-3. **History recording stalled** — last sample in `usage-history.jsonl` is 2026-05-23,
+3. **History recording stalled**: last sample in `usage-history.jsonl` is 2026-05-23,
    though Claude has been used since (Claude's `history.jsonl` updated 5/26). Root cause
    not yet diagnosed; two leading hypotheses: (a) no autostart, so the widget simply
    isn't running after reboot/close; (b) the heavy 30 s collection occasionally throws
    before `append_sample`, silently skipping records.
-4. **`claude_dir` stored with mixed slashes** (`C:\Users\V/.claude`) — works, but a
+4. **`claude_dir` stored with mixed slashes** (`C:\Users\V/.claude`): works, but a
    smell that can bite path comparisons.
 5. **"History" UX is two sparklines** ("Last 5 hours", "Last 7 days") buried in the
-   details popup — even though `trends.py`/`forecast.py`/`analytics.py` already compute
+   details popup, even though `trends.py`/`forecast.py`/`analytics.py` already compute
    far more. The data largely exists; the UI doesn't surface it.
 
 ### Key data finding (good news)
-The collector **already computes** everything the user wants for history — `today_cost`,
+The collector **already computes** everything the user wants for history: `today_cost`,
 `week_cost`, `today_by_model_detailed` (`{model: {input,output,cache_read,cache_creation}}`),
 `today_by_project`, tokens, and messages. It simply **never persists** them: the on-disk
 history (`usage-history.jsonl`) stores only `{ts, session, weekly}` (two utilization
@@ -60,18 +62,18 @@ be **backfilled** rather than starting empty.
 
 ### Goals
 - Turn the patch-overlay into a **maintainable full-source fork** under git, with tests
-  and a clean local install path — without losing the existing launcher/setup/README or
+  and a clean local install path, without losing the existing launcher/setup/README or
   the public repo's history.
 - **Stabilize:** the widget records reliably, runs continuously (autostart), surfaces
   failures (real logging), enforces single-instance, and shows correct/fresh numbers.
 - **Usage history** the user can actually read: usage % over time, cost over time,
-  tokens & messages per day, and per-model / per-project breakdowns — backfilled from
+  tokens & messages per day, and per-model / per-project breakdowns, backfilled from
   existing transcripts so it's useful immediately.
 - **Modern app feel:** a real Dashboard window (not just the cramped OSD popup), a
   cohesive restyle, tray presence, and smooth interactions.
 
 ### Non-goals (for now)
-- Re-architecting the cross-platform (Linux/macOS) paths — changes stay
+- Re-architecting the cross-platform (Linux/macOS) paths: changes stay
   cross-platform-safe, but Windows is the validation target.
 - Publishing the fork to PyPI under a new name (can revisit later).
 - Changing the data sources (still `~/.claude` + Anthropic rate-limit API).
@@ -83,11 +85,11 @@ be **backfilled** rather than starting empty.
 
 | # | Decision | Choice |
 |---|----------|--------|
-| D1 | Development model | **Full-source fork** — vendor complete v0.6.6 into the repo; merge the 5 patches into the source permanently. |
-| D2 | Repo continuity | **Continue the existing GitHub repo** (`claude-usage-widget-windows`) — preserve history, remote, launcher, setup, README; restructure it into a full package. |
+| D1 | Development model | **Full-source fork**: vendor complete v0.6.6 into the repo; merge the 5 patches into the source permanently. |
+| D2 | Repo continuity | **Continue the existing GitHub repo** (`claude-usage-widget-windows`): preserve history, remote, launcher, setup, README; restructure it into a full package. |
 | D3 | App shape | **Keep the floating OSD widget** as the glance surface; **add a Dashboard window** for history/stats/settings. |
 | D4 | History storage | **Daily rollup store** (`~/.claude/usage-daily.jsonl`, one row/day) + keep the existing fine-grained utilization point-samples. |
-| D5 | Backfill | **Yes** — one-time, local, memory-safe scan of `~/.claude/projects/*.jsonl` to reconstruct daily history on first run. |
+| D5 | Backfill | **Yes**: one-time, local, memory-safe scan of `~/.claude/projects/*.jsonl` to reconstruct daily history on first run. |
 | D6 | Charts | **Custom-painted reusable chart toolkit** (extends existing QPainter style); no QtCharts dependency. |
 
 ---
@@ -121,11 +123,11 @@ launcher + (optional) autostart".
 
 ### 4.2 Data model
 
-**Existing (unchanged):** `~/.claude/usage-history.jsonl` — point samples
+**Existing (unchanged):** `~/.claude/usage-history.jsonl`: point samples
 `{ts, session, weekly}` every refresh. Drives fine-grained "last 5h / 7d" utilization
 curves. Pruned to 90 days. (Already implemented in `history.py` + `collector.py`.)
 
-**New:** `~/.claude/usage-daily.jsonl` — one JSON object per calendar day (UTC), e.g.
+**New:** `~/.claude/usage-daily.jsonl`: one JSON object per calendar day (UTC), e.g.
 (all values synthetic):
 ```json
 {
@@ -164,11 +166,11 @@ curves. Pruned to 90 days. (Already implemented in `history.py` + `collector.py`
 - **OSD widget** (`widget.py` / `overlay.py`): unchanged role. Gains a clean entry point
   to open the Dashboard (left-click → Dashboard; or right-click menu → "Open Dashboard").
 - **Dashboard window** (`dashboard/`): a `QMainWindow` with a left nav and pages:
-  - **Overview** — today/week at a glance (cost, tokens, messages, utilization gauges).
-  - **History** — line/area charts: utilization over time, cost/day, tokens/day,
+  - **Overview**: today/week at a glance (cost, tokens, messages, utilization gauges).
+  - **History**: line/area charts: utilization over time, cost/day, tokens/day,
     messages/day; range selector (7d / 30d / 90d / all).
-  - **Breakdowns** — per-model and per-project bar charts + tables (today / week / range).
-  - **Settings** — the config currently buried in the right-click menu, surfaced as a
+  - **Breakdowns**: per-model and per-project bar charts + tables (today / week / range).
+  - **Settings**: the config currently buried in the right-click menu, surfaced as a
     real settings page (limits, refresh, theme, opacity, autostart, notifications, API).
 - The Dashboard reads the same `UsageStats` + the daily store; no new data sources.
 
@@ -186,7 +188,7 @@ A small set of `QWidget`s painted with `QPainter`, sharing one layout/axis/toolt
 
 ## 5. Phases & acceptance criteria
 
-### Phase 0 — Foundation
+### Phase 0: Foundation
 **Deliverables:** working dir becomes the continued git repo; full v0.6.6 source vendored
 into `src/claude_usage/`; the 5 patches merged into source; `pyproject.toml`, `LICENSE`,
 `NOTICE`, updated `README.md`; `setup.ps1` rewritten to install from local source; tests
@@ -195,7 +197,7 @@ scaffold + runnable `pytest`; this spec committed.
 launches the OSD; `claude-usage --version` prints the version; `pytest` runs green;
 `git log` shows continuity with the existing repo; `setup.ps1` no longer references PyPI.
 
-### Phase 1 — Stabilize
+### Phase 1: Stabilize
 **Deliverables:** diagnose the recording stall (systematic-debugging) and fix root cause;
 real rotating log file (e.g. `~/.claude/claude-usage.log`); single-instance lock;
 normalize `claude_dir` slashes; harden the refresh loop so one bad transcript/exception
@@ -205,7 +207,7 @@ and relaunching is single-instance; log file captures exceptions; after a simula
 reboot (autostart enabled) the widget is running and recording; numbers match a
 hand-computed spot check from transcripts.
 
-### Phase 2 — Usage history
+### Phase 2: Usage history
 **Deliverables:** `daily.py` store (upsert + load + prune); backfill from transcripts;
 collector wired to upsert today each refresh; the four history dimensions available to
 the UI; export extended to the daily store.
@@ -214,7 +216,7 @@ plausible tokens/cost/model/project; values reconcile with the existing today/we
 numbers for today; backfill is idempotent (re-run adds nothing) and memory-safe on a
 large `projects/` dir.
 
-### Phase 3 — UI modernization
+### Phase 3: UI modernization
 **Deliverables:** Dashboard window + chart toolkit + the four pages; cohesive restyle of
 OSD + Dashboard; tray icon; smooth open/close. Designed with mockups (visual companion).
 **Acceptance:** Dashboard opens from the widget, renders all four history dimensions +

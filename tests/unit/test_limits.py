@@ -4,7 +4,9 @@ import json
 import subprocess
 import time
 
-from claude_usage import collector
+import pytest
+
+from claude_usage import auth_watchdog, collector, snapshot, store
 
 PAYLOAD = {
     "five_hour": None,
@@ -33,9 +35,8 @@ RESET = 1796173200  # 2026-12-02T01:00:00Z
 def test_null_five_hour_is_none_not_zero():
     r = collector._parse_oauth_usage(PAYLOAD)
     assert r["five_hour"] is None
-    assert r["session_utilization"] == 0.0 and r["session_reset"] == 0  # the old widget's keys
+    assert "session_utilization" not in r  # the old widget's 0.0-when-absent keys are gone
     assert r["weekly"] == {"pct": 0.44, "resets_at": RESET, "severity": "normal"}
-    assert r["weekly_utilization"] == 0.44 and r["weekly_reset"] == RESET
     assert r["source"] == "oauth"
 
 
@@ -53,19 +54,17 @@ def test_surfaces_window_and_extra_usage():
     assert r["window_started_at"] == RESET - 7 * 86400
     assert r["extra_usage"] == {"enabled": False, "monthly_limit": 15.0, "used": 2.5, "currency": "CAD",
                                 "reason": "out_of_credits", "spend_limit_reached": False}
-    assert r["overage_status"] == "rejected"
 
 
 def test_five_hour_when_reported():
     p = dict(PAYLOAD, five_hour={"utilization": 56.0, "resets_at": "2026-11-26T10:00:00+00:00"})
     r = collector._parse_oauth_usage(p)
-    assert r["five_hour"]["pct"] == 0.56 and r["session_utilization"] == 0.56
-    assert r["session_reset"] == r["five_hour"]["resets_at"] > 0
+    assert r["five_hour"]["pct"] == 0.56 and r["five_hour"]["resets_at"] > 0
 
 
 def test_missing_weekly_stays_none():
     r = collector._parse_oauth_usage({"five_hour": None})
-    assert r["weekly"] is None and r["weekly_utilization"] == 0.0
+    assert r["weekly"] is None
     assert r["limits"] == [] and r["surfaces"] == [] and r["extra_usage"] is None
 
 
@@ -82,11 +81,10 @@ HEADERS = {
 
 def test_header_path_without_five_hour():
     r = collector._parse_rate_limit_headers(HEADERS)
-    assert r["five_hour"] is None and r["session_utilization"] == 0.0
+    assert r["five_hour"] is None and "session_utilization" not in r
     assert r["weekly"] == {"pct": 0.44, "resets_at": RESET, "severity": None}
     assert r["extra_usage"]["enabled"] is False and r["extra_usage"]["reason"] == "out_of_credits"
     assert r["representative_claim"] == "seven_day" and r["source"] == "headers"
-    assert r["overage_status"] == "rejected"
 
 
 def test_header_path_with_five_hour():
@@ -94,11 +92,10 @@ def test_header_path_with_five_hour():
                          "anthropic-ratelimit-unified-5h-reset": str(RESET * 1000)})
     r = collector._parse_rate_limit_headers(h)
     assert r["five_hour"] == {"pct": 0.25, "resets_at": RESET, "severity": None}
-    assert r["session_reset"] == RESET
 
 
-def test_no_headers_keeps_the_old_error():
-    assert collector._parse_rate_limit_headers({}) == {"error": "No rate limit headers in response"}
+def test_no_headers_is_an_error():
+    assert collector._parse_rate_limit_headers({}) == {"error": "The usage API sent no limits."}
 
 
 class _Run:
@@ -112,11 +109,49 @@ def test_fetch_oauth_usage_parses_curl_output(monkeypatch):
     assert r["weekly"]["pct"] == 0.44 and r["five_hour"] is None
 
 
-def test_fetch_oauth_usage_keeps_error_strings(monkeypatch):
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _Run("{}", "401"))
-    assert collector._fetch_oauth_usage("t") == {"error": "Credentials expired -- re-authenticate with 'claude'"}
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _Run("{}", "429"))
-    assert collector._fetch_oauth_usage("t") == {"error": "Rate limited -- try again shortly"}
+def test_fetch_errors_are_short_sentences(monkeypatch, tmp_path):
+    # They reach the tray tooltip, the OSD and the app verbatim; the watchdog and the snapshot read them too.
+    seen = []
+    for status in ("401", "429", "500"):
+        monkeypatch.setattr(subprocess, "run", lambda *a, s=status, **k: _Run("{}", s))
+        seen.append(collector._fetch_oauth_usage("t")["error"])
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _Run("[]", "200"))
+    seen.append(collector._fetch_oauth_usage("t")["error"])
+    monkeypatch.delenv("CLAUDE_USAGE_TOKEN", raising=False)
+    seen.append(collector.fetch_rate_limits(str(tmp_path))["error"])
+    assert seen == ["Credentials expired. Run claude to sign in again.", "Rate limited by the usage API. Retrying shortly.",
+                    "The usage API returned error 500.", "The usage API sent an unexpected reply.",
+                    "No credentials found. Run claude to sign in."]
+    assert [auth_watchdog.is_auth_error(e) for e in seen] == [True, False, False, False, True]
+    assert [snapshot.now_state(store.connect(":memory:"), {"error": e})["state"] for e in seen] == [
+        "signed_out", "error", "error", "error", "signed_out"]
+
+
+def test_no_credentials_file_skips_the_token_refresh(tmp_path, monkeypatch):
+    monkeypatch.delenv("CLAUDE_USAGE_TOKEN", raising=False)
+    tried = []
+    monkeypatch.setattr(collector, "_refresh_access_token_if_needed", tried.append)
+    assert collector._load_credentials(str(tmp_path)) is None and tried == []
+    (tmp_path / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {"accessToken": "synthetic"}}),
+                                                encoding="utf-8")
+    assert collector._load_credentials(str(tmp_path)) == "synthetic" and len(tried) == 1
+
+
+@pytest.mark.parametrize("tier,sub,plan", [
+    ("default_claude_max_20x", "max", "Ultra"),  # Max 20x was renamed Ultra on 2026-10-30
+    ("default_claude_ultra", "ultra", "Ultra"),
+    ("default_claude_max_5x", "max", "Max"),
+    ("default_claude_pro", "pro", "Pro"),
+    (None, "max", None),  # both Max tiers said "max"
+    (None, None, None),
+])
+def test_plan_comes_from_the_credentials(tmp_path, monkeypatch, tier, sub, plan):
+    (tmp_path / ".credentials.json").write_text(json.dumps(
+        {"claudeAiOauth": {"accessToken": "synthetic", "rateLimitTier": tier, "subscriptionType": sub}}),
+        encoding="utf-8")
+    monkeypatch.setattr(collector, "_fetch_limits", lambda d: collector._parse_oauth_usage(PAYLOAD))
+    assert collector.fetch_rate_limits(str(tmp_path))["plan"] == plan
+    assert collector._plan(str(tmp_path / "missing")) is None
 
 
 def _claude_dir(tmp_path, expires_ms):

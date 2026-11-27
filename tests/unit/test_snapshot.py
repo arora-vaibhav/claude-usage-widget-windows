@@ -1,6 +1,7 @@
 """Snapshot contract and semantics on the synthetic store (tests/fixtures/make_store.py)."""
 
 import os
+import random
 import sys
 from datetime import datetime, timedelta
 
@@ -77,17 +78,97 @@ def test_previous_window_has_the_same_length(built, rng):
     assert kpi["cost"]["prev"] == pytest.approx(prev, abs=0.01) and kpi["tokens"]["prev"] == tokens
 
 
-def test_colours_follow_all_time_rank_not_the_range(built):
+def test_colours_are_the_same_in_every_range(built):
     conn, limits = built
     colour = {}
     for rng in snapshot.RANGES:
-        g = snapshot.build(conn, rng, None, NOW, limits)["timeline"]["by"]["project"]
-        for k, c in zip(g["keys"], g["colors"]):
-            if k == "Other":
-                assert c == snapshot.OTHER
-            elif k != "Legacy":
-                assert colour.setdefault(k, c) == c, (rng, k)
-    assert sorted(colour.values()) == sorted(set(colour.values()))
+        for grp in ("project", "model"):
+            g = snapshot.build(conn, rng, None, NOW, limits)["timeline"]["by"][grp]
+            for k, c in zip(g["keys"], g["colors"]):
+                if k == "Other":
+                    assert c == snapshot.OTHER
+                elif k != "Legacy":
+                    assert colour.setdefault((grp, k), c) == c, (rng, k)
+    for grp in ("project", "model"):  # no more entities than palette slots here, so none shares one
+        mine = [c for (g, _k), c in colour.items() if g == grp]
+        assert len(mine) == len(set(mine)) and all(0 <= c < 8 for c in mine)
+
+
+def _call(root, project, when, out, tag, model="claude-opus-5-5"):
+    write(root, f"C--work-{project}/{tag}.jsonl",
+          [asst(tag, _iso(when), out=out, sid=tag, model=model, cwd=rf"C:\work\{project}")])
+
+
+def _drawn(conn, now):
+    """(range, group) -> {key: colour} for every range."""
+    out = {}
+    for rng in snapshot.RANGES:
+        snap = snapshot.build(conn, rng, None, now, None)
+        for grp in ("project", "model"):
+            g = snap["timeline"]["by"][grp]
+            out[rng, grp] = {k: c for k, c in zip(g["keys"], g["colors"]) if k != "Other"}
+    return out
+
+
+def _same_everywhere(drawn):
+    seen = {}
+    for (rng, grp), keys in drawn.items():
+        assert len(set(keys.values())) == len(keys), (rng, grp, keys)  # a chart never draws a colour twice
+        for k, c in keys.items():
+            assert seen.setdefault((grp, k), c) == c, (rng, grp, k)  # and an entity has one colour everywhere
+    return seen
+
+
+def test_colours_survive_rank_changes(tmp_path):
+    root = str(tmp_path / "projects")
+    now = datetime(2026, 11, 20, 15, 0)
+    for i, (p, out, model) in enumerate([("alpha", 400_000, "claude-opus-5-5"), ("beta", 300_000, "claude-opus-5-5"),
+                                         ("gamma", 200_000, "claude-sonnet-5-5")]):
+        _call(root, p, now - timedelta(hours=2 + i), out, f"a{i}", model=model)
+    conn = store.connect(str(tmp_path / "usage.db"))
+    ing = ingest.Ingestor(conn, root, clock=lambda: now.timestamp())
+    ing.index()
+    before = _same_everywhere(_drawn(conn, now.timestamp()))
+    assert [before["project", p] for p in ("alpha", "beta", "gamma")] == [0, 1, 2]  # first drawn, by cost
+    assert [before["model", m] for m in ("Opus 5.5", "Sonnet 5.5")] == [0, 1]
+    # beta and Sonnet now cost the most in every range, and two newcomers outspend the rest
+    _call(root, "beta", now - timedelta(hours=1), 5_000_000, "b1", model="claude-sonnet-5-5")
+    _call(root, "delta", now - timedelta(minutes=50), 3_000_000, "b2")
+    _call(root, "epsilon", now - timedelta(minutes=40), 2_000_000, "b3", model="claude-sonnet-5-5")
+    ing.index()
+    after = _same_everywhere(_drawn(conn, now.timestamp()))
+    assert {k: c for k, c in after.items() if k in before} == before
+    assert (after["project", "delta"], after["project", "epsilon"]) == (3, 4)  # next free slots, costlier first
+    # a reopened store reads the same slots back
+    reopened = store.connect(str(tmp_path / "usage.db"))
+    assert _same_everywhere(_drawn(reopened, now.timestamp())) == after
+    reopened.close()
+
+
+def test_more_projects_than_colours_share_slots_safely(tmp_path):
+    rng = random.Random(5)
+    root = str(tmp_path / "projects")
+    now = datetime(2026, 11, 20, 15, 0)
+    n = 0
+    for i in range(16):  # projects busy in different stretches of the last 120 days
+        start = rng.randint(0, 120)
+        for back in range(start, max(start - 25, -1), -1):
+            if rng.random() < 0.4:
+                n += 1
+                _call(root, f"proj-{i:02d}", now - timedelta(days=back, hours=rng.uniform(0.5, 9)),
+                      rng.randint(10_000, 2_000_000), f"c{n:04d}")
+    conn = store.connect(str(tmp_path / "usage.db"))
+    ing = ingest.Ingestor(conn, root, clock=lambda: now.timestamp())
+    ing.index()
+    first = _same_everywhere(_drawn(conn, now.timestamp()))
+    assert len([k for k in first if k[0] == "project"]) > 8  # more than the palette holds, so some share a slot
+    for i in (3, 9, 14):  # idle projects come back and reshuffle the ranks
+        n += 1
+        _call(root, f"proj-{i:02d}", now - timedelta(hours=1 + i / 10), 4_000_000, f"c{n:04d}")
+    ing.index()
+    _same_everywhere(_drawn(conn, now.timestamp()))
+    later = now + timedelta(days=9)
+    _same_everywhere(_drawn(conn, later.timestamp()))
 
 
 def test_sessions_are_capped_with_a_total(built, monkeypatch):
@@ -95,6 +176,20 @@ def test_sessions_are_capped_with_a_total(built, monkeypatch):
     monkeypatch.setattr(snapshot, "SESSION_CAP", 5)
     snap = snapshot.build(conn, "30d", None, NOW, limits)
     assert len(snap["sessions"]) == 5 and snap["sessions_total"] > 5
+
+
+def test_top_sessions_rank_every_session_in_range(built, monkeypatch):
+    conn, limits = built
+    every = snapshot.build(conn, "30d", None, NOW, limits)
+    assert every["sessions_total"] == len(every["sessions"]) > 40
+    costs = sorted((s["cost"] for s in every["sessions"]), reverse=True)
+    recent = sorted(every["sessions"], key=lambda s: s["ended"])[-5:]
+    assert sorted(s["cost"] for s in recent) != sorted(costs[:5])  # so a cap by recency would drop a top session
+    monkeypatch.setattr(snapshot, "SESSION_CAP", 5)
+    capped = snapshot.build(conn, "30d", None, NOW, limits)
+    assert [s["cost"] for s in capped["top_sessions"]] == costs[:10]
+    assert [s["cost"] for s in capped["sessions"]] == costs[:5]
+    assert all(s["started"] and s["ended"] for s in capped["top_sessions"])
 
 
 def test_all_range_uses_legacy_days_before_coverage(built):
@@ -119,9 +214,23 @@ def test_null_five_hour_never_shows_zero(built):
     assert snap["limits"]["session"] is None and snap["now"]["session"] is None
     assert snap["now"]["primary"] == "weekly"
     assert snap["limits"]["session_note"].startswith("Your plan has not reported a 5-hour limit")
+    assert snap["status"]["plan"] is None
     now = snapshot.now_state(conn, limits, NOW)
     snapshot_contract.check(now, snapshot_contract.NOW)
     assert now == snap["now"]
+
+
+def test_ultra_has_no_five_hour_limit_and_a_returning_one_shows(built):
+    conn, limits = built
+    ultra = dict(limits, plan="Ultra")
+    snap = snapshot.build(conn, "7d", None, NOW, ultra)
+    assert snap["status"]["plan"] == "Ultra" and snap["now"]["primary"] == "weekly"
+    assert snap["limits"]["session"] is None and snap["now"]["session"] is None
+    assert snap["limits"]["session_note"] == "Ultra has no 5-hour limit, so your weekly limit is the one that counts."
+    back = snapshot.build(conn, "7d", None, NOW, dict(ultra, five_hour={"pct": 0.3, "resets_at": NOW + 3600,
+                                                                          "severity": None}))
+    assert back["limits"]["session"]["pct"] == 0.3 and back["now"]["session"]["pct"] == 0.3
+    assert back["limits"]["session_note"] is None
 
 
 def test_five_hour_projected_to_run_out_first_is_primary(built):
@@ -148,9 +257,9 @@ def test_pace_engine(built):
 
 def test_signed_out_and_stale_states(built):
     conn, limits = built
-    out = snapshot.now_state(conn, {"error": "No credentials found -- run 'claude' to log in"}, NOW)
+    out = snapshot.now_state(conn, {"error": "No credentials found. Run claude to sign in."}, NOW)
     assert out["state"] == "signed_out" and out["weekly"] is None
-    stale = snapshot.now_state(conn, dict(limits, error="Rate limited -- try again shortly"), NOW)
+    stale = snapshot.now_state(conn, dict(limits, error="Rate limited by the usage API. Retrying shortly."), NOW)
     assert stale["state"] == "stale" and stale["weekly"] is not None
     assert snapshot.now_state(conn, None, NOW)["state"] == "loading"
 
@@ -210,7 +319,7 @@ def test_caches_follow_each_store_and_every_rollup(tmp_path):
     write(root, "C--work-y/s2.jsonl", [asst("m4", _ts(3), out=900_000, sid="s2", cwd=r"C:\work\gamma")])
     ing.tail()
     assert {p["name"]: p["color"] for p in snapshot.build(conn, "7d", None, now, None)["projects"]} == \
-        {"gamma": 0, "beta": 1}
+        {"gamma": 1, "beta": 0}  # beta keeps the slot it had before gamma outspent it
 
 
 def test_session_started_before_the_range_shows_its_real_start(tmp_path):

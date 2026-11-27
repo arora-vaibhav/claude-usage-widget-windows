@@ -36,6 +36,8 @@ TOP = 5
 OTHER = -1
 LEGACY = -2  # timeline series of days that only have the old usage-daily totals
 SESSION_CAP = 2000
+TOP_SESSIONS = 10
+ULTRA_NOTE = "Ultra has no 5-hour limit, so your weekly limit is the one that counts."
 ACTIVITY_DAYS = 84
 LIVE_MS = 2 * 60_000
 ACTIVE_MS = 5 * 60_000
@@ -49,8 +51,7 @@ COST_NOTE = ("Cost is API-equivalent: every API call in your local Claude Code t
              "does not save in transcripts, such as web searches and title or summary calls, and for a session "
              "older than its cleanup period it can read much higher because older transcript files are gone. "
              "Subagent transcripts written by Claude Code builds before about October 2026 often kept only the "
-             "first streamed line of a reply, so their output reads low. In the all-time range, days before full transcript coverage show the old widget's own daily "
-             "totals, which were estimated differently and usually read lower.")
+             "first streamed line of a reply, so their output reads low.")
 
 _SUMS = "COUNT(*), SUM(input), SUM(output), SUM(cache_read), SUM(cache_write_5m), SUM(cache_write_1h), SUM(web_search)"
 _PROJ = "coalesce(project, 'Unknown')"
@@ -220,7 +221,7 @@ _ALLTIME: dict = {}
 
 
 def _alltime(conn) -> tuple:
-    """All-time cost per project and per canonical model, and their colour ranks."""
+    """All-time cost per project and per canonical model."""
     key = _gen(conn)
     hit = _ALLTIME.get(key) if key else None
     if hit is not None:
@@ -234,15 +235,98 @@ def _alltime(conn) -> tuple:
         pc[project] = pc.get(project, 0.0) + c
         cid = _rate(model, speed, long)[0]
         mc[cid] = mc.get(cid, 0.0) + c
-
-    def rank(d):
-        return {k: i for i, k in enumerate(sorted(d, key=lambda k: (-d[k], k)))}
-
-    out = (pc, rank(pc), mc, rank(mc))
+    out = (pc, mc)
     if key:
         _ALLTIME.clear()
         _ALLTIME[key] = out
     return out
+
+
+def _top(costs: dict) -> list:
+    """The TOP entities by cost: the keys a timeline draws."""
+    return sorted((k for k, c in costs.items() if k and c > 0), key=lambda k: (-costs[k], k))[:TOP]
+
+
+def _tops(conn, now: float, alltime: dict) -> dict:
+    """Every range's unfiltered timeline keys per group: the sets whose members must not share a colour."""
+    out: dict = {"project": [], "model": []}
+    for n_days, kind, _label in RANGES.values():
+        costs = alltime  # shortcut: ignores legacy days replacing ledger days in "all"; build() still checks its chart
+        if n_days is not None:
+            s0 = _buckets(kind, n_days, now, datetime.fromtimestamp(now).date())[0][0]
+            d0 = s0.date().isoformat()
+            table, where, args = (("rollup", "day >= ? AND (day > ? OR hour >= ?)", (d0, d0, s0.hour))
+                                  if kind in ("hour", "6h") else ("rollup_day", "day >= ?", (d0,)))
+            costs = {"project": {}, "model": {}}
+            for proj, model, speed, long, *t in conn.execute(
+                    f"SELECT project, model, speed, long, SUM(input), SUM(output), SUM(cache_read), SUM(cache_write_5m), "
+                    f"SUM(cache_write_1h), SUM(web_search) FROM {table} WHERE {where} GROUP BY 1, 2, 3, 4", args):
+                c = sum(_price(model, speed, long, *t)[:4])
+                for g, k in (("project", proj), ("model", _rate(model, speed, long)[0])):
+                    costs[g][k] = costs[g].get(k, 0.0) + c
+        for g in out:
+            out[g].append(set(_top(costs[g])))
+    return out
+
+
+def _clash(slots: dict, sets: dict) -> bool:
+    """A set with a member that has no slot, or two members on one slot."""
+    return any(len({slots[g].get(k) for k in s} - {None}) < len(s) for g in sets for s in sets[g])
+
+
+_CHECKED: dict = {}
+
+
+def _slots(conn, now: float, charts: dict, alltime: dict) -> dict:
+    """Each project's and model's palette slot, kept in meta 'colors' so a colour survives range and rank changes.
+
+    An entity gets a slot when a range first draws it: the lowest free one that nothing it can be drawn with
+    holds, else one held only by entities no range draws now (a long-idle project lends its colour). A slot
+    moves only when two of its holders come to be drawn in one range; the one with less all-time cost moves.
+    While no slot is shared this costs one meta read; then every range is checked once per rollup and hour.
+    """
+    n = len(tokens.SERIES_LIGHT)
+    saved = store.get_meta(conn, "colors") or {}
+    out = {g: {k: v for k, v in (saved.get(g) or {}).items() if isinstance(v, int) and 0 <= v < n} for g in charts}
+    sets = {g: [set(keys)] for g, keys in charts.items()}
+    key = (_gen(conn), int(now // 3600))
+    if not _clash(out, sets) and (all(len(set(m.values())) == len(m) for m in out.values())
+                                  or key[0] and _CHECKED.get("key") == key):
+        return out
+    for g, more in _tops(conn, now, alltime).items():
+        sets[g] += more
+    if _clash(out, sets):
+        for g in charts:
+            _assign(out[g], sets[g], sets[g][0], alltime[g], n)
+        try:
+            store.set_meta(conn, "colors", out)
+        except sqlite3.Error:
+            return out  # a locked or read-only store: this build still has its colours, the next one saves them
+    if key[0]:
+        _CHECKED["key"] = key
+    return out
+
+
+def _assign(held: dict, sets: list, chart: set, cost: dict, n: int) -> None:
+    """Give every member of *sets* a slot in 0..n-1 that no member of a set it is in uses (updates *held*)."""
+    union = sorted(set().union(*sets), key=lambda k: (-cost.get(k, 0.0), k))  # the costlier keeps its slot
+    placed: dict = {}
+    for k in union:
+        mates = set().union(*(s for s in sets if k in s)) - {k}
+        must = chart - {k} if k in chart else set()  # a chart never draws one colour twice
+        holders: dict = {}
+        for j, v in held.items():
+            if j != k:
+                holders.setdefault(v, set()).add(j)
+
+        def score(i, mates=mates, must=must, holders=holders):
+            h = holders.get(i, set())
+            return (sum(placed.get(j) == i for j in must), sum(placed.get(j) == i for j in mates),
+                    bool(h & (mates - placed.keys())), bool(h.intersection(union)), bool(h), i)
+
+        if k not in held or score(held[k])[:2] != (0, 0):
+            held[k] = min(range(n), key=score)
+        placed[k] = held[k]
 
 
 # ---------------------------------------------------------------- range windows
@@ -441,7 +525,8 @@ def _limits(conn, limits: Optional[dict], now: float, thresholds: tuple) -> tupl
 
     note = None
     if session is None:
-        note = (f"Your plan has not reported a 5-hour limit since {_md(last5)}." if last5
+        note = (ULTRA_NOTE if lim.get("plan") == "Ultra" else
+                f"Your plan has not reported a 5-hour limit since {_md(last5)}." if last5
                 else "Your plan does not report a 5-hour limit.")
 
     scoped = []
@@ -591,6 +676,7 @@ def build(conn: sqlite3.Connection, range_key: str = "7d", project: Optional[str
     """The whole app view. ``project`` filters everything except ``limits`` and ``now``.
 
     Takes 50-300 ms on a large store: call it off the GUI thread, on a connection of that thread.
+    Its one write is the colour slots in meta when an entity is first drawn (see :func:`_slots`).
     """
     now = _time.time() if now is None else now
     thresholds = thresholds or (tokens.CAUTION, tokens.CRITICAL)
@@ -610,7 +696,7 @@ def build(conn: sqlite3.Connection, range_key: str = "7d", project: Optional[str
     hourly = kind in ("hour", "6h")
     rows = _rollup_rows(conn, starts[0].date().isoformat(), today.isoformat(), project, hourly)
     turns = _turn_rows(conn, t0_ms, now_ms + 1, project, hourly)
-    pc_all, prank, mc_all, mrank = _alltime(conn)
+    pc_all, mc_all = _alltime(conn)
 
     # Days before coverage_from fall back to the legacy totals when those are larger.
     priced = []
@@ -714,11 +800,15 @@ def build(conn: sqlite3.Connection, range_key: str = "7d", project: Optional[str
             leg_cost += c
             leg_msgs += msg
 
-    # ---- timeline groups: top five by cost in range, coloured by all-time rank
-    def group(grp, ranks, name):
-        costs = ent_cost[grp]
-        keys = sorted((k for k in by[grp] if k and costs.get(k, 0) > 0), key=lambda k: (-costs[k], k))[:TOP]
-        out = {"keys": [name(k) for k in keys], "colors": [ranks.get(k, OTHER) for k in keys],
+    # ---- timeline groups: top five by cost in range, each in its persistent colour slot
+    tops = {g: _top(ent_cost[g]) for g in ent_cost}
+    slots = _slots(conn, now, tops, {"project": pc_all, "model": mc_all})
+    # Lists colour only what the chart draws; the rest is in the Other band.
+    colour = {g: {k: slots[g][k] for k in tops[g]} for g in tops}
+
+    def group(grp, name):
+        keys = tops[grp]
+        out = {"keys": [name(k) for k in keys], "colors": [colour[grp][k] for k in keys],
                "values": {m: [[round(v, 4) for v in by[grp][k][m]] for k in keys] for m in by[grp].get(keys[0], {})}
                if keys else {m: [] for m in ("cost", "tokens", "messages", "agent_time")}}
         rest = [k for k in by[grp] if k not in keys]
@@ -744,7 +834,7 @@ def build(conn: sqlite3.Connection, range_key: str = "7d", project: Optional[str
         "partial_last": True,
         "totals": {"cost": round(total.cost, 4), "tokens": total.tok, "messages": total.calls,
                    "agent_time": total.agent},
-        "by": {"project": group("project", prank, str), "model": group("model", mrank, model_name)},
+        "by": {"project": group("project", str), "model": group("model", model_name)},
     }
 
     # ---- previous equal-length window, ending where this one starts
@@ -795,10 +885,10 @@ def build(conn: sqlite3.Connection, range_key: str = "7d", project: Optional[str
     for name in sorted(pc_all, key=lambda k: (k not in proj_range, -(proj_range.get(k, [0.0])[0]), -pc_all[k], k)):
         pr = proj_range.get(name)
         projects.append({"name": name, "sessions": len(pr[1]) if pr else 0, "cost": round(pr[0], 2) if pr else 0.0,
-                         "color": prank.get(name, OTHER), "idle": pr is None})
+                         "color": colour["project"].get(name, OTHER), "idle": pr is None})
 
-    # ---- sessions
-    sids = sorted(sessions, key=lambda k: -sessions[k]["last"])
+    # ---- sessions, ranked by cost over the whole range before the cap
+    sids = sorted(sessions, key=lambda k: (-sessions[k]["cost"], -sessions[k]["last"]))
     meta = {}
     for i in range(0, len(sids), 500):
         chunk = sids[i:i + 500]
@@ -815,14 +905,14 @@ def build(conn: sqlite3.Connection, range_key: str = "7d", project: Optional[str
     for sid in sids:
         s = sessions[sid]
         first_of[sid or ""] = s["first"]
-        shown = len(sess_out) < SESSION_CAP  # rows past the cap only feed the facts
+        shown = len(sess_out) < max(SESSION_CAP, TOP_SESSIONS)  # rows past both caps only feed the facts
         title, entry = meta.get(sid, (None, None))
         proj = max(s["projects"], key=s["projects"].get)
         sess_out.append({
             "id": sid or "",
             "title": title,
             "project": proj,
-            "color": prank.get(proj, OTHER),
+            "color": colour["project"].get(proj, OTHER),
             "model": model_name(max(s["models"], key=s["models"].get)),
             "entrypoint": entry or "unknown",
             "started": _iso(s["first"] / 1000) if shown else "",
@@ -844,7 +934,7 @@ def build(conn: sqlite3.Connection, range_key: str = "7d", project: Optional[str
     model_out = [{"name": "Legacy" if cid == "legacy" else model_name(cid), "id": cid, "cost": round(m["cost"], 4),
                   "share": round(m["cost"] / all_cost, 4) if all_cost else 0.0,
                   "output": int(m["output"]), "cache_hit": round(m["cr"] / m["prompt"], 4) if m["prompt"] else None,
-                  "calls": int(m["calls"]), "color": LEGACY if cid == "legacy" else mrank.get(cid, OTHER),
+                  "calls": int(m["calls"]), "color": LEGACY if cid == "legacy" else colour["model"].get(cid, OTHER),
                   "priced": m["priced"]}
                  for cid, m in sorted(models.items(), key=lambda kv: -kv[1]["cost"])]
     cost_split = {k: {"cost": round(split[i][0], 4), "tokens": int(split[i][1])}
@@ -867,6 +957,7 @@ def build(conn: sqlite3.Connection, range_key: str = "7d", project: Optional[str
             "updated_at": _iso(updated_at if updated_at is not None else now),
             "limits_as_of": _iso((limits or {}).get("fetched_at")),
             "indexing": indexing,
+            "plan": (limits or {}).get("plan"),
             "transcripts": conn.execute("SELECT COUNT(*) FROM files").fetchone()[0],
             "coverage_from": cov,
             "legacy_before": cov if legacy else None,
@@ -877,6 +968,7 @@ def build(conn: sqlite3.Connection, range_key: str = "7d", project: Optional[str
         "timeline": timeline,
         "projects": projects,
         "sessions": sess_out[:SESSION_CAP],
+        "top_sessions": sess_out[:TOP_SESSIONS],
         "sessions_total": len(sess_out),
         "activity": activity,
         "models": model_out,

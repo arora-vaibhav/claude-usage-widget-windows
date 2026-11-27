@@ -7,6 +7,7 @@ T.Slider {
     implicitWidth: 200
     implicitHeight: 24
     hoverEnabled: true
+    opacity: enabled ? 1 : 0.45
     background: Item {
         x: s.leftPadding; y: s.topPadding + s.availableHeight / 2 - 2
         width: s.availableWidth; height: 4

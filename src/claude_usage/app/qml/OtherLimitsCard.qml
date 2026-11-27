@@ -5,7 +5,8 @@ import QtQuick
 Card {
     id: card
     property var limits: null
-    readonly property real natural: col.implicitHeight + 24 + 8 + 2 * padding
+    property string plan: ""         // status.plan, when the data layer knows it
+    readonly property real natural: col.implicitHeight + 30 + 2 * padding
 
     // The API sends codes like "out_of_credits"; show them as a short sentence.
     function reasonText(code) {
@@ -18,11 +19,15 @@ Card {
     readonly property var rows: {
         var L = limits, out = []
         if (!L) return out
-        if (L.session) {
+        // never a 0% meter for a window that has not started or does not exist
+        if (L.session && (L.session.resets_at || L.session.pct > 0)) {
             var r = Ui.date(L.session.resets_at)
             out.push({ label: "5-hour session", value: Ui.pct(L.session.pct), meter: L.session.pct, sub: r ? "Resets " + Ui.when(r) : "" })
+        } else if (L.session) {
+            out.push({ label: "5-hour session", pill: "Not started", sub: "Starts on your next prompt." })
         } else {
-            out.push({ label: "5-hour session", pill: "Not reported", sub: L.session_note || "Your plan does not report a 5-hour limit right now." })
+            out.push({ label: "5-hour session", pill: card.plan === "Ultra" ? "None on Ultra" : "Not reported",
+                       sub: L.session_note || "Your plan does not report a 5-hour limit right now." })
         }
         L.scoped.forEach(function (sc) {
             var sub = (sc.active ? "In use this week" : "Not in use this week")
@@ -50,38 +55,44 @@ Card {
     Txt { id: title; height: 24; text: "Other limits"; color: Ui.p.text_muted }
     Column {
         id: col
-        y: 32
+        y: 30
         width: parent.width
+        spacing: 9
         Repeater {
             model: card.rows
-            Column {
+            Item {
                 width: col.width
-                bottomPadding: index < card.rows.length - 1 ? 10 : 0
-                spacing: 5
+                height: row.y + row.implicitHeight
                 Rectangle { visible: index > 0; width: parent.width; height: 1; color: Ui.p.line }
-                Item { width: 1; height: index ? 3 : 0 }
-                Item {
-                    width: parent.width; height: 24
-                    Txt { height: 24; text: modelData.label; font.weight: 600; width: parent.width - 90 }
-                    Txt { visible: modelData.value !== undefined; anchors.right: parent.right; height: 24; text: modelData.value || ""; font.weight: 600 }
-                    Pill { visible: !!modelData.pill; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; text: modelData.pill || ""; kind: modelData.pillKind || "none" }
-                }
-                Rectangle {
-                    visible: modelData.meter !== undefined
-                    width: parent.width; height: 6; radius: 3; color: Ui.p.track
-                    Rectangle {
-                        width: Math.max(modelData.meter > 0 ? 6 : 0, parent.width * Math.min(1, modelData.meter || 0))
-                        height: 6; radius: 3
-                        color: card.meterColor(modelData.meter || 0)
-                    }
-                }
-                Txt {
-                    visible: modelData.sub !== ""
+                Column {
+                    id: row
+                    y: index ? 10 : 0
                     width: parent.width
-                    text: modelData.sub
-                    wrapMode: Text.WordWrap; elide: Text.ElideNone
-                    font.pixelSize: 12; color: Ui.p.text_muted
-                    lineHeight: 1.15
+                    spacing: 4
+                    Item {
+                        width: parent.width; height: 22
+                        // the label takes the row unless a value or pill sits at its end
+                        TipTxt { height: 22; text: modelData.label; font.weight: 600; width: parent.width - (val.visible ? val.implicitWidth + 12 : tag.visible ? tag.width + 12 : 0) }
+                        Txt { id: val; visible: modelData.value !== undefined; anchors.right: parent.right; height: 22; text: modelData.value || ""; font.weight: 600 }
+                        Pill { id: tag; visible: !!modelData.pill; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; text: modelData.pill || ""; kind: modelData.pillKind || "none" }
+                    }
+                    Rectangle {
+                        visible: modelData.meter !== undefined
+                        width: parent.width; height: 6; radius: 3; color: Ui.p.track
+                        Rectangle {
+                            width: Math.max(modelData.meter > 0 ? 6 : 0, parent.width * Math.min(1, modelData.meter || 0))
+                            height: 6; radius: 3
+                            color: card.meterColor(modelData.meter || 0)
+                        }
+                    }
+                    Txt {
+                        visible: modelData.sub !== ""
+                        width: parent.width
+                        text: modelData.sub
+                        wrapMode: Text.WordWrap; elide: Text.ElideNone
+                        font.pixelSize: 12; color: Ui.p.text_muted
+                        lineHeight: 1.1
+                    }
                 }
             }
         }

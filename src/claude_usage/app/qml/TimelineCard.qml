@@ -244,20 +244,28 @@ Card {
         }
         readonly property var bands: stack.bands
         readonly property var soFar: tl && tl.partial_last && card.n > 1 ? { x: px(card.n - 1), y: py(card.tot[card.n - 1]) } : null
-        // "so far" goes just above or below the dot where it clears the bands
-        // beside it; otherwise the tooltip explains the open dot
+        // "so far" goes just above, below or left of the dot where it clears
+        // the bands and the dashed lead; otherwise the tooltip explains the open dot
         readonly property var soFarLabel: {
             if (!soFar) return null
-            var w = fmAxis.advanceWidth("so far"), x = Math.min(xR - w, soFar.x - w / 2), ceil = base
-            for (var k = 0; k <= card.lastFull; k++) {
-                var bx = px(k)
-                if (bx >= x - 6 && bx <= x + w + 6) ceil = Math.min(ceil, py(card.plotTot[k]))
+            var w = fmAxis.advanceWidth("so far"), xc = Math.min(xR - w, soFar.x - w / 2)
+            var x0 = card.lastFull >= 0 ? px(card.lastFull) : soFar.x, y0 = card.lastFull >= 0 ? py(card.plotTot[card.lastFull]) : soFar.y
+            function clear(x, y) {
+                if (y < yTop - 10 || y + 18 > base || x < xL) return false
+                for (var k = 0; k <= card.lastFull; k++) {
+                    var bx = px(k)
+                    if (bx >= x - 6 && bx <= x + w + 6 && y + 18 > py(card.plotTot[k])) return false
+                }
+                for (var t = 0; t <= 1; t += 0.05) {
+                    var lx = x0 + (soFar.x - 5 - x0) * t, ly = y0 + (soFar.y - y0) * t
+                    if (lx >= x - 3 && lx <= x + w + 3 && ly >= y - 2 && ly <= y + 18) return false
+                }
+                return true
             }
-            // the side the dashed lead does not come from
-            var from = card.lastFull >= 0 ? py(card.plotTot[card.lastFull]) : soFar.y
-            var cands = from < soFar.y ? [soFar.y + 10, soFar.y - 26] : [soFar.y - 26, soFar.y + 10]
-            for (var i = 0; i < 2; i++)
-                if (cands[i] >= yTop - 10 && cands[i] + 18 <= Math.min(ceil, base)) return { x: x, y: cands[i] }
+            // the side the dashed lead does not come from first
+            var below = { x: xc, y: soFar.y + 10 }, above = { x: xc, y: soFar.y - 26 }, left = { x: soFar.x - 14 - w, y: Math.min(soFar.y - 8, base - 18) }
+            var cands = y0 < soFar.y ? [below, left, above] : [above, left, below]
+            for (var i = 0; i < 3; i++) if (clear(cands[i].x, cands[i].y)) return cands[i]
             return null
         }
 
@@ -555,6 +563,13 @@ Card {
                     }
                 }
             }
+        }
+        // the open dot explained here when no "so far" label fits beside it
+        Row {
+            visible: !!chart.soFar && !chart.soFarLabel && chart.maxV > 0
+            height: 30; spacing: 7; leftPadding: 4
+            Rectangle { anchors.verticalCenter: parent.verticalCenter; width: 9; height: 9; radius: 4.5; color: "transparent"; border.width: 1.5; border.color: Ui.p.text_muted }
+            Txt { height: 30; text: "Open dot: " + (card.tl ? card.partialNote().charAt(0).toLowerCase() + card.partialNote().slice(1) : ""); font.pixelSize: 12; color: Ui.p.text_muted }
         }
     }
 }

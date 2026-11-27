@@ -9,7 +9,7 @@ The widget is useful but reads as unfinished. The owner's verdict: the UI is not
 
 The November 2026 audit measured the problems:
 
-- History under-reports by 22% ($8.4k) and 36% of tokens over 08-19..11-26. Subagent transcripts are skipped, the price table predates the 5.x models and 1h cache writes, and day rows are copied across an overnight sleep and then frozen by a max() merge.
+- History under-reports by 22% of cost and 36% of tokens over 08-19..11-26. Subagent transcripts are skipped, the price table predates the 5.x models and 1h cache writes, and day rows are copied across an overnight sleep and then frozen by a max() merge.
 - The 5-hour limit has been null since 2026-10-30 (the Ultra plan has none) but the app shows 0%. Weekly is the binding limit, and the OAuth payload carries more than the app reads (scoped Fable limit, surface breakdown, extra usage).
 - The running widget burns 15% of a core and logged 58 MemoryErrors because it re-reads every recently changed transcript every 30 s.
 - Every font falls back to Courier New or Arial. The minimized OSD is a 6px line. 29% of the code is themes and skins, none finished.
@@ -39,7 +39,7 @@ The November 2026 audit measured the problems:
 
 ## Constraints
 
-- Only dependency stays `PySide6-Essentials` (6.11.1 installed). It ships QtQuick, QtQuick.Controls (FluentWinUI3 style), QtQuick.Shapes, QtQuick.Effects, QtNetwork, sqlite3 is stdlib. QtGraphs, QtCharts and QtWebEngine are not available.
+- Only dependency stays `PySide6-Essentials` (6.7 or later for variable font axes; 6.11.1 installed). It ships QtQuick, QtQuick.Controls (FluentWinUI3 style), QtQuick.Shapes, QtQuick.Effects, QtNetwork, sqlite3 is stdlib. QtGraphs, QtCharts and QtWebEngine are not available.
 - Python 3.10+ (runs on 3.14 here). Windows 11 first.
 - The installed tool is an editable install of this checkout's `src`, so development happens in a worktree.
 - Real-data renders and snapshots stay in scratch folders, never in the repo. Fixtures are synthetic.
@@ -65,7 +65,7 @@ worker (every refresh_seconds):
   snapshot.now(store, limits)   -> "now" dict
   emit refreshed
 GUI thread:
-  overlay.set_now(now); tray tooltip; notifier thresholds
+  osd.set_now(now); tray tooltip; notifier thresholds
   app backend: if window visible, rebuild snapshot for the current range/project
 ```
 
@@ -78,10 +78,10 @@ GUI thread:
 - `snapshot.py` (new, pure): `build(conn, range_key, project, now, limits) -> dict` and `now(...) -> dict`. Contract: `tests/unit/snapshot_contract.py`.
 - `tokens.py` (new): the design tokens. Replaces `themes.py`.
 - `app/` (new): `window.py` (engine, `Backend` QObject bridge) and `qml/` (pages and components).
-- `overlay.py` (rewritten): pill and card, states, tokens.
+- `osd.py` (replaces `overlay.py`): pill and card, states, tokens.
 - `widget.py` (slimmed): controller, worker, tray, menus, settings, single instance.
 - Kept: `config.py`, `autostart.py`, `auth_watchdog.py`, `logging_setup.py`, `winchrome.py`, `notifier.py` (switched to tray balloons), `updater.py` (fixed), `cli.py`.
-- Deleted: `skins/`, `dashboard/`, `themes.py`, `ticker.py`, `webhooks.py`, `ai_report.py`, `exporter.py`, `api_server.py`, `cache_analyzer.py`, `analytics.py`, `trends.py`, `forecast.py` and the old view classes in `widget.py`.
+- Deleted: `skins/`, `dashboard/`, `themes.py`, `ticker.py`, `webhooks.py`, `ai_report.py`, `exporter.py`, `api_server.py`, `cache_analyzer.py`, `analytics.py`, `trends.py`, `forecast.py`, `history.py`, `live_stream.py`, `subagents.py`, `overlay.py` and the old view classes in `widget.py`.
 
 ### Store schema
 
@@ -100,7 +100,7 @@ Cost is never stored. It is computed from tokens and the price table when read, 
 - Walk `~/.claude/projects/**/*.jsonl` recursively (main sessions and `subagents/**`, including workflow runs).
 - Per file, read from the stored offset to the last complete newline. If the file shrank or its mtime went back, re-read from 0 (dedupe makes that safe). Skip any line over 8 MB after advancing past it.
 - Cheap byte prefilter before `json.loads`: only lines that can be an assistant message with usage, a `turn_duration` record, or a title record.
-- One row per `message.id`. Claude Code writes a message on several lines while it streams, and early lines can carry a partial `output_tokens` (measured: keeping the first line drops 10.8% of output tokens). So upsert: every usage field keeps the maximum seen across the message's lines, the timestamp keeps the earliest. Skip `<synthetic>` models.
+- One row per `message.id`. Claude Code writes a message on several lines while it streams, and early lines can carry a partial `output_tokens` (measured: keeping the first line drops 40.7% of output tokens, almost all of it in subagent transcripts from August to October 2026). So upsert: every usage field keeps the maximum seen across the message's lines, the timestamp keeps the earliest. Skip `<synthetic>` models.
 - Claude Code's own `cost-state` records (`modelUsage.<model>.costUSD` per session) are an independent check on pricing, not a source of truth. Published per-token prices are the truth for "API-equivalent"; any systematic gap is explained and shown in the UI's cost note.
 - `day` and `hour` come from the call's own timestamp converted to local time. Never from `now()`.
 - Project = basename of the record's `cwd`, with `\.claude\worktrees\<x>` and `.worktrees\<x>` folded to the repo folder, the home folder shown as "Home", and anything under the system temp folder grouped as "Temporary folders" (never a raw path). Fallback: the decoded project directory name.
@@ -126,8 +126,8 @@ Import `~/.claude/usage-daily.jsonl` read-only into `legacy_days`. A row whose c
 - `now`: range-independent; drives the OSD. `primary` is the limit projected to run out first (weekly when the 5h limit is absent).
 - `limits.weekly`: pace engine. `elapsed` = share of the window gone; `pace` = pct / elapsed; `eta` = when 100% is reached at the faster of the 24 h rate and the window-average rate; `usual` and `usual_series` = median of past complete windows at the same elapsed share; `locked_hours` = time between eta and reset; `daily_budget` = what per day keeps you under 100%.
 - `kpis`: cost, tokens, sessions, agent time, cache hit rate, each with the previous equal-length window (to the same hour) and a sparkline. Deltas are `null` when the previous window reaches past `coverage_from` or for `all`.
-- `timeline`: buckets are hour (24h), 6h (7d), day (30d, 90d), week (all). The in-progress bucket is flagged by `partial_last` and drawn as "so far". Series by project and by model, top 5 plus Other. Colour index = the entity's all-time cost rank, so colours never change with the range; Other is `-1`.
-- `sessions`: every session with a call in range (cap 2,000), with title when Claude Code stored one.
+- `timeline`: buckets are hour (24h), 6h (7d), day (30d, 90d), week (all). The in-progress bucket is flagged by `partial_last` and drawn as "so far". Series by project and by model, top 5 plus Other. Colour index = a palette slot (0-7) that each project and model keeps across ranges and days, saved in the store's `meta` as `colors`: an entity takes the lowest free slot when a range first draws it, a slot is shared only with entities no range draws now, and a chart never draws one colour twice. Other is `-1`, legacy days `-2`.
+- `sessions`: the sessions with a call in range, ranked by cost and capped at 2,000, with title when Claude Code stored one. `top_sessions` holds the ten costliest of all of them, and `sessions_total` counts them.
 - `activity`: last 84 days, heatmap levels 0-4, streaks and pre-formatted facts.
 - Range keys: `24h`, `7d` (default), `30d`, `90d`, `all`. Project filter applies to everything except `limits` and `now`.
 
@@ -151,7 +151,7 @@ QWidget painter on the same tokens. Two styles:
 - **Pill** (replaces the 6px capsule; default when the user had `osd_minimized`): 32px tall, status dot, primary limit first ("7d 46%" with a 3px meter and "5d 17h"), then the other limit if reported. Hover raises opacity to 1 and shows a tooltip with the forecast.
 - **Card**: 296x136, header "Claude usage" plus a status chip; two columns (or one when 5h is absent) with label, 28px value, 4px meter, and "Resets in 2h 30m" or the forecast in caution/critical colour; footer "Today $82".
 
-Rules: values always in the text colour; colour only on meters and icons; levels from config thresholds (75/90); plate alpha at least 0.85 under text, user opacity applies to the whole window only when idle and normal; stale shows values dimmed with "as of 14:02"; signed out shows "Sign in" and no numbers; no overlapping badges; sizes on a 4px grid and integer device pixels. Click opens the app, right-click opens the menu, drag moves it (position and taskbar parking behave as today).
+Rules: values always in the text colour; colour only on meters and icons; levels from config thresholds (75/90); plate alpha at least 0.85 under text (1.0 in light mode), user opacity applies to the whole window only when idle and normal; stale shows values dimmed with "as of 14:02"; signed out shows "Sign in" and no numbers; no overlapping badges; sizes on a 4px grid and integer device pixels. Click opens the app, right-click opens the menu, drag moves it (position and taskbar parking behave as today).
 
 ## Menus, tray, single instance
 
@@ -165,7 +165,7 @@ One menu for OSD right-click and tray: Open Claude Usage, Refresh now, Pill/Card
 
 - Unit: store migrations, ingest (nested subagent file, repeated message id, the same id in a resumed file, partial last line, file shrink, a refresh across midnight, 5m vs 1h writes), pricing per current model, limits parsing (null five_hour, scoped, extra usage), snapshot contract and consistency on a synthetic store, config migration.
 - Render: offscreen grabs of the app (light and dark, Overview and Sessions and Settings) and the OSD (every state, both styles) from synthetic fixtures; assert no QML warnings.
-- Real data (scratch only): full index of the owner's transcripts, totals reconciled with the audit recount ($37,644.54 for 08-19..11-26), snapshot timing, CPU over 10 minutes of running.
+- Real data (scratch only): full index of the owner's transcripts, totals reconciled with an independent recount (exact to the token per day for 08-19..11-25), snapshot timing, CPU over 10 minutes of running.
 
 ## Left to the builder
 

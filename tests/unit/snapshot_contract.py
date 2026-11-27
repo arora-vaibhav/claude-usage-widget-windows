@@ -181,6 +181,7 @@ SNAPSHOT = {
         "updated_at": Opt(str),
         "limits_as_of": Opt(str),
         "indexing": Opt({"done": int, "total": int}),
+        "plan": Opt(str),  # "Ultra", "Max" or "Pro" from the credentials
         "transcripts": int,
         "coverage_from": Opt(str),
         "legacy_before": Opt(str),
@@ -191,6 +192,7 @@ SNAPSHOT = {
     "timeline": TIMELINE,
     "projects": [PROJECT],
     "sessions": [SESSION],
+    "top_sessions": [SESSION],  # the ten costliest of every session in range
     "sessions_total": int,
     "activity": ACTIVITY,
     "models": [MODEL],
@@ -247,4 +249,4 @@ def check_consistency(snap: dict) -> None:
                 assert len(s) == n, f"timeline.by.{by}.values.{m}: series length {len(s)} != {n} starts"
     for k in snap["kpis"]:
         assert len(k["series"]) >= 2, f"kpi {k['key']}: sparkline needs 2+ points"
-    assert snap["sessions_total"] >= len(snap["sessions"])
+    assert snap["sessions_total"] >= len(snap["sessions"]) >= len(snap["top_sessions"])

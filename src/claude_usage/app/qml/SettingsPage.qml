@@ -5,7 +5,13 @@ Page {
     id: page
     readonly property var s: backend.settings
     readonly property var st: snap ? snap.status : null
-    readonly property var th: s.notify_thresholds || [Ui.caution, Ui.critical]
+    // the stored pair when it is one (config allows 0 < caution < critical <= 1)
+    readonly property var th: {
+        var t = s.notify_thresholds
+        return t && t.length === 2 && t[0] > 0 && t[0] < t[1] && t[1] <= 1 ? t : [Ui.caution, Ui.critical]
+    }
+    // the overlay never goes below this while it carries text (osd.MIN_OPACITY)
+    readonly property real opacityFloor: 0.85
     readonly property real colW: Math.min(cw, 820)
 
     function setThreshold(i, v) {
@@ -42,7 +48,7 @@ Page {
         SettingRow {
             first: true
             label: "Style"
-            hint: "Pill is a slim bar with the binding limit. Card shows both limits and today's cost."
+            hint: "Pill is a slim bar with the limit that runs out first. Card shows every limit your plan reports, when each resets, and today's cost."
             Seg {
                 name: "Overlay style"
                 options: [["pill", "Pill"], ["card", "Card"]]
@@ -52,13 +58,16 @@ Page {
         }
         SettingRow {
             label: "Opacity when idle"
-            hint: "The overlay turns fully opaque when you point at it or a limit needs attention."
-            Txt { height: 24; width: 44; horizontalAlignment: Text.AlignRight; text: Ui.pct(op.value) }
+            hint: Ui.dark ? "Down to 85%, so its text stays readable. The overlay turns fully opaque when you point at it or a limit needs attention."
+                          : "The light overlay stays fully opaque so its text stays readable. Switch to dark to let it fade when idle."
+            // what the overlay applies: an older config may hold a value under the floor
+            Txt { height: 24; width: 44; horizontalAlignment: Text.AlignRight; text: Ui.pct(Ui.dark ? op.value : 1); color: op.enabled ? Ui.p.text : Ui.p.text_faint }
             SliderX {
                 id: op
                 width: 180
-                from: 0.3; to: 1; stepSize: 0.05
-                value: page.s.osd_opacity !== undefined ? page.s.osd_opacity : 1
+                enabled: Ui.dark
+                from: page.opacityFloor; to: 1; stepSize: 0.01
+                value: page.s.osd_opacity !== undefined ? Math.max(page.opacityFloor, page.s.osd_opacity) : 1
                 Accessible.name: "Overlay opacity"
                 onMoved: backend.setSetting("osd_opacity", Math.round(value * 100) / 100)
             }
@@ -106,11 +115,11 @@ Page {
         SettingRow {
             label: "Caution at"
             hint: "Meters turn amber, and an alert fires if alerts are on."
-            Txt { height: 24; width: 44; horizontalAlignment: Text.AlignRight; text: Ui.pct(ca.value) }
+            Txt { height: 24; width: 44; horizontalAlignment: Text.AlignRight; text: Ui.pct(page.th[0]) }
             SliderX {
                 id: ca
                 width: 180
-                from: 0.5; to: 0.95; stepSize: 0.05
+                from: 0.05; to: 0.95; stepSize: 0.05
                 value: page.th[0]
                 Accessible.name: "Caution threshold"
                 onMoved: page.setThreshold(0, value)
@@ -119,11 +128,11 @@ Page {
         SettingRow {
             label: "Critical at"
             hint: "Meters turn red, and an alert fires if alerts are on."
-            Txt { height: 24; width: 44; horizontalAlignment: Text.AlignRight; text: Ui.pct(cr.value) }
+            Txt { height: 24; width: 44; horizontalAlignment: Text.AlignRight; text: Ui.pct(page.th[1]) }
             SliderX {
                 id: cr
                 width: 180
-                from: 0.6; to: 0.99; stepSize: 0.01
+                from: 0.1; to: 1; stepSize: 0.01
                 value: page.th[1]
                 Accessible.name: "Critical threshold"
                 onMoved: page.setThreshold(1, value)

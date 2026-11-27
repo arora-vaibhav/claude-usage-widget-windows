@@ -4,9 +4,11 @@ composited colours over any backdrop), never overlaps text and stays on the
 
 from __future__ import annotations
 
+import inspect
 import itertools
 import math
 import os
+import re
 import sys
 from datetime import datetime, timedelta
 from functools import lru_cache
@@ -22,8 +24,9 @@ from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, Qt, QVariantAnimatio
 from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from claude_usage import osd, tokens  # noqa: E402
+from claude_usage import collector, osd, snapshot, tokens  # noqa: E402
 from claude_usage.osd import EDGE_MARGIN, MIN_OPACITY, MIN_OPACITY_LIGHT, Osd, _clock, _pct, _when  # noqa: E402
+from claude_usage.widget import NEWER_STORE as NEWER  # noqa: E402  (the one error today that is not a fetch's)
 
 sys.path.insert(0, os.path.dirname(__file__))
 from snapshot_contract import NOW, check  # noqa: E402
@@ -93,6 +96,9 @@ def states(now: datetime | None = None) -> dict[str, dict]:
                           "weekly": meter(0.78, timedelta(days=2, hours=4), timedelta(days=1, hours=2))},
         "long_error": {**base, **none, "state": "error", "as_of": None,
                        "message": "OAuth token expired; run claude login in a terminal, then wait for the next refresh"},
+        "wk_only_limited": {**base, "session": None, "weekly": meter(1.0, timedelta(days=6, hours=23, minutes=50))},
+        # Not a fetch failure: nothing retries, and the empty stand-in store's $0 is not today's cost.
+        "newer_store": {**base, **none, "state": "error", "as_of": None, "today_cost": 0.0, "message": NEWER},
     }
 
 
@@ -296,6 +302,14 @@ def test_binding_limit_comes_first_and_missing_5h_is_omitted():
     assert [it.text for it in make("normal", "pill").items() if it.role == "tag"] == ["7d", "5h"]
     assert len([it for it in make("no_5h", "card").items() if it.role == "value"]) == 1
     assert [it.text for it in make("no_5h", "pill").items() if it.role == "tag"] == ["7d"]
+    # Ultra (five_hour null): weekly only on every surface, never a 5-hour 0%, and a 5h limit
+    # that comes back shows again on the next refresh.
+    for style in ("pill", "card"):
+        w = make("no_5h", style)
+        said = [it.text for it in w.items() if it.kind == "text"] + [w.toolTip()]
+        assert not any(k in t for t in said for k in ("5h", "5-hour", "Session")), (style, said)
+        w.set_now(states()["normal"])
+        assert ("5h" if style == "pill" else "5-hour") in [it.text for it in w.items()], style
 
 
 def test_percent_never_rounds_up_to_the_limit():
@@ -317,7 +331,7 @@ def test_no_limits_says_so_instead_of_loading_forever():
 
 
 def test_every_limited_column_says_limited():
-    for state in ("limited", "limited_5h", "both_limited", "limited_far"):
+    for state in ("limited", "limited_5h", "both_limited", "limited_far", "wk_only_limited"):
         w = make(state)
         texts = [it.text for it in w.items() if it.kind == "text"]
         limited = [m for _, m in w._meters() if m["level"] == "limited"]
@@ -336,6 +350,9 @@ def test_states_show_their_copy():
     assert "Limit any minute" in texts("eta_now")
     one = texts("wk_only_critical")  # one column: the forecast and the reset side by side
     assert "Limit in ~" in one and "Resets " in one
+    # Weekly only without a forecast (Ultra's usual card): the reset date and the countdown.
+    subs = [it.text for it in sorted(make("no_5h").items(), key=lambda it: it.rect.left()) if it.role == "sub"]
+    assert subs[0].startswith("Resets ") and subs[1] == "in 5d 17h", subs
     assert "Starts on next prompt" in texts("not_started") or "Not started" in texts("not_started")
     assert "Today $82.40" in texts("normal")
     assert not [it for it in make("loading").items() if it.role == "value"]
@@ -347,6 +364,36 @@ def test_states_show_their_copy():
     assert "resets" not in make("limited").toolTip().split("\n")[0]
     assert "At this pace the limit is reached any minute" in make("eta_now").toolTip()
     assert osd._rate(999_960) == "1.0M tok/min" and osd._rate(999_940) == "999.9k tok/min"
+    # The 5-hour limit has one name on the card, the tooltip, the menu, the tray and the alerts.
+    assert [it.text for it in make("normal").items() if it.role == "label"] == ["Weekly", "5-hour"]
+    assert "5-hour 12%, resets in 2h 30m" in make("normal").toolTip()
+
+
+def test_signed_out_tooltip_says_why_and_as_of_when():
+    st = states()["signed_out"]
+    assert make("signed_out").toolTip().splitlines()[-1] == "No credentials found"
+    as_of = datetime.now().astimezone() - timedelta(minutes=47)
+    w = Osd()
+    w.set_now({**st, "as_of": as_of.isoformat()})  # signed out after a good fetch
+    assert w.toolTip().splitlines()[-1] == f"As of {_clock(as_of)}. No credentials found"
+
+
+def test_only_fetch_errors_say_they_retry():
+    def texts(state, style="card"):
+        return [it.text for it in make(state, style).items() if it.kind == "text"]
+    net = texts("error")
+    assert "Can't reach Claude" in net and "Today $82.40" in net
+    assert " ".join(texts("error")).endswith("Network unreachable. Retrying automatically.")
+    newer = texts("newer_store")
+    assert not [t for t in newer if "reach" in t or "Retrying" in t or "$" in t], newer
+    assert " ".join(it.text for it in make("newer_store").items() if it.role == "body") == NEWER
+    assert make("newer_store").toolTip() == NEWER
+    assert "Limits unavailable" in texts("newer_store", "pill")
+    # Every fetch error the collector can return, however it is worded, is a sign-out or says it retries.
+    msgs = re.findall(r'\{"error": f?"([^"]+)"\}', inspect.getsource(collector))
+    assert len(msgs) >= 5, msgs
+    for msg in msgs + ["Collection error: TimeoutError"]:  # the last is the worker's own
+        assert snapshot._state({"error": msg}, 0)[0] == "signed_out" or osd._retries({"message": msg}), msg
 
 
 def test_long_error_wraps_and_keeps_its_end():

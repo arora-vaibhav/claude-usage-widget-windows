@@ -51,10 +51,10 @@ Flickable {
 
     Item {
         id: header
-        x: (page.width - page.cw) / 2; y: 24
-        width: page.cw; height: 64
+        x: (page.width - page.cw) / 2; y: 20
+        width: page.cw; height: 58
         Column {
-            spacing: 4
+            spacing: 2
             width: parent.width - tools.width - 16
             Txt { width: parent.width; text: page.title; display: true; font.pixelSize: 28; font.weight: 600; height: 36 }
             Txt { width: parent.width; text: page.subtitle; color: Ui.p.text_muted; visible: text !== "" }
@@ -69,7 +69,7 @@ Flickable {
     }
     Column {
         id: body
-        x: header.x; y: header.y + header.height + 20
+        x: header.x; y: header.y + header.height + 16
         width: page.cw
         spacing: Ui.gap
     }

@@ -46,8 +46,12 @@ EDGE_MARGIN = 16
 # DirectWrite and FreeType; the "Segoe UI Variable Text" family name does not.
 FAMILIES = ["Segoe UI Variable", "Segoe UI"]
 RANK = {"none": 0, "normal": 1, "caution": 2, "critical": 3, "limited": 4}
-NAMES = {"weekly": ("7d", "Weekly", "Weekly"), "session": ("5h", "Session (5h)", "5-hour")}
+NAMES = {"weekly": ("7d", "Weekly"), "session": ("5h", "5-hour")}  # pill tag, and the name the menu, tray and alerts use
 NO_LIMITS = "Claude didn't report a weekly or 5-hour limit."
+# Words of the limits-fetch errors (collector.fetch_rate_limits and the worker's own). The worker
+# retries those by itself; any other error (a store from a newer version) needs the user, so the
+# OSD shows its message alone, without "Can't reach Claude" or "Retrying automatically".
+FETCH_WORDS = ("network", "request", "rate limit", "api", "oauth", "collection")
 # Each pill countdown keeps the room of the widest string its limit shows in normal use
 # (weekly '6d 23h', '23h 59m', forecast '~6d 23h'; 5h '4h 59m', forecast '~4h 59m'), so the
 # pill keeps its width and nothing in it moves as the numbers tick. Forecasts ('~') are semibold.
@@ -132,6 +136,12 @@ def _rate(tpm: float) -> str:
     if tpm >= 1000:
         return f"{tpm / 1000:.1f}k tok/min"
     return f"{int(tpm)} tok/min"
+
+
+def _retries(now: dict) -> bool:
+    """True while the problem is a failed limits fetch, which the worker keeps retrying."""
+    msg = (now["message"] or "").lower()
+    return not msg or any(w in msg for w in FETCH_WORDS)
 
 
 def _not_started(m: dict) -> bool:
@@ -402,7 +412,9 @@ class Osd(QWidget):
             kind, color = ("alert", pal["bad_fill"]) if n["state"] == "error" else ("clock", pal["text_muted"])
             if as_of:
                 return kind, color, f"Stale, as of {_clock(as_of)}"
-            return kind, color, "Can't reach Claude" if n["state"] == "error" else "Stale"
+            if n["state"] == "stale":
+                return kind, color, "Stale"
+            return kind, color, "Can't reach Claude" if _retries(n) else "Claude usage"
         if n["live"]:
             return "dot", pal["ok"], "Live " + _rate(n["tokens_per_min"])
         return "", pal["text_muted"], "Claude usage"
@@ -478,7 +490,8 @@ class Osd(QWidget):
         x = P + self._icon(o, kind, P, hb - cap12 / 2, kcol)
         x += 6 if kind else 0
         x += o.text(x, hb, label, f12b, pal["text_muted"], "status", width=W - P - x)
-        if n["state"] != "loading":
+        # An error outside the fetch is the local store failing, so its $0 is not today's cost.
+        if n["state"] != "loading" and (n["state"] != "error" or _retries(n)):
             cost = _money(n["today_cost"])
             o.text(W - P, hb, _fit([f"Today {cost}", cost], f12, W - P - x - 12), f12, pal["text_muted"],
                    "cost", right=True)
@@ -522,9 +535,13 @@ class Osd(QWidget):
                 o.text(cx + adv + 1, vb, "%", f18, vcol, "unit")
             o.shape("meter", cx, 96, cw, 4, self._fill(m, pal), frac=self._frac(key, m["pct"]), track=pal["track"])
             sb = 104 + 8 + cap12 / 2
-            if len(cols) == 1 and self._eta(m):  # one column has room for the reset beside the forecast
-                o.text(cx + cw, sb, _resets(_parse(m["resets_at"]), self._t)[0], f12, pal["text_muted"], "sub",
-                       right=True)
+            reset, eta = _parse(m["resets_at"]), self._eta(m)
+            # One column (weekly only, as on Ultra) has room for a second fact: the reset beside a
+            # forecast, or the countdown beside a reset date ("Resets in 2h 30m" already is one).
+            if len(cols) == 1 and reset and reset > self._t and (
+                    eta or m["level"] == "limited" or reset - self._t >= timedelta(hours=24)):
+                o.text(cx + cw, sb, _resets(reset, self._t)[0] if eta else "in " + _span(reset - self._t), f12,
+                       pal["text_muted"], "sub", right=True)
             if sub:
                 o.text(cx, sb, sub, sf, scol, "sub", width=cw)
         return W, H
@@ -545,7 +562,7 @@ class Osd(QWidget):
         if n["state"] == "signed_out":
             rows = 1
         elif n["state"] in ("stale", "error"):
-            body, rows = body.rstrip(".") + ". Retrying automatically.", 3
+            body, rows = (body.rstrip(".") + ". Retrying automatically." if _retries(n) else body), 3
         for i, line in enumerate(_wrap(body, f12, width, rows)):
             o.text(x, 68 + 16 * i + 8 + cap12 / 2, line, f12, pal["text_muted"], "body", width=width)
         if n["state"] == "signed_out":
@@ -848,7 +865,7 @@ class Osd(QWidget):
         elif n["state"] == "ok" and not self._meters():
             lines.append(NO_LIMITS)
         for key, m in self._meters():
-            line = f"{NAMES[key][2]} {_pct(m)}{'' if _not_started(m) else '%'}"
+            line = f"{NAMES[key][1]} {_pct(m)}{'' if _not_started(m) else '%'}"
             reset, eta = _parse(m["resets_at"]), self._eta(m)
             if reset and reset <= now:
                 line += f", window reset at {_when(reset, now)}"
@@ -865,13 +882,17 @@ class Osd(QWidget):
                 lines.append(m["forecast"])
             elif eta:
                 lines.append("At this pace the limit is reached " + (_when(eta, now) if eta > now else "any minute"))
-        if n["state"] != "loading":
+        if n["state"] != "loading" and (n["state"] != "error" or _retries(n)):
             lines.append(f"Today {_money(n['today_cost'])} (API-equivalent)")
         if n["live"]:
             k, subs = n["active_sessions"], n["active_subagents"]
             lines.append(f"Live {_rate(n['tokens_per_min'])}, {k} active session{'s' if k != 1 else ''}"
                          + (f", {subs} subagent{'s' if subs != 1 else ''}" if subs else ""))
-        if n["state"] in ("stale", "error"):
+        if n["state"] in ("stale", "error", "signed_out"):
+            # Signed out after a good fetch keeps that fetch's time, as stale does.
             as_of = _parse(n["as_of"])
-            lines.append(("As of " + _clock(as_of) + ". " if as_of else "") + (n["message"] or "Can't reach Claude."))
+            why = n["message"] or ("" if n["state"] == "signed_out" else "Can't reach Claude.")
+            line = ("As of " + _clock(as_of) + ". " if as_of else "") + why
+            if line:
+                lines.append(line)
         return "\n".join(lines)

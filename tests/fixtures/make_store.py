@@ -181,8 +181,7 @@ def synthetic_limits(conn) -> dict:
     reset = _reset_after(NOW)
     weekly = conn.execute("SELECT weekly FROM samples ORDER BY ts DESC LIMIT 1").fetchone()[0]
     return {
-        "session_utilization": 0.0, "session_reset": 0, "weekly_utilization": weekly, "weekly_reset": int(reset),
-        "overage_status": "rejected", "fallback_status": "", "source": "oauth", "fetched_at": int(NOW - 40),
+        "source": "oauth", "fetched_at": int(NOW - 40), "plan": None,
         "weekly": {"pct": weekly, "resets_at": int(reset), "severity": "normal"},
         "five_hour": None,
         "limits": [

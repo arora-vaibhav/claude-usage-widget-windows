@@ -20,7 +20,7 @@ from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuickControls2 import QQuickStyle
 
-from .. import __version__, tokens
+from .. import __version__, snapshot, tokens
 from ..winchrome import apply_win11_chrome
 
 log = logging.getLogger(__name__)
@@ -104,6 +104,9 @@ class Backend(QObject):
     def _version(self) -> str:
         return __version__
 
+    def _cost_note(self) -> str:
+        return snapshot.cost_note()
+
     def _theme(self) -> dict:
         dark = self._dark
         # shortcut: the offscreen platform renders Segoe UI Variable through
@@ -136,6 +139,7 @@ class Backend(QObject):
     busy = Property(bool, _is_busy, notify=busyChanged)
     quitting = Property(bool, _is_quitting)
     version = Property(str, _version, constant=True)
+    costNote = Property(str, _cost_note, constant=True)
 
     # -- slots called from QML --------------------------------------------
     @Slot(str)
@@ -261,9 +265,11 @@ class AppWindow(QObject):
                  parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
         QQuickStyle.setStyle("FluentWinUI3")
-        self.backend = Backend(provider, settings, on_setting, on_action, self)
         self.warnings: list[str] = []
+        # Children are deleted in creation order: the engine (and every
+        # binding that reads backend) must go before the backend does.
         self.engine = QQmlApplicationEngine(self)
+        self.backend = Backend(provider, settings, on_setting, on_action, self)
         self.engine.warnings.connect(self._on_warnings)
         self.engine.rootContext().setContextProperty("backend", self.backend)
         self.engine.load(QUrl.fromLocalFile(str(QML_MAIN)))

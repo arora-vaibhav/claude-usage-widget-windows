@@ -32,7 +32,7 @@ def test_load_credentials_prefers_long_lived(tmp_path, monkeypatch):
 
 def test_long_lived_token_routes_to_unified_headers(tmp_path, monkeypatch):
     # A long-lived token (setup-token) lacks the user:profile scope, so it must
-    # NOT hit /api/oauth/usage (which 403s) — it must read the /v1/messages
+    # NOT hit /api/oauth/usage (which 403s); it must read the /v1/messages
     # unified rate-limit headers instead.
     monkeypatch.setenv("CLAUDE_USAGE_TOKEN", "sk-ant-oat01-LONGLIVED")
     called = {"oauth": 0, "messages": 0}
